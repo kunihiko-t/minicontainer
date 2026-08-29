@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/bundle", "crates/protocol", "xtask"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kunihiko-t/minicontainer"
+
+[workspace.dependencies]
+minios-abi = { git = "https://github.com/kunihiko-t/minios.git", tag = "minios-abi-v0.1.1" }
+sha2 = "=0.10.9"
