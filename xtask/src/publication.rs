@@ -69,6 +69,9 @@ pub enum PublicationError {
         text: &'static str,
     },
     NonUtf8TrackedPath,
+    NonUtf8Symlink {
+        path: PathBuf,
+    },
     ForbiddenPath {
         path: PathBuf,
     },
@@ -100,6 +103,7 @@ impl PublicationError {
             | Self::MissingFile { path }
             | Self::FileEscapesRoot { path }
             | Self::ForbiddenPath { path }
+            | Self::NonUtf8Symlink { path }
             | Self::ForbiddenContent { path, .. }
             | Self::Workflow { path, .. }
             | Self::MutableAction { path, .. } => Some(path),
@@ -145,6 +149,11 @@ impl fmt::Display for PublicationError {
                 write!(formatter, "README.md: missing required text: {text}")
             }
             Self::NonUtf8TrackedPath => write!(formatter, "git returned a non-UTF-8 tracked path"),
+            Self::NonUtf8Symlink { path } => write!(
+                formatter,
+                "{}: tracked symlink target is not UTF-8",
+                path.display()
+            ),
             Self::ForbiddenPath { path } => {
                 write!(formatter, "{}: forbidden tracked path", path.display())
             }
@@ -196,6 +205,11 @@ pub fn check(root: &Path) -> Result<(), PublicationError> {
 
 fn check_workflow_policy(root: &Path) -> Result<(), PublicationError> {
     for path in tracked_workflows(root)? {
+        require_regular_policy_file(
+            root,
+            &path,
+            "workflow configuration must be a regular tracked file",
+        )?;
         let contents =
             fs::read_to_string(root.join(&path)).map_err(|error| PublicationError::Read {
                 path: path.clone(),
@@ -230,7 +244,10 @@ fn tracked_workflows(root: &Path) -> Result<Vec<PathBuf>, PublicationError> {
             let path =
                 std::str::from_utf8(path).map_err(|_| PublicationError::NonUtf8TrackedPath)?;
             let path = PathBuf::from(path);
-            if path.extension().is_some_and(|extension| extension == "yml") {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "yml" || extension == "yaml")
+            {
                 Ok(Some(path))
             } else {
                 Ok(None)
@@ -242,6 +259,19 @@ fn tracked_workflows(root: &Path) -> Result<Vec<PathBuf>, PublicationError> {
 
 fn check_dependabot(root: &Path) -> Result<(), PublicationError> {
     let path = PathBuf::from(".github/dependabot.yml");
+    let tracked = git(root, ["ls-files", "-z", "--", ".github/dependabot.yml"])?;
+    if tracked.stdout != b".github/dependabot.yml\0" {
+        return Err(PublicationError::Workflow {
+            path,
+            line: 1,
+            message: "Dependabot configuration must be Git-tracked",
+        });
+    }
+    require_regular_policy_file(
+        root,
+        &path,
+        "Dependabot configuration must be a regular tracked file",
+    )?;
     let contents = fs::read_to_string(root.join(&path)).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             PublicationError::MissingFile { path: path.clone() }
@@ -252,123 +282,310 @@ fn check_dependabot(root: &Path) -> Result<(), PublicationError> {
             }
         }
     })?;
-    for ecosystem in ["cargo", "github-actions"] {
-        if !has_active_dependabot_ecosystem(&contents, ecosystem) {
-            return Err(PublicationError::Workflow {
-                path,
-                line: 1,
-                message: if ecosystem == "cargo" {
-                    "missing active Dependabot cargo ecosystem"
-                } else {
-                    "missing active Dependabot github-actions ecosystem"
-                },
-            });
-        }
-    }
-    Ok(())
+    check_dependabot_contents(&contents).map_err(|error| PublicationError::Workflow {
+        path,
+        line: error.line,
+        message: error.message,
+    })
 }
 
-fn has_active_dependabot_ecosystem(contents: &str, ecosystem: &str) -> bool {
+fn require_regular_policy_file(
+    root: &Path,
+    path: &Path,
+    message: &'static str,
+) -> Result<(), PublicationError> {
+    let metadata =
+        fs::symlink_metadata(root.join(path)).map_err(|error| PublicationError::Read {
+            path: path.to_owned(),
+            message: error.to_string(),
+        })?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(PublicationError::Workflow {
+            path: path.to_owned(),
+            line: 1,
+            message,
+        })
+    }
+}
+
+fn check_dependabot_contents(contents: &str) -> Result<(), WorkflowPolicyError> {
+    let mut version = None;
+    let mut updates_seen = false;
     let mut updates_indent = None;
-    let mut update = None;
-    for raw_line in contents.lines() {
-        let indentation = raw_line.bytes().take_while(|byte| *byte == b' ').count();
-        let line = strip_yaml_comment(&raw_line[indentation..]).trim_end();
-        if line.is_empty() {
+    let mut list_indent = None;
+    let mut current = None;
+    let mut entries = Vec::new();
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = index + 1;
+        let indentation = yaml_indentation(raw_line, line)?;
+        let content = strip_workflow_comment(&raw_line[indentation..], line)?.trim_end();
+        if content.is_empty() {
             continue;
         }
-        if let Some((key, value)) = yaml_mapping(line)
-            && key == "updates"
-            && value.is_empty()
-        {
-            updates_indent = Some(indentation);
-            update = None;
+        let (is_list_item, mapping, mapping_indent) = yaml_list_item(content, indentation, line)?;
+        let parsed = workflow_yaml_mapping(mapping, line)?;
+
+        if indentation == 0 && !is_list_item {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            updates_indent = None;
+            list_indent = None;
+            let Some((key, value)) = parsed else {
+                continue;
+            };
+            match key {
+                "version" => {
+                    if version.is_some() {
+                        return Err(WorkflowPolicyError {
+                            line,
+                            message: "duplicate Dependabot root version",
+                        });
+                    }
+                    version = Some((line, unquote_yaml_scalar(value) == Some("2")));
+                }
+                "updates" => {
+                    if updates_seen {
+                        return Err(WorkflowPolicyError {
+                            line,
+                            message: "Dependabot updates must contain exactly cargo and github-actions",
+                        });
+                    }
+                    if !value.is_empty() {
+                        return Err(WorkflowPolicyError {
+                            line,
+                            message: "Dependabot updates must be a block sequence",
+                        });
+                    }
+                    updates_seen = true;
+                    updates_indent = Some(indentation);
+                }
+                _ => {}
+            }
             continue;
         }
+
         let Some(parent_indent) = updates_indent else {
             continue;
         };
         if indentation <= parent_indent {
-            if update.is_some_and(|update: DependabotUpdate| {
-                update.ecosystem == ecosystem && update.has_weekly_schedule
-            }) {
-                return true;
-            }
-            updates_indent = None;
-            update = None;
             continue;
         }
-        let Some(list) = line.strip_prefix('-') else {
-            let Some(update) = update.as_mut() else {
-                continue;
+        if is_list_item {
+            let expected = list_indent.get_or_insert(indentation);
+            if indentation != *expected {
+                return Err(WorkflowPolicyError {
+                    line,
+                    message: "inconsistent Dependabot update indentation",
+                });
+            }
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            let Some((key, value)) = parsed else {
+                return Err(WorkflowPolicyError {
+                    line,
+                    message: "Dependabot updates must use block mapping entries",
+                });
             };
-            if indentation <= update.indentation {
-                continue;
-            }
-            let Some((key, value)) = yaml_mapping(line.trim_start()) else {
-                continue;
-            };
-            if indentation == update.mapping_indent {
-                update.schedule =
-                    (key == "schedule" && value.is_empty()).then_some(DependabotSchedule {
-                        indentation,
-                        child_indent: None,
-                    });
-            } else if let Some(schedule) = update.schedule.as_mut()
-                && indentation > schedule.indentation
-            {
-                let child_indent = schedule.child_indent.get_or_insert(indentation);
-                if indentation == *child_indent
-                    && key == "interval"
-                    && unquote_yaml_scalar(value) == Some("weekly")
-                {
-                    update.has_weekly_schedule = true;
-                }
-            }
+            let mut entry = DependabotUpdate::new(line, mapping_indent);
+            entry.observe_direct(line, key, value)?;
+            current = Some(entry);
             continue;
-        };
-        let marker_width = list.bytes().take_while(|byte| *byte == b' ').count();
-        let line = &list[marker_width..];
-        let mapping_indent = indentation + 1 + marker_width;
-        if update.is_some_and(|update: DependabotUpdate| {
-            update.ecosystem == ecosystem && update.has_weekly_schedule
-        }) {
-            return true;
         }
-        if update.is_some_and(|update: DependabotUpdate| update.indentation == indentation) {
-            update = None;
-        }
-        let Some((key, value)) = yaml_mapping(line.trim_start()) else {
-            continue;
+
+        let Some(entry) = current.as_mut() else {
+            return Err(WorkflowPolicyError {
+                line,
+                message: "Dependabot update fields must belong to a list entry",
+            });
         };
-        if key == "package-ecosystem" {
-            update = Some(DependabotUpdate {
-                indentation,
-                mapping_indent,
-                ecosystem: unquote_yaml_scalar(value).unwrap_or_default(),
-                schedule: None,
-                has_weekly_schedule: false,
+        let Some((key, value)) = parsed else {
+            return Err(WorkflowPolicyError {
+                line,
+                message: "Dependabot update fields must be mappings",
+            });
+        };
+        if mapping_indent == entry.mapping_indent {
+            entry.observe_direct(line, key, value)?;
+        } else if mapping_indent > entry.mapping_indent {
+            entry.observe_nested(line, mapping_indent, key, value)?;
+        } else {
+            return Err(WorkflowPolicyError {
+                line,
+                message: "inconsistent Dependabot update indentation",
             });
         }
     }
-    update.is_some_and(|update: DependabotUpdate| {
-        update.ecosystem == ecosystem && update.has_weekly_schedule
-    })
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+
+    if !version.is_some_and(|(_, is_two)| is_two) {
+        return Err(WorkflowPolicyError {
+            line: version.map_or(1, |(line, _)| line),
+            message: "Dependabot root version must be 2",
+        });
+    }
+    for (ecosystem, missing_message) in [
+        ("cargo", "missing active Dependabot cargo ecosystem"),
+        (
+            "github-actions",
+            "missing active Dependabot github-actions ecosystem",
+        ),
+    ] {
+        let matching = entries
+            .iter()
+            .filter(|entry| entry.ecosystem.as_deref() == Some(ecosystem))
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(WorkflowPolicyError {
+                line: 1,
+                message: missing_message,
+            });
+        }
+        for entry in matching {
+            if entry.directory.as_deref() != Some("/") {
+                return Err(WorkflowPolicyError {
+                    line: entry.line,
+                    message: "Dependabot update directory must be /",
+                });
+            }
+            if entry.schedule_line.is_none() || entry.interval.as_deref() != Some("weekly") {
+                return Err(WorkflowPolicyError {
+                    line: entry.schedule_line.unwrap_or(entry.line),
+                    message: "Dependabot schedule interval must be weekly",
+                });
+            }
+        }
+    }
+    if entries.len() != 2
+        || entries
+            .iter()
+            .filter(|entry| entry.ecosystem.as_deref() == Some("cargo"))
+            .count()
+            != 1
+        || entries
+            .iter()
+            .filter(|entry| entry.ecosystem.as_deref() == Some("github-actions"))
+            .count()
+            != 1
+    {
+        return Err(WorkflowPolicyError {
+            line: 1,
+            message: "Dependabot updates must contain exactly cargo and github-actions",
+        });
+    }
+    Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct DependabotUpdate<'a> {
-    indentation: usize,
+struct DependabotUpdate {
+    line: usize,
     mapping_indent: usize,
-    ecosystem: &'a str,
-    schedule: Option<DependabotSchedule>,
-    has_weekly_schedule: bool,
+    ecosystem: Option<String>,
+    directory: Option<String>,
+    schedule_line: Option<usize>,
+    interval: Option<String>,
+    nested_owner: DependabotNestedOwner,
 }
 
-#[derive(Clone, Copy)]
-struct DependabotSchedule {
-    indentation: usize,
-    child_indent: Option<usize>,
+impl DependabotUpdate {
+    fn new(line: usize, mapping_indent: usize) -> Self {
+        Self {
+            line,
+            mapping_indent,
+            ecosystem: None,
+            directory: None,
+            schedule_line: None,
+            interval: None,
+            nested_owner: DependabotNestedOwner::None,
+        }
+    }
+
+    fn observe_direct(
+        &mut self,
+        line: usize,
+        key: &str,
+        value: &str,
+    ) -> Result<(), WorkflowPolicyError> {
+        self.nested_owner = DependabotNestedOwner::Other;
+        match key {
+            "package-ecosystem" => set_dependabot_scalar(
+                &mut self.ecosystem,
+                value,
+                line,
+                "duplicate Dependabot package ecosystem",
+            ),
+            "directory" => set_dependabot_scalar(
+                &mut self.directory,
+                value,
+                line,
+                "duplicate Dependabot update directory",
+            ),
+            "schedule" => {
+                if self.schedule_line.is_some() {
+                    return Err(WorkflowPolicyError {
+                        line,
+                        message: "duplicate Dependabot update schedule",
+                    });
+                }
+                if !value.is_empty() {
+                    return Ok(());
+                }
+                self.schedule_line = Some(line);
+                self.nested_owner = DependabotNestedOwner::Schedule { child_indent: None };
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn observe_nested(
+        &mut self,
+        line: usize,
+        indentation: usize,
+        key: &str,
+        value: &str,
+    ) -> Result<(), WorkflowPolicyError> {
+        let DependabotNestedOwner::Schedule { child_indent } = &mut self.nested_owner else {
+            return Ok(());
+        };
+        let direct_indent = child_indent.get_or_insert(indentation);
+        if indentation == *direct_indent && key == "interval" {
+            set_dependabot_scalar(
+                &mut self.interval,
+                value,
+                line,
+                "duplicate Dependabot schedule interval",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+enum DependabotNestedOwner {
+    None,
+    Other,
+    Schedule { child_indent: Option<usize> },
+}
+
+fn set_dependabot_scalar(
+    field: &mut Option<String>,
+    value: &str,
+    line: usize,
+    duplicate_message: &'static str,
+) -> Result<(), WorkflowPolicyError> {
+    if field.is_some() {
+        return Err(WorkflowPolicyError {
+            line,
+            message: duplicate_message,
+        });
+    }
+    *field = unquote_yaml_scalar(value).map(str::to_owned);
+    Ok(())
 }
 
 fn is_immutable_action_reference(reference: &str) -> bool {
@@ -390,7 +607,7 @@ fn workflow_action_references(contents: &str) -> Result<Vec<ActionReference>, Wo
     for (index, raw_line) in contents.lines().enumerate() {
         let line = index + 1;
         let indentation = yaml_indentation(raw_line, line)?;
-        let content = strip_yaml_comment(raw_line[indentation..].as_ref()).trim_end();
+        let content = strip_workflow_comment(&raw_line[indentation..], line)?.trim_end();
         if content.is_empty() {
             continue;
         }
@@ -405,17 +622,31 @@ fn workflow_action_references(contents: &str) -> Result<Vec<ActionReference>, Wo
 
         let (is_list_item, mapping, mapping_indent) = yaml_list_item(content, indentation, line)?;
 
-        let parsed = yaml_mapping(mapping);
+        let parsed = workflow_yaml_mapping(mapping, line)?;
+
+        if mapping.trim_start().starts_with(['&', '*'])
+            || parsed.is_some_and(|(key, value)| {
+                key == "<<" || value.trim_start().starts_with(['&', '*'])
+            })
+        {
+            return Err(WorkflowPolicyError {
+                line,
+                message: "YAML anchors and aliases are unsupported",
+            });
+        }
 
         let Some((key, value)) = parsed else {
             state.leave_scopes(indentation, is_list_item);
             continue;
         };
 
-        if !is_list_item
-            && indentation == 0
-            && parsed.is_some_and(|(key, value)| key == "jobs" && value.is_empty())
-        {
+        if !is_list_item && indentation == 0 && key == "jobs" {
+            if !value.is_empty() {
+                return Err(WorkflowPolicyError {
+                    line,
+                    message: "jobs must be a block mapping",
+                });
+            }
             state.enter_jobs(indentation);
             continue;
         }
@@ -423,11 +654,11 @@ fn workflow_action_references(contents: &str) -> Result<Vec<ActionReference>, Wo
         state.leave_scopes(indentation, is_list_item);
         state.validate_mapping_indentation(line, indentation, mapping_indent, is_list_item)?;
 
-        if state.enter_job(indentation, is_list_item) {
+        if state.enter_job(line, indentation, is_list_item, value)? {
             continue;
         }
         state.observe_job_mapping(line, mapping_indent, value)?;
-        if state.enter_steps(indentation, is_list_item, key, value) {
+        if state.enter_steps(line, indentation, is_list_item, key, value)? {
             continue;
         }
         if state.enter_step(line, indentation, mapping_indent, is_list_item)? {
@@ -500,14 +731,26 @@ impl WorkflowScannerState {
         }
     }
 
-    fn enter_job(&mut self, indentation: usize, is_list_item: bool) -> bool {
+    fn enter_job(
+        &mut self,
+        line: usize,
+        indentation: usize,
+        is_list_item: bool,
+        value: &str,
+    ) -> Result<bool, WorkflowPolicyError> {
         let Some(jobs_indent) = self.jobs_indent else {
-            return false;
+            return Ok(false);
         };
         if is_list_item || indentation <= jobs_indent {
-            return false;
+            return Ok(false);
         }
-        match self.job_indent {
+        if self.job_indent.is_none_or(|job| indentation == job) && !value.is_empty() {
+            return Err(WorkflowPolicyError {
+                line,
+                message: "job must be a block mapping",
+            });
+        }
+        Ok(match self.job_indent {
             None => {
                 self.job_indent = Some(indentation);
                 true
@@ -521,30 +764,37 @@ impl WorkflowScannerState {
                 true
             }
             _ => false,
-        }
+        })
     }
 
     fn enter_steps(
         &mut self,
+        line: usize,
         indentation: usize,
         is_list_item: bool,
         key: &str,
         value: &str,
-    ) -> bool {
+    ) -> Result<bool, WorkflowPolicyError> {
         let Some(job_indent) = self.job_indent else {
-            return false;
+            return Ok(false);
         };
         if is_list_item || indentation <= job_indent {
-            return false;
+            return Ok(false);
         }
         let mapping_indent = self.job_mapping_indent.get_or_insert(indentation);
-        if indentation == *mapping_indent && key == "steps" && value.is_empty() {
+        if indentation == *mapping_indent && key == "steps" {
+            if !value.is_empty() {
+                return Err(WorkflowPolicyError {
+                    line,
+                    message: "steps must be a block sequence",
+                });
+            }
             self.steps_indent = Some(indentation);
             self.step_list_indent = None;
             self.step_mapping_indent = None;
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 
     fn enter_step(
@@ -706,30 +956,94 @@ fn yaml_list_item(
     Ok((true, &rest[marker_width..], indentation + 1 + marker_width))
 }
 
-fn strip_yaml_comment(line: &str) -> &str {
+fn strip_workflow_comment(line: &str, number: usize) -> Result<&str, WorkflowPolicyError> {
     let mut quote = None;
-    for (index, character) in line.char_indices() {
+    let mut characters = line.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
         match (quote, character) {
-            (None, '\'' | '\"') => quote = Some(character),
+            (None, '\'' | '"') => quote = Some(character),
+            (Some('\''), '\'') if characters.peek().is_some_and(|(_, next)| *next == '\'') => {
+                characters.next();
+            }
+            (Some('"'), '\\') => {
+                characters.next();
+            }
             (Some(active), candidate) if active == candidate => quote = None,
-            (None, '#') => return &line[..index],
+            (None, '#') => return Ok(&line[..index]),
             _ => {}
         }
     }
-    line
+    if quote.is_some() {
+        Err(WorkflowPolicyError {
+            line: number,
+            message: "unterminated quoted scalar",
+        })
+    } else {
+        Ok(line)
+    }
 }
 
-fn yaml_mapping(line: &str) -> Option<(&str, &str)> {
+fn workflow_yaml_mapping(
+    line: &str,
+    number: usize,
+) -> Result<Option<(&str, &str)>, WorkflowPolicyError> {
     let mut quote = None;
-    for (index, character) in line.char_indices() {
+    let mut characters = line.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
         match (quote, character) {
-            (None, '\'' | '\"') => quote = Some(character),
+            (None, '\'' | '"') => quote = Some(character),
+            (Some('\''), '\'') if characters.peek().is_some_and(|(_, next)| *next == '\'') => {
+                characters.next();
+            }
+            (Some('"'), '\\') => {
+                characters.next();
+            }
             (Some(active), candidate) if active == candidate => quote = None,
-            (None, ':') => return Some((line[..index].trim(), line[index + 1..].trim())),
+            (None, ':') => {
+                let key = normalize_workflow_key(&line[..index], number)?;
+                return Ok(Some((key, line[index + 1..].trim())));
+            }
             _ => {}
         }
     }
-    None
+    Ok(None)
+}
+
+fn normalize_workflow_key(key: &str, line: usize) -> Result<&str, WorkflowPolicyError> {
+    let key = key.trim();
+    let normalized = match key.as_bytes() {
+        [quote @ (b'\'' | b'"'), middle @ .., end] if end == quote => {
+            let middle = std::str::from_utf8(middle).map_err(|_| WorkflowPolicyError {
+                line,
+                message: "mapping key must be UTF-8",
+            })?;
+            if middle.contains(*quote as char) || middle.contains('\\') {
+                return Err(WorkflowPolicyError {
+                    line,
+                    message: "escaped quoted mapping keys are unsupported",
+                });
+            }
+            middle
+        }
+        [b'\'' | b'"', ..] | [.., b'\'' | b'"'] => {
+            return Err(WorkflowPolicyError {
+                line,
+                message: "malformed quoted mapping key",
+            });
+        }
+        _ => key,
+    };
+    if normalized.is_empty()
+        || normalized
+            .bytes()
+            .any(|byte| matches!(byte, b'{' | b'}' | b'[' | b']'))
+    {
+        return Err(WorkflowPolicyError {
+            line,
+            message: "unsupported mapping key",
+        });
+    }
+    Ok(normalized)
 }
 
 fn yaml_scalar(value: &str, line: usize) -> Result<String, WorkflowPolicyError> {
@@ -761,16 +1075,29 @@ fn check_required_files(root: &Path) -> Result<(), PublicationError> {
     let canonical_root = canonical_root(root)?;
     for required in REQUIRED_PUBLICATION_FILES {
         let relative = PathBuf::from(required);
-        let resolved = canonical_root.join(&relative);
-        if !resolved.is_file() {
-            return Err(PublicationError::MissingFile { path: relative });
+        let mut resolved = canonical_root.clone();
+        let mut metadata = None;
+        for component in relative.components() {
+            resolved.push(component);
+            let current = fs::symlink_metadata(&resolved).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    PublicationError::MissingFile {
+                        path: relative.clone(),
+                    }
+                } else {
+                    PublicationError::Read {
+                        path: relative.clone(),
+                        message: error.to_string(),
+                    }
+                }
+            })?;
+            if current.file_type().is_symlink() {
+                return Err(PublicationError::FileEscapesRoot { path: relative });
+            }
+            metadata = Some(current);
         }
-        let canonical = fs::canonicalize(&resolved).map_err(|error| PublicationError::Read {
-            path: relative.clone(),
-            message: error.to_string(),
-        })?;
-        if !canonical.starts_with(&canonical_root) {
-            return Err(PublicationError::FileEscapesRoot { path: relative });
+        if !metadata.is_some_and(|metadata| metadata.is_file()) {
+            return Err(PublicationError::MissingFile { path: relative });
         }
     }
     Ok(())
@@ -814,13 +1141,25 @@ fn check_tracked_tree(root: &Path) -> Result<(), PublicationError> {
             path: relative.clone(),
             message: error.to_string(),
         })?;
-        if !metadata.file_type().is_file() {
+        let bytes = if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&resolved).map_err(|error| PublicationError::Read {
+                path: relative.clone(),
+                message: error.to_string(),
+            })?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| PublicationError::NonUtf8Symlink {
+                    path: relative.clone(),
+                })?;
+            target.as_bytes().to_vec()
+        } else if metadata.file_type().is_file() {
+            fs::read(&resolved).map_err(|error| PublicationError::Read {
+                path: relative.clone(),
+                message: error.to_string(),
+            })?
+        } else {
             continue;
-        }
-        let bytes = fs::read(&resolved).map_err(|error| PublicationError::Read {
-            path: relative.clone(),
-            message: error.to_string(),
-        })?;
+        };
         let Ok(contents) = std::str::from_utf8(&bytes) else {
             continue;
         };
@@ -937,25 +1276,121 @@ fn forbidden_needles() -> Vec<(String, ForbiddenKind)> {
             ["BEGIN ", "PRIVATE KEY"].concat(),
             ForbiddenKind::PrivateKey,
         ),
-        (["gh", "p_"].concat(), ForbiddenKind::GitHubToken),
-        (["AK", "IA"].concat(), ForbiddenKind::AwsAccessKey),
+        (
+            ["BEGIN RSA ", "PRIVATE KEY"].concat(),
+            ForbiddenKind::PrivateKey,
+        ),
+        (
+            ["BEGIN OPEN", "SSH PRIVATE KEY"].concat(),
+            ForbiddenKind::PrivateKey,
+        ),
+        (
+            ["BEGIN EC ", "PRIVATE KEY"].concat(),
+            ForbiddenKind::PrivateKey,
+        ),
+        (
+            ["BEGIN DSA ", "PRIVATE KEY"].concat(),
+            ForbiddenKind::PrivateKey,
+        ),
+        (
+            ["BEGIN ENCRYPTED ", "PRIVATE KEY"].concat(),
+            ForbiddenKind::PrivateKey,
+        ),
+        (
+            ["BEGIN PGP ", "PRIVATE KEY", " BLOCK"].concat(),
+            ForbiddenKind::PrivateKey,
+        ),
     ]
 }
 
 fn forbidden_content(contents: &str) -> Option<(usize, ForbiddenKind)> {
     for (needle, kind) in forbidden_needles() {
-        let offset = match kind {
-            ForbiddenKind::GitHubToken => {
-                token_offset(contents, &needle, 36, |byte| byte.is_ascii_alphanumeric())
-            }
-            ForbiddenKind::AwsAccessKey => token_offset(contents, &needle, 16, |byte| {
-                byte.is_ascii_uppercase() || byte.is_ascii_digit()
-            }),
-            _ => contents.find(&needle),
-        };
+        let offset = contents.find(&needle);
         if let Some(offset) = offset {
             return Some((line_at(contents, offset), kind));
         }
+    }
+    if let Some(offset) = github_token_offset(contents) {
+        return Some((line_at(contents, offset), ForbiddenKind::GitHubToken));
+    }
+    let aws_prefix = ["AK", "IA"].concat();
+    if let Some(offset) = token_offset(contents, &aws_prefix, 16, |byte| {
+        byte.is_ascii_uppercase() || byte.is_ascii_digit()
+    }) {
+        return Some((line_at(contents, offset), ForbiddenKind::AwsAccessKey));
+    }
+    None
+}
+
+fn github_token_offset(contents: &str) -> Option<usize> {
+    let opaque_prefixes = [
+        ["gh", "p_"].concat(),
+        ["gh", "o_"].concat(),
+        ["gh", "u_"].concat(),
+        ["gh", "s_"].concat(),
+    ];
+    for prefix in opaque_prefixes {
+        if let Some(offset) =
+            token_offset(contents, &prefix, 36, |byte| byte.is_ascii_alphanumeric())
+        {
+            return Some(offset);
+        }
+    }
+    let refresh_prefix = ["gh", "r_"].concat();
+    if let Some(offset) = token_offset(contents, &refresh_prefix, 76, |byte| {
+        byte.is_ascii_alphanumeric()
+    }) {
+        return Some(offset);
+    }
+    let fine_grained_prefix = ["github", "_pat_"].concat();
+    if let Some(offset) = token_offset(contents, &fine_grained_prefix, 82, |byte| {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }) {
+        return Some(offset);
+    }
+    let stateless_prefix = ["gh", "s_"].concat();
+    stateless_installation_token_offset(contents, &stateless_prefix)
+}
+
+fn stateless_installation_token_offset(contents: &str, prefix: &str) -> Option<usize> {
+    let bytes = contents.as_bytes();
+    let mut search_start = 0;
+    while let Some(relative) = contents[search_start..].find(prefix) {
+        let offset = search_start + relative;
+        if has_token_prefix_boundary(bytes, offset) {
+            let mut cursor = offset + prefix.len();
+            let app_id_start = cursor;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor += 1;
+            }
+            if cursor > app_id_start && bytes.get(cursor) == Some(&b'_') {
+                cursor += 1;
+                let mut valid = true;
+                for segment in 0..3 {
+                    let segment_start = cursor;
+                    while bytes.get(cursor).is_some_and(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+                    }) {
+                        cursor += 1;
+                    }
+                    if cursor - segment_start < 8 {
+                        valid = false;
+                        break;
+                    }
+                    if segment < 2 {
+                        if bytes.get(cursor) != Some(&b'.') {
+                            valid = false;
+                            break;
+                        }
+                        cursor += 1;
+                    }
+                }
+                if valid && bytes.get(cursor) != Some(&b'.') {
+                    return Some(offset);
+                }
+            }
+        }
+        search_start = offset + prefix.len();
     }
     None
 }
@@ -971,18 +1406,25 @@ fn token_offset(
         let offset = search_start + offset;
         let suffix_start = offset + prefix.len();
         let suffix_end = suffix_start + suffix_length;
-        if let Some(suffix) = contents.as_bytes().get(suffix_start..suffix_end)
+        if has_token_prefix_boundary(contents.as_bytes(), offset)
+            && let Some(suffix) = contents.as_bytes().get(suffix_start..suffix_end)
             && suffix.iter().copied().all(&valid)
             && !contents
                 .as_bytes()
                 .get(suffix_end)
-                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                .is_some_and(|byte| valid(*byte))
         {
             return Some(offset);
         }
         search_start = suffix_start;
     }
     None
+}
+
+fn has_token_prefix_boundary(contents: &[u8], offset: usize) -> bool {
+    !contents
+        .get(offset.wrapping_sub(1))
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
 }
 
 fn line_at(contents: &str, offset: usize) -> usize {
@@ -1365,6 +1807,93 @@ mod tests {
     }
 
     #[test]
+    fn final_review_secret_rejects_common_private_key_headers() {
+        let headers = [
+            ["-----", "BEGIN RSA ", "PRIVATE KEY", "-----"].concat(),
+            ["-----", "BEGIN OPEN", "SSH PRIVATE KEY", "-----"].concat(),
+            ["-----", "BEGIN EC ", "PRIVATE KEY", "-----"].concat(),
+            ["-----", "BEGIN ENCRYPTED ", "PRIVATE KEY", "-----"].concat(),
+            ["-----", "BEGIN PGP ", "PRIVATE KEY", " BLOCK-----"].concat(),
+        ];
+
+        for contents in headers {
+            let repo = TestRepo::public_fixture();
+            repo.write("docs/reference/leak.md", &contents);
+            repo.add_all();
+            repo.commit_noreply();
+
+            let error = check(repo.path()).expect_err("private key header must fail");
+            assert!(matches!(
+                &error,
+                PublicationError::ForbiddenContent {
+                    path,
+                    line: 1,
+                    kind: ForbiddenKind::PrivateKey,
+                } if path == Path::new("docs/reference/leak.md")
+            ));
+            assert!(
+                !error.to_string().contains(&contents),
+                "diagnostic must not include matched secret text"
+            );
+        }
+    }
+
+    #[test]
+    fn final_review_secret_rejects_current_github_token_families() {
+        let opaque_suffix = "a".repeat(36);
+        let refresh_suffix = "b".repeat(76);
+        let fine_grained_suffix = "c".repeat(82);
+        let stateless_jwt = ["d".repeat(16), "e".repeat(24), "f".repeat(32)].join(".");
+        let tokens = [
+            ["gh", "p_"].concat() + &opaque_suffix,
+            ["gh", "o_"].concat() + &opaque_suffix,
+            ["gh", "u_"].concat() + &opaque_suffix,
+            ["gh", "s_"].concat() + &opaque_suffix,
+            ["gh", "r_"].concat() + &refresh_suffix,
+            ["github", "_pat_"].concat() + &fine_grained_suffix,
+            ["gh", "s_"].concat() + "12345_" + &stateless_jwt,
+        ];
+
+        for contents in tokens {
+            let repo = TestRepo::public_fixture();
+            repo.write("docs/reference/leak.md", &contents);
+            repo.add_all();
+            repo.commit_noreply();
+
+            let error = check(repo.path()).expect_err("GitHub token must fail");
+            assert!(matches!(
+                &error,
+                PublicationError::ForbiddenContent {
+                    path,
+                    line: 1,
+                    kind: ForbiddenKind::GitHubToken,
+                } if path == Path::new("docs/reference/leak.md")
+            ));
+            assert!(
+                !error.to_string().contains(&contents),
+                "diagnostic must not include matched secret value"
+            );
+        }
+    }
+
+    #[test]
+    fn final_review_secret_allows_github_prefixes_with_invalid_shapes() {
+        let invalid = [
+            ["gh", "p_"].concat() + &"a".repeat(35),
+            ["gh", "o_"].concat() + &format!("{}-", "a".repeat(35)),
+            ["gh", "r_"].concat() + &"b".repeat(75),
+            ["github", "_pat_"].concat() + &"c".repeat(81),
+            ["gh", "s_"].concat() + "12345_not-a-jwt",
+        ];
+        let repo = TestRepo::public_fixture();
+        repo.write("docs/reference/token-prose.md", &invalid.join("\n"));
+        repo.add_all();
+        repo.commit_noreply();
+
+        assert_eq!(check(repo.path()), Ok(()));
+    }
+
+    #[test]
     fn does_not_reject_incomplete_token_prefixes() {
         let repo = TestRepo::public_fixture();
         let github_prefix = ["gh", "p_"].concat() + "short";
@@ -1441,6 +1970,142 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn final_review_symlink_scans_the_tracked_link_text() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TestRepo::public_fixture();
+        let local_target = ["/", "Users", "/private/project"].concat();
+        symlink(
+            &local_target,
+            repo.path().join("docs/reference/private-link.md"),
+        )
+        .expect("must create fixture symlink");
+        repo.add_all();
+        repo.commit_noreply();
+
+        let error = check(repo.path()).expect_err("tracked symlink text must be scanned");
+        assert!(matches!(
+            error,
+            PublicationError::ForbiddenContent {
+                path,
+                line: 1,
+                kind: ForbiddenKind::LocalPath,
+            } if path == Path::new("docs/reference/private-link.md")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_review_symlink_rejects_required_file_links_before_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TestRepo::public_fixture();
+        fs::remove_file(repo.path().join("SECURITY.md")).expect("must remove fixture file");
+        let outside_target = ["/", "Users", "/private/missing-security.md"].concat();
+        symlink(outside_target, repo.path().join("SECURITY.md"))
+            .expect("must create required-file fixture symlink");
+        repo.add_all();
+        repo.commit_noreply();
+
+        assert_eq!(
+            check(repo.path()),
+            Err(PublicationError::FileEscapesRoot {
+                path: PathBuf::from("SECURITY.md"),
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_review_symlink_accepts_safe_relative_links_without_following_targets() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TestRepo::public_fixture();
+        symlink(
+            "../design/architecture.md",
+            repo.path().join("docs/reference/architecture-link.md"),
+        )
+        .expect("must create safe internal fixture symlink");
+        let outside = repo.container.join("outside-secret.md");
+        fs::write(&outside, ["/", "Users", "/private/project"].concat())
+            .expect("must write outside fixture");
+        symlink(
+            "../../../outside-secret.md",
+            repo.path().join("docs/reference/outside-link.md"),
+        )
+        .expect("must create safe-text outside fixture symlink");
+        repo.add_all();
+        repo.commit_noreply();
+
+        assert_eq!(check(repo.path()), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_review_symlink_rejects_workflow_policy_links_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TestRepo::public_fixture();
+        let outside = repo.container.join("outside-workflow.yml");
+        fs::write(
+            &outside,
+            "jobs:\n  check:\n    steps:\n      - uses: ./local-action\n",
+        )
+        .expect("must write outside workflow fixture");
+        fs::create_dir_all(repo.path().join(".github/workflows"))
+            .expect("must create workflow fixture directory");
+        symlink(
+            "../../../outside-workflow.yml",
+            repo.path().join(".github/workflows/release.yaml"),
+        )
+        .expect("must create workflow fixture symlink");
+        repo.add_all();
+        repo.commit_noreply();
+
+        assert_eq!(
+            check(repo.path()),
+            Err(PublicationError::Workflow {
+                path: PathBuf::from(".github/workflows/release.yaml"),
+                line: 1,
+                message: "workflow configuration must be a regular tracked file",
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_review_symlink_rejects_dependabot_policy_links_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TestRepo::public_fixture();
+        fs::remove_file(repo.path().join(".github/dependabot.yml"))
+            .expect("must remove Dependabot fixture file");
+        let outside = repo.container.join("outside-dependabot.yml");
+        fs::write(
+            &outside,
+            "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+        )
+        .expect("must write outside Dependabot fixture");
+        symlink(
+            "../../outside-dependabot.yml",
+            repo.path().join(".github/dependabot.yml"),
+        )
+        .expect("must create Dependabot fixture symlink");
+        repo.add_all();
+        repo.commit_noreply();
+
+        assert_eq!(
+            check(repo.path()),
+            Err(PublicationError::Workflow {
+                path: PathBuf::from(".github/dependabot.yml"),
+                line: 1,
+                message: "Dependabot configuration must be a regular tracked file",
+            })
+        );
+    }
+
     #[test]
     fn rejects_a_personal_author_or_committer_in_head_history() {
         for role in [IdentityRole::Author, IdentityRole::Committer] {
@@ -1474,6 +2139,117 @@ mod tests {
         let references = workflow_action_references(&workflow).unwrap();
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].value, format!("owner/action@{sha}"));
+    }
+
+    #[test]
+    fn final_review_workflow_rejects_mutable_actions_in_yaml_files() {
+        let repo = TestRepo::public_fixture();
+        repo.write(
+            ".github/workflows/release.yaml",
+            "jobs:\n  release:\n    steps:\n      - uses: owner/action@v1\n",
+        );
+        repo.add_all();
+        repo.commit_noreply();
+
+        assert!(matches!(
+            check(repo.path()),
+            Err(PublicationError::MutableAction { path, line: 4, reference })
+                if path == Path::new(".github/workflows/release.yaml")
+                    && reference == "owner/action@v1"
+        ));
+    }
+
+    #[test]
+    fn final_review_workflow_rejects_quoted_direct_step_actions() {
+        let repo = TestRepo::public_fixture();
+        repo.write(
+            ".github/workflows/release.yml",
+            "\"jobs\":\n  'release':\n    \"steps\":\n      - \"uses\": \"owner/action@v1\"\n",
+        );
+        repo.add_all();
+        repo.commit_noreply();
+
+        assert!(matches!(
+            check(repo.path()),
+            Err(PublicationError::MutableAction { path, line: 4, reference })
+                if path == Path::new(".github/workflows/release.yml")
+                    && reference == "owner/action@v1"
+        ));
+    }
+
+    #[test]
+    fn final_review_workflow_ignores_quoted_nested_uses_keys() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let workflow = format!(
+            "'jobs':\n  \"check\":\n    'steps':\n      - \"uses\": owner/action@{sha}\n      - name: nested\n        \"env\":\n          \"uses\": owner/not-a-step@v1\n        'with':\n          'uses': owner/not-a-step@v1\n"
+        );
+
+        assert_eq!(
+            workflow_action_references(&workflow),
+            Ok(vec![ActionReference {
+                line: 4,
+                value: format!("owner/action@{sha}"),
+            }])
+        );
+    }
+
+    #[test]
+    fn final_review_workflow_rejects_malformed_or_unsupported_security_hierarchy() {
+        let cases = [
+            (
+                "unterminated quoted key",
+                "jobs:\n  check:\n    steps:\n      - \"uses: owner/action@v1\n",
+                4,
+                "unterminated quoted scalar",
+            ),
+            (
+                "flow-style jobs",
+                "jobs: { check: { steps: [ { uses: owner/action@v1 } ] } }\n",
+                1,
+                "jobs must be a block mapping",
+            ),
+            (
+                "flow-style steps",
+                "jobs:\n  check:\n    steps: [{ uses: owner/action@v1 }]\n",
+                3,
+                "steps must be a block sequence",
+            ),
+        ];
+
+        for (name, workflow, line, message) in cases {
+            assert_eq!(
+                workflow_action_references(workflow),
+                Err(WorkflowPolicyError { line, message }),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_review_workflow_rejects_yaml_anchors_and_aliases() {
+        let cases = [
+            (
+                "anchored job mapping",
+                "shared: &shared\n  steps:\n    - uses: owner/action@v1\njobs:\n  check:\n    <<: *shared\n",
+            ),
+            (
+                "aliased step",
+                "shared: &shared\n  uses: owner/action@v1\njobs:\n  check:\n    steps:\n      - *shared\n",
+            ),
+        ];
+
+        for (name, workflow) in cases {
+            assert!(
+                matches!(
+                    workflow_action_references(workflow),
+                    Err(WorkflowPolicyError {
+                        message: "YAML anchors and aliases are unsupported",
+                        ..
+                    })
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1766,7 +2542,7 @@ mod tests {
             (
                 "missing configuration",
                 None,
-                "missing required publication file".to_owned(),
+                "Dependabot configuration must be Git-tracked".to_owned(),
             ),
             (
                 "commented cargo",
@@ -1778,7 +2554,7 @@ mod tests {
             (
                 "commented GitHub Actions",
                 Some(
-                    "version: 2\nupdates:\n  - package-ecosystem: cargo\n    schedule:\n      interval: weekly\n  # - package-ecosystem: github-actions\n",
+                    "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  # - package-ecosystem: github-actions\n",
                 ),
                 "missing active Dependabot github-actions ecosystem".to_owned(),
             ),
@@ -1787,7 +2563,7 @@ mod tests {
                 Some(
                     "version: 2\nupdates:\n  package-ecosystem: cargo\n  - package-ecosystem: github-actions\n",
                 ),
-                "missing active Dependabot cargo ecosystem".to_owned(),
+                "Dependabot update fields must belong to a list entry".to_owned(),
             ),
             (
                 "cargo outside updates",
@@ -1801,28 +2577,28 @@ mod tests {
                 Some(
                     "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
                 ),
-                "missing active Dependabot cargo ecosystem".to_owned(),
+                "Dependabot schedule interval must be weekly".to_owned(),
             ),
             (
                 "weekly interval outside cargo schedule",
                 Some(
-                    "version: 2\nupdates:\n  - package-ecosystem: cargo\n    schedule:\n      interval: monthly\n    metadata:\n      interval: weekly\n  - package-ecosystem: github-actions\n    schedule:\n      interval: weekly\n",
+                    "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: monthly\n    metadata:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
                 ),
-                "missing active Dependabot cargo ecosystem".to_owned(),
+                "Dependabot schedule interval must be weekly".to_owned(),
             ),
             (
                 "weekly interval nested below schedule metadata",
                 Some(
-                    "version: 2\nupdates:\n  - package-ecosystem: cargo\n    schedule:\n      metadata:\n        interval: weekly\n  - package-ecosystem: github-actions\n    schedule:\n      interval: weekly\n",
+                    "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      metadata:\n        interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
                 ),
-                "missing active Dependabot cargo ecosystem".to_owned(),
+                "Dependabot schedule interval must be weekly".to_owned(),
             ),
             (
                 "weekly schedule nested below entry metadata",
                 Some(
-                    "version: 2\nupdates:\n  - package-ecosystem: cargo\n    metadata:\n      schedule:\n        interval: weekly\n  - package-ecosystem: github-actions\n    schedule:\n      interval: weekly\n",
+                    "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    metadata:\n      schedule:\n        interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
                 ),
-                "missing active Dependabot cargo ecosystem".to_owned(),
+                "Dependabot schedule interval must be weekly".to_owned(),
             ),
         ];
         for (name, contents, diagnostic) in cases {
@@ -1842,6 +2618,175 @@ mod tests {
                 "{name}"
             );
             assert!(error.to_string().contains(&diagnostic), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn final_review_dependabot_requires_the_configuration_to_be_tracked() {
+        let repo = TestRepo::public_fixture();
+        repo.git(["rm", "--cached", ".github/dependabot.yml"]);
+        repo.commit_noreply();
+
+        assert_eq!(
+            check(repo.path()),
+            Err(PublicationError::Workflow {
+                path: PathBuf::from(".github/dependabot.yml"),
+                line: 1,
+                message: "Dependabot configuration must be Git-tracked",
+            })
+        );
+    }
+
+    #[test]
+    fn final_review_dependabot_requires_root_version_two() {
+        let cases = [
+            (
+                "wrong version",
+                "version: 1\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "commented version",
+                "# version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "nested version",
+                "metadata:\n  version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+        ];
+
+        for (name, contents) in cases {
+            let repo = TestRepo::public_fixture();
+            repo.write(".github/dependabot.yml", contents);
+            repo.add_all();
+            repo.commit_noreply();
+
+            assert!(
+                matches!(
+                    check(repo.path()),
+                    Err(PublicationError::Workflow { path, message, .. })
+                        if path == Path::new(".github/dependabot.yml")
+                            && message == "Dependabot root version must be 2"
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_review_dependabot_requires_direct_root_directory() {
+        let cases = [
+            (
+                "missing directory",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "wrong directory",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: /crates\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "nested directory",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    metadata:\n      directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "commented directory",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    # directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+        ];
+
+        for (name, contents) in cases {
+            let repo = TestRepo::public_fixture();
+            repo.write(".github/dependabot.yml", contents);
+            repo.add_all();
+            repo.commit_noreply();
+
+            assert!(
+                matches!(
+                    check(repo.path()),
+                    Err(PublicationError::Workflow { path, message, .. })
+                        if path == Path::new(".github/dependabot.yml")
+                            && message == "Dependabot update directory must be /"
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_review_dependabot_requires_direct_weekly_schedule() {
+        let cases = [
+            (
+                "missing schedule",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "nested schedule",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    metadata:\n      schedule:\n        interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "wrong interval",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: monthly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "nested interval",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      metadata:\n        interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "commented interval",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      # interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+        ];
+
+        for (name, contents) in cases {
+            let repo = TestRepo::public_fixture();
+            repo.write(".github/dependabot.yml", contents);
+            repo.add_all();
+            repo.commit_noreply();
+
+            assert!(
+                matches!(
+                    check(repo.path()),
+                    Err(PublicationError::Workflow { path, message, .. })
+                        if path == Path::new(".github/dependabot.yml")
+                            && message == "Dependabot schedule interval must be weekly"
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_review_dependabot_requires_exactly_the_two_intended_updates() {
+        let cases = [
+            (
+                "extra ecosystem",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: npm\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "duplicate cargo",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+            (
+                "duplicate root updates",
+                "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\nupdates:\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
+            ),
+        ];
+
+        for (name, contents) in cases {
+            let repo = TestRepo::public_fixture();
+            repo.write(".github/dependabot.yml", contents);
+            repo.add_all();
+            repo.commit_noreply();
+
+            assert!(
+                matches!(
+                    check(repo.path()),
+                    Err(PublicationError::Workflow { path, message, .. })
+                        if path == Path::new(".github/dependabot.yml")
+                            && message
+                                == "Dependabot updates must contain exactly cargo and github-actions"
+                ),
+                "{name}"
+            );
         }
     }
 }
