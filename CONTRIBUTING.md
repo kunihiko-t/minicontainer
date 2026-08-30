@@ -20,6 +20,16 @@ cargo xtask check
 公開するコメントと文書は日本語で書く。
 用語、前提、保証範囲を曖昧にせず、実装済みの機能と将来の目標を区別する。
 
+## Pull Requestの統合
+
+Pull RequestはCIとレビューの入口として使う。
+保守者はGitHubのmergeボタンと`gh pr merge`を使わない。
+server-side mergeではGitHubがcommitter identityを生成するため、このリポジトリが要求するnoreply identityを保証できない。
+
+統合前に`origin/main`をfetchし、Pull Requestのbaseが移動していないことを確認する。
+続いて、headの作者とcommitterがnoreply形式だけを使い、`cargo xtask check`とrequired checkが成功していることを確認する。
+検証済みheadはforce optionを付けず、`main`へfast-forward pushする。
+
 ## ライセンス
 
 コントリビューションはMIT LicenseまたはApache License 2.0の条件で提供することに同意したものとして扱う。
