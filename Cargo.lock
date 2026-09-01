@@ -80,6 +80,10 @@ dependencies = [
 [[package]]
 name = "minicontainer-runtime"
 version = "0.1.0"
+dependencies = [
+ "minicontainer-protocol",
+ "minios-abi",
+]
 
 [[package]]
 name = "minios-abi"
