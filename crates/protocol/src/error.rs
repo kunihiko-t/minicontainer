@@ -4,12 +4,16 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     Header(ControlError),
+    TruncatedFrame,
 }
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Header(error) => write!(formatter, "invalid UART frame header: {error:?}"),
+            Self::TruncatedFrame => {
+                write!(formatter, "UART ended with an incomplete control frame")
+            }
         }
     }
 }

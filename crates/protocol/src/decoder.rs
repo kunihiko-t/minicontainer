@@ -54,6 +54,15 @@ impl Decoder {
 
         Ok(frames)
     }
+
+    /// UARTの終端で、未完了frameが残っていないことを確認する。
+    pub fn finish(&self) -> Result<(), ProtocolError> {
+        if self.buffer.is_empty() {
+            Ok(())
+        } else {
+            Err(ProtocolError::TruncatedFrame)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +338,20 @@ mod tests {
                 minios_abi::control::ControlError::WrongFixedPayloadLength
             ))
         );
+    }
+
+    // Catches treating EOF with a partial header or payload as a valid stream,
+    // which lets a caller report success after silently dropping control data.
+    #[test]
+    fn finish_rejects_a_truncated_frame() {
+        for truncated in [
+            b"MCF1".as_slice(),
+            &encode_test_frame(FrameKind::Stdout, b"payload")[..14],
+        ] {
+            let mut decoder = Decoder::new();
+            assert_eq!(decoder.push(truncated).unwrap(), Vec::<Frame>::new());
+            assert_eq!(decoder.finish(), Err(crate::ProtocolError::TruncatedFrame));
+        }
     }
 
     fn encode_test_frame(kind: FrameKind, payload: &[u8]) -> Vec<u8> {

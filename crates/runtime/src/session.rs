@@ -168,7 +168,10 @@ impl Session {
     }
 
     /// QEMU終了時にsessionを確定する。
-    pub fn finish(&self, status: ProcessStatus) -> Result<RunOutcome, SessionError> {
+    pub fn finish(&mut self, status: ProcessStatus) -> Result<RunOutcome, SessionError> {
+        self.finish_boot_preamble()?;
+        self.decoder.finish().map_err(SessionError::Protocol)?;
+
         let State::Exited(exit_code) = self.state else {
             return Err(SessionError::MissingExit);
         };
@@ -184,6 +187,14 @@ impl Session {
             exit_code,
             diagnostics,
         })
+    }
+
+    fn finish_boot_preamble(&mut self) -> Result<(), SessionError> {
+        if !self.control_started {
+            let prefix = std::mem::take(&mut self.magic_prefix);
+            self.append_boot_diagnostic(&prefix)?;
+        }
+        Ok(())
     }
 
     fn first_control_bytes(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, SessionError> {
@@ -387,7 +398,7 @@ mod tests {
     // when no Exit control frame was received.
     #[test]
     fn finish_rejects_eof_without_an_exit_frame() {
-        let session = ready_session();
+        let mut session = ready_session();
 
         assert_eq!(
             session.finish(successful_process()),
@@ -476,6 +487,36 @@ mod tests {
         assert_eq!(
             session.finish(status),
             Err(SessionError::ProcessFailed(status))
+        );
+    }
+
+    // Catches returning a successful guest outcome when UART ends after Exit
+    // but the decoder still owns an incomplete subsequent control frame.
+    #[test]
+    fn finish_rejects_a_truncated_frame_after_exit() {
+        let mut session = ready_session();
+        session
+            .push_uart(&frame(FrameKind::Exit, &0_u32.to_le_bytes()))
+            .unwrap();
+        assert_eq!(session.push_uart(b"MCF1").unwrap(), Vec::new());
+
+        assert_eq!(
+            session.finish(successful_process()),
+            Err(SessionError::Protocol(ProtocolError::TruncatedFrame))
+        );
+    }
+
+    // Catches delaying the final 1–3 boot bytes that happened to match the
+    // start of MCF1, thereby bypassing the boot preamble size limit at EOF.
+    #[test]
+    fn finish_counts_a_partial_magic_prefix_against_the_boot_limit() {
+        let mut session = Session::new();
+        session.push_uart(&vec![b'B'; 64 * 1024]).unwrap();
+        assert_eq!(session.push_uart(b"MCF").unwrap(), Vec::new());
+
+        assert_eq!(
+            session.finish(successful_process()),
+            Err(SessionError::BootPreambleTooLarge)
         );
     }
 
