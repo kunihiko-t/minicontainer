@@ -1,11 +1,14 @@
 //! payload一時fileのRAII管理。
 
+use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::RuntimeError;
 
 const PAYLOAD_FILE_NAME: &str = "payload.mcb";
+const TEMP_CREATE_ATTEMPTS: usize = 64;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -21,26 +24,59 @@ pub struct PayloadTemp {
 impl PayloadTemp {
     /// process固有の新しい一時directoryへpayload bytesを書き込む。
     pub fn create(bytes: &[u8]) -> Result<Self, RuntimeError> {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "minicontainer-run-{}-{}",
+        Self::create_unique_in(
+            bytes,
+            &std::env::temp_dir(),
             std::process::id(),
-            sequence
-        ));
-        Self::create_in(bytes, &root)
+            &TEMP_SEQUENCE,
+        )
+    }
+
+    fn create_unique_in(
+        bytes: &[u8],
+        parent: &Path,
+        process_id: u32,
+        sequence: &AtomicU64,
+    ) -> Result<Self, RuntimeError> {
+        let mut last_collision = None;
+        for _ in 0..TEMP_CREATE_ATTEMPTS {
+            let candidate = sequence.fetch_add(1, Ordering::Relaxed);
+            let root = parent.join(format!("minicontainer-run-{process_id}-{candidate}"));
+            match Self::create_in(bytes, &root) {
+                Err(RuntimeError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    last_collision = Some(error);
+                }
+                result => return result,
+            }
+        }
+
+        Err(RuntimeError::Io(
+            last_collision.expect("the retry budget is non-zero"),
+        ))
     }
 
     /// 指定されたroot (まだ存在しないこと) へpayloadを書き込む。
     ///
     /// 書き込みに失敗した場合は、部分書き込みのfileと空のdirectoryを
     /// できる限り取り除いてからerrorを返す。
-    pub fn create_in(bytes: &[u8], root: &Path) -> Result<Self, RuntimeError> {
+    fn create_in(bytes: &[u8], root: &Path) -> Result<Self, RuntimeError> {
+        Self::create_in_with_writer(bytes, root, write_payload)
+    }
+
+    fn create_in_with_writer<F>(
+        bytes: &[u8],
+        root: &Path,
+        write_payload: F,
+    ) -> Result<Self, RuntimeError>
+    where
+        F: FnOnce(&Path, &[u8]) -> io::Result<()>,
+    {
         // create_dirは既存entry (symlink含む) の上では失敗するため、
         // 他人のpathを横取りしない。
-        std::fs::create_dir(root).map_err(RuntimeError::Io)?;
+        create_private_root(root).map_err(RuntimeError::Io)?;
         let payload = root.join(PAYLOAD_FILE_NAME);
 
-        let write_result = std::fs::write(&payload, bytes);
+        let write_result = write_payload(&payload, bytes);
         if let Err(error) = write_result {
             // 部分書き込みのfileが残っていれば取り除き、空になったdirectoryも
             // 取り除く。directoryの削除は失敗してもerrorを上書きしない。
@@ -61,6 +97,28 @@ impl PayloadTemp {
     }
 }
 
+fn create_private_root(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn write_payload(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)
+}
+
 impl Drop for PayloadTemp {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.payload);
@@ -70,8 +128,10 @@ impl Drop for PayloadTemp {
 
 #[cfg(test)]
 mod tests {
-    use super::PayloadTemp;
+    use super::{PayloadTemp, write_payload};
+    use std::io;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
 
     // Catches leaving the payload file or its directory behind after the run.
     #[test]
@@ -91,31 +151,69 @@ mod tests {
         );
     }
 
-    // Catches retaining a partially written payload file when the write fails.
-    #[cfg(unix)]
+    // Catches retaining a partially written payload file when the writer
+    // reports an error after creating it.
     #[test]
-    fn a_failed_write_leaves_no_temporary_file_behind() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_failed_partial_write_removes_the_payload_and_root() {
+        use std::io::Write;
 
         let root = std::env::temp_dir().join(format!(
-            "minicontainer-runtime-test-{}-readonly",
+            "minicontainer-runtime-test-{}-partial-write",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let outcome = PayloadTemp::create_in_with_writer(
+            b"MINICTR\0payload bytes",
+            &root,
+            |payload, bytes| {
+                let mut file = std::fs::File::create(payload)?;
+                file.write_all(&bytes[..4])?;
+                Err(io::Error::other("injected write failure"))
+            },
+        );
+
+        assert!(outcome.is_err(), "the injected writer must fail");
+        assert!(!root.join("payload.mcb").exists());
+        assert!(!root.exists());
+    }
+
+    // Catches truncating or following a payload entry that appears before the
+    // exclusive create.
+    #[test]
+    fn payload_writer_rejects_an_existing_entry_without_changing_it() {
+        let root = std::env::temp_dir().join(format!(
+            "minicontainer-runtime-test-{}-exclusive-write",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let payload = root.join("payload.mcb");
+        std::fs::write(&payload, b"existing").unwrap();
 
-        let outcome = PayloadTemp::create_in(b"MINICTR\0payload bytes", &root);
+        let error = write_payload(&payload, b"replacement").unwrap_err();
 
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let leftovers = std::fs::read_dir(&root)
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .count();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&payload).unwrap(), b"existing");
         std::fs::remove_dir_all(&root).unwrap();
+    }
 
-        assert!(outcome.is_err(), "a read-only root must fail the write");
-        assert_eq!(leftovers, 0, "a failed write must leave no partial file");
+    // Catches exposing runtime-owned payload storage through group or other
+    // permission bits inherited from the process umask.
+    #[cfg(unix)]
+    #[test]
+    fn payload_storage_denies_group_and_other_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = PayloadTemp::create(b"private payload").unwrap();
+        let payload_mode = std::fs::metadata(temp.path()).unwrap().permissions().mode();
+        let root_mode = std::fs::metadata(temp.path().parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+
+        assert_eq!(root_mode & 0o077, 0, "temporary root must be private");
+        assert_eq!(payload_mode & 0o077, 0, "payload file must be private");
     }
 
     // Catches reusing the same temporary root for sequential runs within one
@@ -126,5 +224,33 @@ mod tests {
         let second = PayloadTemp::create(b"second").unwrap();
         assert_ne!(first.path(), second.path());
         assert_eq!(std::fs::read(second.path()).unwrap(), b"second");
+    }
+
+    // Catches aborting on a stale first candidate and verifies that counter
+    // wraparound advances to the next available root without removing the
+    // pre-existing directory.
+    #[test]
+    fn unique_creation_retries_a_collision_across_counter_wraparound() {
+        let parent = std::env::temp_dir().join(format!(
+            "minicontainer-runtime-test-{}-collision-parent",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).unwrap();
+        let fake_pid = 4242;
+        let stale = parent.join(format!("minicontainer-run-{fake_pid}-{}", u64::MAX));
+        std::fs::create_dir(&stale).unwrap();
+        let sequence = AtomicU64::new(u64::MAX);
+
+        let temp = PayloadTemp::create_unique_in(b"payload", &parent, fake_pid, &sequence).unwrap();
+
+        assert_eq!(
+            temp.path().parent().unwrap().file_name().unwrap(),
+            "minicontainer-run-4242-0"
+        );
+        assert!(stale.exists(), "a colliding root is not owned by this run");
+        drop(temp);
+        std::fs::remove_dir(&stale).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
     }
 }

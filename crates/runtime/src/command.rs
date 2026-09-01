@@ -23,10 +23,9 @@ impl QemuCommand {
             return Err(RuntimeError::UnsafePayloadPath(payload.to_path_buf()));
         }
 
-        let loader = format!(
-            "loader,file={},addr=0x87800000,force-raw=on",
-            payload.as_os_str().to_string_lossy()
-        );
+        let mut loader = OsString::from("loader,file=");
+        loader.push(payload.as_os_str());
+        loader.push(",addr=0x87800000,force-raw=on");
         let args = [
             OsStr::new("-machine"),
             OsStr::new("virt"),
@@ -39,7 +38,7 @@ impl QemuCommand {
             OsStr::new("-kernel"),
             kernel.as_ref().as_os_str(),
             OsStr::new("-device"),
-            OsStr::new(&loader),
+            loader.as_os_str(),
             OsStr::new("-serial"),
             OsStr::new("stdio"),
             OsStr::new("-monitor"),
@@ -115,14 +114,44 @@ mod tests {
         ));
     }
 
+    // Catches replacing invalid Unix filename bytes while embedding the
+    // payload path in QEMU's loader option.
+    #[cfg(unix)]
+    #[test]
+    fn command_preserves_non_utf8_payload_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let payload = OsStr::from_bytes(b"/tmp/run/\xffpayload.mcb");
+        let command = QemuCommand::new("/kernel", payload).unwrap();
+        let loader = command
+            .args()
+            .windows(2)
+            .find(|pair| pair[0] == "-device")
+            .map(|pair| pair[1].as_os_str())
+            .unwrap();
+
+        assert_eq!(
+            loader.as_bytes(),
+            b"loader,file=/tmp/run/\xffpayload.mcb,addr=0x87800000,force-raw=on"
+        );
+    }
+
     // Catches rejecting a kernel path that only lives in a non-UTF-8 name;
     // -kernel takes a plain argv element, so commas stay legal there.
     #[cfg(unix)]
     #[test]
-    fn command_accepts_non_utf8_kernel_paths_with_commas() {
+    fn command_preserves_non_utf8_kernel_paths_with_commas() {
         use std::os::unix::ffi::OsStrExt;
-        let kernel = OsStr::from_bytes(b"/tmp/kernel,m1.elf");
+
+        let kernel = OsStr::from_bytes(b"/tmp/kernel,\xffm1.elf");
         let command = QemuCommand::new(kernel, "/tmp/run/payload.mcb").unwrap();
-        assert!(command.contains_pair("-kernel", "/tmp/kernel,m1.elf"));
+        let kernel_arg = command
+            .args()
+            .windows(2)
+            .find(|pair| pair[0] == "-kernel")
+            .map(|pair| pair[1].as_os_str())
+            .unwrap();
+
+        assert_eq!(kernel_arg.as_bytes(), b"/tmp/kernel,\xffm1.elf");
     }
 }
