@@ -258,10 +258,13 @@ impl ProcessControl for SystemProcess {
 
         let status = match self.child.try_wait().map_err(ProcessError::Wait)? {
             Some(status) => process_status(status),
-            None => {
-                self.child.kill().map_err(ProcessError::Terminate)?;
-                process_status(self.child.wait().map_err(ProcessError::Wait)?)
-            }
+            None => match self.child.kill() {
+                Ok(()) => process_status(self.child.wait().map_err(ProcessError::Wait)?),
+                Err(kill_error) => match self.child.try_wait().map_err(ProcessError::Wait)? {
+                    Some(status) => process_status(status),
+                    None => return Err(ProcessError::Terminate(kill_error)),
+                },
+            },
         };
         self.observed_status = Some(status);
         self.reaped_status = Some(status);
@@ -372,10 +375,10 @@ mod tests {
         }
     }
 
-    // Catches treating an elapsed deadline as a successful process event, or
-    // returning before the caller can synchronously reap the child.
+    // Catches a timeout path that kills the child implicitly, instead of
+    // leaving the lifecycle choice with the caller.
     #[test]
-    fn timeout_kills_and_reaps_the_child() {
+    fn timeout_leaves_the_child_for_explicit_reap() {
         let mut child = spawn_helper("sleep").unwrap();
         let pid = child.id();
 
@@ -383,6 +386,7 @@ mod tests {
             child.wait_until(Duration::from_millis(25)),
             Err(ProcessError::TimedOut)
         ));
+        assert!(pid_is_alive(pid));
 
         child.terminate_and_reap().unwrap();
         assert!(!pid_is_alive(pid));
