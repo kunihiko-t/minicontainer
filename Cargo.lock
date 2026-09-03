@@ -81,6 +81,7 @@ dependencies = [
 name = "minicontainer-runtime"
 version = "0.1.0"
 dependencies = [
+ "minicontainer-bundle",
  "minicontainer-protocol",
  "minios-abi",
 ]
