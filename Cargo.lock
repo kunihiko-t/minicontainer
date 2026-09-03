@@ -87,6 +87,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "minictr"
+version = "0.1.0"
+dependencies = [
+ "minicontainer-bundle",
+ "minicontainer-runtime",
+]
+
+[[package]]
 name = "minios-abi"
 version = "0.1.1"
 source = "git+https://github.com/kunihiko-t/minios.git?tag=minios-abi-v0.1.1#a3631759fe0490c5d39214108a004dedfdeab9f8"
