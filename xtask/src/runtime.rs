@@ -739,15 +739,17 @@ fn run_with_timeout(
 
 /// harnessの子のprocess group全体へSIGKILLを送る。子は `process_group(0)`
 /// で自groupのleaderとして起動するため、PIDはPGIDと等しく、子孫 (timeout
-/// した`minictr`が残したQEMUなど) まで届く。`kill` binaryの不在や既死PIDは
-/// 無視する。呼び出し側は必ず直接のkillとwaitも行う。
+/// した`minictr`が残したQEMUなど) まで届く。既死groupのerrorは無視する。
+/// 呼び出し側は必ず直接のkillとwaitも行う。
+///
+/// 外部の`kill` binaryは使わない。procpsの`kill`は`-pgid`形式をexit 0の
+/// まま黙って無視し、孫processを生かしたまま残す。`kill(2)`を直接呼ぶ。
 fn kill_process_group(pid: u32) {
-    let mut command = Command::new("kill");
-    command.arg("-KILL");
-    command.arg(format!("-{pid}"));
-    command.stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::null());
-    let _ = command.status();
+    let target = -(pid as libc::pid_t);
+    // SAFETY: `kill(2)`の第一引数が負のときはprocess groupを指定する。
+    // `pid`はspawn直後の子のPIDで`pid_t`に収まる。戻り値は既死groupの
+    // errorを含めて無視する。
+    let _ = unsafe { libc::kill(target, libc::SIGKILL) };
 }
 
 fn read_all(mut stream: impl io::Read + Send + 'static) -> io::Result<Vec<u8>> {
