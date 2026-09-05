@@ -34,7 +34,8 @@ killと`try_wait`の競合で既に終了していた場合は、そのstatusを
 killできないのに終了もしていない場合だけ型付きerrorを返す。
 
 `SystemProcess`の`Drop`は`terminate_and_reap`を呼ぶ最終手段である。
-呼び出し側がerror経路で子を放棄しても、子processは残らない。
+呼び出し側がエラー経路で子を放棄した場合も、終了と回収を試みる。
+ただし`Drop`からは失敗を返せず、ホスト停止や`SIGKILL`では`Drop`自体が実行されない。
 ただし公開の`ProcessBackend` traitがDrop実装を要求するわけではない。
 自作backendでは呼び出し側が必ず`terminate_and_reap`を呼ぶ必要がある。
 

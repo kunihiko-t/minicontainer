@@ -14,7 +14,8 @@ Rustは1.98.0 stableの完全一致を要求する。
 ## setupで診断する
 
 最初に`cargo xtask setup`を実行する。
-このcommandは環境を変更せず、toolの有無とversionだけを診断する。
+`xtask setup`自体はツールの導入や更新を行わず、有無とバージョンを診断する。
+ただし起動元のCargoやrustupは、初回の依存取得や指定ツールチェーンの導入を行うことがある。
 不足があれば導入手順つきの診断を出して失敗するため、表示に従ってtoolを揃える。
 
 ## checkで検証する
@@ -28,6 +29,10 @@ CIは同じ二つのcommandをUbuntu 24.04で実行する。
 
 ## 初回実行までの流れ
 
-`minictr run hello`までの手順は`README.md`のQuick startに従う。
+RustとCargoを使える状態にするにはrustupを用意し、リポジトリの`rust-toolchain.toml`が指定するツールチェーンを導入する。
+QEMUはmacOSでは`brew install qemu`、Ubuntuでは`sudo apt-get install qemu-system-misc`で導入する。
+Gitもあらかじめ用意する。
+
+`minictr run hello`までの手順は[READMEのクイックスタート](../../README.md#クイックスタート)に従う。
 固定revisionのminiOSからguest kernelをbuildし、hello bundleをstoreへ取り込んで`hello` tagを作り、`minictr run`で実行する。
 storeとkernelの解決、実行結果の読み方は第9章、失敗の切り分けは第10章を参照する。

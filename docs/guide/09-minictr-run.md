@@ -25,8 +25,10 @@ command名、option名、image名はUTF-8でなければならず、storeとkern
 
 解決したimage tagはcontent-addressed storeから検証済みbundle bytesとして取り出す。
 bundleとkernel pathと期限をruntimeへ渡し、guest outcomeを受け取る。
-guest stdoutはhost標準出力へ、guest stderrはhost標準エラー出力へ、そのまま書き出す。
-途中で書き込みに失敗したらhost失敗として終わる。
+ゲスト出力は実行中にメモリーへ蓄積し、成功結果を受け取ってから標準出力、標準エラー出力の順に書き出す。
+二つのストリーム間で、ゲストが出力した順序は保存しない。
+書き込みやフラッシュに失敗したらホスト側の失敗として終わる。
+ランタイムがエラーを返した場合、途中まで蓄積したゲスト出力はCLIに返らない。
 
 ## 終了code
 
@@ -42,4 +44,6 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、
 `invalid UART control frame`を含む行はcontrol protocolの破損である。
 `guest reported an error`を含む行はguest自身の実行失敗である。
 `deadline elapsed`を含む行は全体のtimeoutである。
-成功markerの有無ではなく、終了codeとこの分類で結果を判定する。
+ゲスト自身も2や125を返せるため、終了コードだけでは使い方の誤りやホスト側の失敗と区別できない。
+`minictr:`という文字列もゲストが出力できるので、接頭辞は調査の手掛かりとして使う。
+プログラムから失敗を厳密に区別する場合は、Rust APIの`Result`とエラー型を使う。

@@ -1,6 +1,6 @@
 # テストハーネスと公開gate
 
-この章は、書式、文書、Clippy、単体試験、build、実機検証を同じcommandから順に検証する方法を説明する。
+書式、文書、Clippy、単体試験、ビルド、実QEMUでの検証は、共通のテストハーネスから実行する。
 検証の入口は`cargo xtask setup`と`cargo xtask check`の二つだけである。
 `xtask`が受け付けるcommandはこの二つであり、引数を付けると型付きerrorになる。
 
@@ -17,34 +17,47 @@ QEMUは8.2.0以上を要求し、Gitはversionの読み取りを確認する。
 依存関係を解決するすべてのCargo phaseは`--locked`で実行する。
 各段階は`[n/15]`の開始行と経過秒つきの成否行を出し、最後に全体の要約を出す。
 
-1. `cargo fmt --all -- --check`で書式を検査する。
-2. 文書内のlocal Markdown linkの到達を検査する。
-3. 公開条件（必須file、禁止内容、workflow、identity）を検査する。
-4. から8. crateごとのClippyを`--all-targets --locked -- -D warnings`で実行する。順序はbundle、protocol、runtime、minictr、xtaskである。
-9. から13. crateごとの単体試験を`--locked`で実行する。順序はClippyと同じである。
-14. `cargo build --workspace --locked`でworkspace全体をbuildする。
-15. 実QEMU end-to-end検証を実行する。
+| 段階 | 検査 |
+| --- | --- |
+| 1 | `cargo fmt --all -- --check`による書式検査 |
+| 2 | Markdown内のローカルリンクの検査 |
+| 3 | 必須文書、禁止内容、ワークフロー、コミットのメールアドレスの検査 |
+| 4〜8 | bundle、protocol、runtime、minictr、xtaskの順にClippyを実行 |
+| 9〜13 | 同じcrate順に単体テストを実行 |
+| 14 | `cargo build --workspace --locked`によるビルド |
+| 15 | 実QEMUによるエンドツーエンド検証 |
+
+Clippyには`--all-targets --locked -- -D warnings`、単体テストには`--locked`を指定する。
 
 安い検査を先に置き、失敗箇所を一つに絞るのが順序の意図である。
 `--locked`は、lockfileと食い違う依存解決での検証成功を許さない。
 
 ## 公開条件の検査
 
-第3段階は、公開に耐える状態を五つに分けて検査する。
-必須file（license二種、`SECURITY.md`、`CONTRIBUTING.md`、`README.md`、設計、索引、脅威モデル）の存在。
-`README.md`にSPDX表記とsecurity境界の非保証文が含まれること。
-Git管理下のtree全体に、local pathとURL、私物email、秘密鍵、token類が含まれないこと。
-workflowの参照actionがimmutableな参照であることと、Dependabot設定が管理下にあること。
-HEAD履歴全体のauthorとcommitterがnoreply形式だけを使うこと。
+第3段階では、必須文書とREADMEのライセンス表記、セキュリティー境界を保証しない旨の記載を確認する。
+Git管理下のテキストには、特定のローカルパス、メールドメイン、秘密鍵やトークンの既知パターンがないかを調べる。
+すべての秘密情報を検出できる検査ではないため、差分の目視確認も必要である。
+
+ワークフローでは、外部のGitHub ActionsがコミットSHAに固定されていることなどを確認する。
+Dependabot設定と、HEADからたどれるコミットの作者、コミッターのnoreply形式も検査対象になる。
+詳細は[公開条件の実装](../../xtask/src/publication.rs)で確認できる。
+
+内容検査は`git ls-files`に列挙されるファイルが対象であり、未追跡の新規ファイルを含まない。
+追加する文書は内容を確認してから`git add`し、その後に検査する。
+検査は作業ツリーの内容を読むため、ステージ後に編集した場合はコミット対象との差も確認する。
 
 ## CIは同じgateを実行する
 
 Ubuntu 24.04のCIは、`cargo xtask setup`に続けて`cargo xtask check`を実行する。
-localとCIでcommandが同一のため、localの緑はCIの緑と一致する。
-Pull Requestの統合条件（検証済みheadのfast-forwardなど）は`CONTRIBUTING.md`を参照する。
+同じ検査を共有するが、OS、QEMUのバージョン、権限、ネットワークなどの差によって結果は変わり得る。
+ローカルでの成功に加え、対象コミットのCI結果も確認する。
+Pull Requestの統合条件は[コントリビュート](../../CONTRIBUTING.md)を参照する。
 
 ## E2Eは最終段階である
 
 第15段階は、pin留めしたminiOS revisionからguest kernelをbuildし、`minictr run hello`の標準出力、標準エラー出力、終了code 42を確認する。
 timeout経路とmalformed-frame経路では、非0終了に加えてQEMUと一時領域の残留がなく、happy-pathの内容が混入しないことを確認する。
-失敗の分類は第10章を参照する。
+プロセス残存検査には`ps`が必要であり、実行制限のあるサンドボックスでは権限エラーになることがある。
+通常は`target/e2e/minios`へ固定リビジョンを取得するため、初回はネットワーク接続も必要になる。
+既存の取得済みソースを使う場合は、`MINICTR_E2E_MINIOS_DIR`に固定リビジョンと一致する、未変更のチェックアウトを指定する。
+失敗の分類は[第10章](10-failure-diagnostics.md)を参照する。

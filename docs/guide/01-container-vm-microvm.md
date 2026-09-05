@@ -5,15 +5,18 @@
 
 ## 三つの実行形態
 
-process分離のコンテナは、ホストと同じkernelを共有し、namespaceとcgroup相当の仕組みでprocessを区切る。
-起動は速いが、kernelが単一の信頼基盤になる。
+Linuxのプロセス分離型コンテナは、ホストと同じカーネルを共有し、namespaceで資源の見え方を分け、cgroupで資源の使用量を管理する。
+コンテナごとにカーネルを起動せず、共有するカーネルを信頼する前提で動作する。
 
 仮想マシンは、VMMが用意する仮想hardwareの上で独立したguest kernelを動かす。
-guestは独自のaddress空間とsystem callを持つため、境界はhardware仮想化とguest kernelの実装に依存する。
+ゲストは独自のカーネルとシステムコールを持つ。
+仮想CPUの実行には、ハードウェア支援による仮想化やソフトウェアによるエミュレーションを使う。
+MiniContainerはQEMUでRISC-Vをエミュレートするため、Apple Silicon上でもRISC-Vゲストを動かせる。
 
-microVMは、一つのapplicationのために最小化した仮想マシンである。
-仮想hardwareとguest kernelを削り、起動の速さと見通しの良さを取る。
-分離の強さは残した実装に依存するため、用途を限定して使う。
+microVMは、仮想デバイスなどを絞った軽量な仮想マシンを指す。
+たとえば[Firecracker](https://github.com/firecracker-microvm/firecracker)はデバイスモデルを最小限にし、起動時間とメモリー使用量の削減を目指している。
+単一アプリケーションしか実行できないという定義ではなく、性能や分離の保証は実装によって異なる。
+MiniContainerも責務を小さく分けて学ぶ設計だが、Firecrackerの性能や分離特性を備えているという意味ではない。
 
 ## MiniContainerの境界
 

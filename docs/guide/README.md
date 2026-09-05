@@ -2,10 +2,10 @@
 
 このガイドは、miniOSをゲストカーネルとして使うRISC-V 64ランタイムを段階的に学ぶための索引である。
 
-## 読める章
+## 章の一覧
 
-現在のコードに対応する章の本文がある。
-各章は一つの責務だけを説明する。
+第1章から第11章は現在の実装を説明し、第12章は将来のOCI対応を検討するための資料である。
+まず実行結果を確認したい場合は、[クイックスタート](../../README.md#クイックスタート)から始める。
 
 1. **[コンテナ、仮想マシン、microVMの違い](01-container-vm-microvm.md)**：ホストとゲストの責務を分け、MiniContainerが採用する仮想マシン境界を説明できるようにする。
 2. **[開発環境と`cargo xtask`](02-dev-environment-xtask.md)**：Rust、RISC-V target、QEMU、Gitを診断し、同じrelease gateをローカルとCIで実行できるようにする。
@@ -23,10 +23,15 @@
 第5章から第9章までがQEMUとguest実行の経路に対応する。
 第1章から第11章までの本文が現在のコードに対応し、第12章は次の拡張方向を扱う。
 
-## 現在のコードと章の対応
+## 実装を読むときの入口
 
-第2章の環境診断とrelease gate、第3章のGuest ABI条件、第4章のMiniBundle codecとstore、第7章のhost decoder、第10章の失敗分類と診断、第11章のhost側verificationに加え、第5章のpayload受け渡し、第6章のQEMU backend、第8章のlifecycleとcleanup、第9章の`minictr run`を実装している。
-`minictr run hello`は一つのQEMU仮想マシンでRISC-V 64 ELFを実行し、標準出力、標準エラー出力、終了code、timeoutを返す。
+| 対象 | コード | 対応する章 |
+| --- | --- | --- |
+| MiniBundleの構築とストア | [bundle](../../crates/bundle/src/lib.rs) | 第4章 |
+| UARTフレームの復元 | [protocol](../../crates/protocol/src/lib.rs) | 第7章 |
+| QEMU起動と実行後の後始末 | [runtime](../../crates/runtime/src/lib.rs) | 第5〜8章、第10章 |
+| コマンドラインと終了コード | [minictr](../../crates/minictr/src/main.rs) | 第9章、第10章 |
+| 環境診断と検証 | [xtask](../../xtask/src/lib.rs) | 第2章、第11章 |
 
 ## 設計資料
 

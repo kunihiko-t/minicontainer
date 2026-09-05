@@ -15,7 +15,7 @@ Linux application互換は提供しない。
 MiniContainerはtagで固定したminios-abi (`minios-abi-v0.1.1`) を利用する。
 boot header、manifest、UART control frame、system call番号をhostとguestで共有する。
 実行kernelはminiOSの固定revisionからbuildする。
-ABIの更新は、tagとkernel revisionの変更として別に承認する。
+ABIを更新する場合は、タグとカーネルリビジョンの対応を確認し、ホストとゲストを組み合わせた検証を行う。
 
 ## system callの条件
 

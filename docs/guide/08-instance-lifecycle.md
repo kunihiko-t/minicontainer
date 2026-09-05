@@ -22,7 +22,7 @@ backendが期限過ぎの出力を返し続けても、全体の期限でrunはt
 
 ## 終了とcleanup
 
-主結果が決まったら、必ず`terminate_and_reap`で子processを止めて回収する。
+主結果が決まったら、`terminate_and_reap`を呼び、子プロセスの停止と回収を試みる。
 終了済みの子はそのstatusを回収し、動作中の子はkillしてから回収する。
 次にpayload fileとdirectoryの削除を試みる。
 
@@ -42,5 +42,5 @@ backendが期限過ぎの出力を返し続けても、全体の期限でrunはt
 - applicationの非0終了: guestの終了codeをそのまま返す。
 - host失敗: QEMU非0終了、入出力error、cleanup失敗。
 
-`minictr`はguest終了codeをprocess終了codeへ写し、host失敗を終了code 125へ写す。
+`minictr`は0〜255のゲスト終了コードをプロセス終了コードへ写し、範囲外やホスト側の失敗を終了コード125へ写す。
 詳しいCLIの振る舞いは第9章を参照する。

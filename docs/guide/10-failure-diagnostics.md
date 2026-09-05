@@ -6,7 +6,8 @@ run全体のlifecycleは第8章、CLIの構文と解決は第9章を参照する
 ## 失敗の三分類
 
 runの失敗は、出所で三つに分ける。
-applicationの非0終了は失敗ではなく、guestの結果としてそのまま返す。
+アプリケーションの非0終了は、ランタイムの失敗とは区別してゲストの結果として返す。
+その値をアプリケーションの成功とみなすかは、呼び出し側が判断する。
 
 - host error: bundle不正、期限の表現不能、payload pathの拒否、QEMU起動失敗、入出力error、cleanup失敗、QEMUの非0終了。
 - guest failure: `GuestError` frame。実行中の異常に加え、Exit後のresource回収失敗もここに入る。
@@ -34,7 +35,8 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写る。
 - `; cleanup also failed`を含む行は、主操作に加えて後始末も失敗したことを示す。
 
 guest stderrのbytes自体にも`minictr:`は付かない。
-prefixの有無で、guest出力とhost診断を見分ける。
+ただしゲストも同じ接頭辞や終了コードを出力できるため、接頭辞だけで出所を確定できない。
+型による区別が必要な呼び出し側は、CLIの文字列解析ではなくRust APIを使う。
 
 ## timeoutの二層強制
 
@@ -43,8 +45,10 @@ event loopの先頭で毎回時計を見て、期限を過ぎたらtimeoutで終
 `next_event`側の待機にも同じ期限を渡す。
 この二層で、出力量にかかわらず期限が効く。
 
-timeout後も子processは自動で止まらない。
-呼び出し側が`terminate_and_reap`で止めて回収し、payloadを削除する。
+`next_event`がタイムアウトを返すだけでは、子プロセスは停止しない。
+`Runtime::run`が続けて`terminate_and_reap`を呼び、停止と回収、payloadの削除を試みる。
+CLI利用者が通常のタイムアウト時に別途停止コマンドを実行する必要はない。
+この期限はOSの入出力や終了後の後始末までを厳密に打ち切る時間制限ではない。
 timeout経路の検証では、125終了に加えてQEMUと一時領域の残留がないことを確認する。
 
 ## 診断logの扱い
@@ -55,4 +59,5 @@ Exit後の成功markerもここに集まる。
 `minictr run`は現状この診断bytesを出力せず、stdout、stderr、終了codeだけを返す。
 
 QEMU processの標準エラー出力は読み捨てにする。
-host標準エラー出力へ届くのは、UART上の`Stderr` frameとして届いたguest stderrだけである。
+ホスト標準エラー出力には、実行成功時のゲスト標準エラー出力と、CLIが生成する失敗診断が届く。
+ランタイムの失敗時には`RunOutcome`が返らないため、途中まで蓄積したゲスト出力と診断は表示されない。

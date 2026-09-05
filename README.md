@@ -10,13 +10,23 @@ MiniContainerは、miniOSをゲストカーネルとして使い、RISC-V 64ア�
 Windowsは対象外である。
 
 必要なツールはRust 1.98.0、`riscv64gc-unknown-none-elf`ターゲット、QEMU 8.2.0以上、Gitである。
-`cargo xtask setup`は環境を変更せずに診断だけを行う。
+`xtask setup`自体はツールの導入や更新を行わず、環境を診断する。
+初回は起動元のCargoやrustupによる依存取得やツールチェーンの導入が発生することがある。
 
-## Quick start
+## クイックスタート
+
+RustとGit、QEMUを用意し、このリポジトリを取得する。
+ツールの導入と診断は[開発環境](docs/guide/02-dev-environment-xtask.md)を参照する。
+
+```sh
+git clone https://github.com/kunihiko-t/minicontainer.git
+cd minicontainer
+```
 
 `minictr run hello`で、同じ結果を再現できるhelloゲストを実行する。
 標準出力に`hello stdout`、標準エラー出力に`hello stderr`が届き、終了コード42で終わる。
-最初に、新しいシェルで次の変数を設定する。
+以下は同じシェルで、MiniContainerのリポジトリ直下から順に実行する。
+作業用のminiOSとストアは一時ディレクトリーに作成するため、長期保存には別の保存先を指定する。
 
 ```sh
 MINIOS="$(mktemp -d)/minios"
@@ -36,7 +46,7 @@ cargo build -p minictr --locked
 ```sh
 git clone https://github.com/kunihiko-t/minios.git "$MINIOS"
 git -C "$MINIOS" checkout 9be99255a59d58d19db25b835af0e28a8d2a4036
-cargo build --manifest-path "$MINIOS/Cargo.toml" -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --locked
+cargo build --manifest-path "$MINIOS/Cargo.toml" --target-dir "$MINIOS/target" -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --locked
 ```
 
 ビルド成果物`$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel`が実行カーネルである。
@@ -46,14 +56,15 @@ Guest ABIは`minios-abi-v0.1.1`に固定している。
 `$STORE`は絶対パスで指定した保存先であり、`Store::new`が作成する。
 
 ```sh
-cargo run -p xtask --example prepare_hello_store -- "$STORE"
+cargo run -p xtask --locked --example prepare_hello_store -- "$STORE"
 ```
 
 最後に`minictr run`で実行する。
 
 ```sh
-./target/debug/minictr run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" hello
-echo "exit=$?"
+exit_code=0
+cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" hello || exit_code=$?
+echo "exit=$exit_code"
 ```
 
 期待する結果は次の通りである。
@@ -63,8 +74,9 @@ hello stdout
 exit=42
 ```
 
-`hello stderr`は標準エラー出力に届く。
-`minictr`はゲストの終了コードをそのまま返す。
+`hello stderr`は標準エラー出力に届く。Cargoのビルド状況も標準エラー出力に表示される。
+この例の42は意図した終了コードであり、シェルの`set -e`が有効でも結果を確認できる形にしている。
+`minictr`は0〜255のゲスト終了コードをそのまま返し、範囲外はホスト側の失敗として扱う。
 使い方の誤りは終了コード2、ホスト側の失敗（`store`の解決失敗、QEMUの失敗、タイムアウトを含む）は終了コード125になる。
 
 ## 現在の機能と制限
@@ -80,7 +92,9 @@ usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 
 MiniBundleの構築と検証、SHA-256ダイジェスト、manifestの制限、content-addressed storeへの取り込み、タグ付け、解決ができる。
 UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
-QEMU backendは再現可能な引数で起動し、子プロセスの回収と一時領域の後始末をすべての終了経路で行う。
+QEMUバックエンドは固定した引数で起動し、通常の成功経路とエラー経路で子プロセスの回収と一時領域の削除を試みる。
+後始末の失敗もエラーとして返す。ホストの停止や`SIGKILL`による強制終了では、後始末を実行できない場合がある。
+ゲスト出力はメモリーに蓄積し、実行完了後に表示する。対話入力とリアルタイムの出力表示には対応していない。
 
 OCI互換、ネットワーク、永続ボリューム、Linuxアプリケーション互換、マルチテナント分離は現在の機能ではない。
 詳細は[脅威モデル](docs/reference/threat-model.md)で確認できる。

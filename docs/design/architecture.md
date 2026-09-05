@@ -23,7 +23,7 @@ MiniContainerはtagで固定したminios-abi (`minios-abi-v0.1.1`) を利用し�
 実行kernelはminiOSの固定revision (`9be99255a59d58d19db25b835af0e28a8d2a4036`) からbuildする。
 ホスト側の検証は、miniOSが行うguest側の再検証を省略する根拠にならない。
 
-## M1の実行の流れ
+## ゲスト実行の流れ
 
 `minictr`がstoreからbundleを解決し、runtimeが一時payloadを作ってQEMUを起動し、miniOSがELFをU-modeで実行する。
 `write`と`exit`の結果はUART control frameでホストへ届き、runtimeがQEMUを回収する。
@@ -33,8 +33,11 @@ Exit frameの後、kernelはresource回収を検証し、成功markerをDiagnost
 ## エラーと後始末
 
 bundle不正はQEMU起動前に拒否する。
-timeout、QEMU起動失敗、guest failure、protocol破損、applicationの非0終了を区別し、すべての終了経路で子processと一時領域を回収する。
-全体の期限はevent loopとprocess読み取りの二層で強制し、出力量にかかわらず効く。
+タイムアウト、QEMU起動失敗、ゲスト実行失敗、プロトコル破損、アプリケーションの非0終了を区別する。
+通常の成功経路とエラー経路で、子プロセスの回収と一時領域の削除を試み、後始末の失敗も報告する。
+ホスト停止や強制終了では、後始末を実行できない場合がある。
+イベントループとプロセス読み取りの二か所で期限を確認し、出力が流れ続けてもタイムアウトを検出する。
+OSの入出力や後始末を含む、呼び出し全体の厳密な終了時刻は保証しない。
 
 ## 対象環境
 

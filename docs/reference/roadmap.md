@@ -1,10 +1,11 @@
 # ロードマップ
 
-この文書は、MiniContainerで実装済みの範囲、依存するminiOSの到達点、次のcross-repository実装を区別して記録する。
+実装済みの機能、依存するminiOSの機能、将来の拡張候補を示す。
+起動手順は[README](../../README.md)、学習の順序は[ガイド索引](../guide/README.md)を参照する。
 
 ## 現在
 
-**FoundationとGuest ABI**の節目は完了した。
+### バンドルとGuest ABI
 
 Cargo workspaceは公開に必要な文書とlocal linkを検査し、公開前の文書条件をgateに含めている。
 MiniContainerは固定したminiOS Guest ABI (`minios-abi-v0.1.1`) を依存として取得し、BootHeader、manifest、UART control frameの定義をhost側の実装で消費している。
@@ -15,7 +16,9 @@ UART control frame decoderは分割入力を復元し、不正なheaderと64 KiB
 `cargo xtask setup`は開発環境を変更せずに診断し、`cargo xtask check`は15段階の検査を実行する。
 Ubuntu 24.04のCIはsetupと同じcheckを実行する。
 
-**M1実行経路**の節目は完了した。
+### QEMU上でのゲスト実行
+
+開発上の節目「M1」は、このゲスト実行機能を指す。AppleのM1チップ限定という意味ではない。
 
 依存先のminiOSでは、Sv39、実行前ELF loader、U-mode実行、`write`、`exit`、終了後のresource回収の節目が完了した。
 実行kernelは固定revision (`9be99255a59d58d19db25b835af0e28a8d2a4036`) からbuildする。
@@ -27,21 +30,18 @@ MiniContainerは検証済みbundleをboot payload予約領域へ渡し、QEMU子
 `minictr run hello`の標準出力、標準エラー出力、終了code 42、QEMU回収、一時directory cleanupを確認する。
 timeoutとmalformed-frameの失敗経路では非0終了と残留の不在も確認する。
 
-**失敗と診断の扱い**の節目は完了した。
+### 学習ガイド
 
-ガイド全12章の本文が現在の実装に対応した。
+ガイド全12章の本文を用意している。
+第1章から第11章は現在の実装、第12章は未実装のOCI対応を検討するための資料である。
 第10章はhost error、guest failure、protocol破損の三分類と終了code、timeoutの二層強制、診断logの扱いを説明する。
 第11章は`setup`と15段階の`check`、公開条件の検査、CIとの同一性を説明する。
 第1章から第4章は境界、環境、ELFとGuest ABI、MiniBundleを、第12章はOCI imageとの差と拡張順の計画を扱う。
 
-## 次
+## 拡張候補
 
-次の受け入れ単位はまだ定めていない。
-将来方向はその後のOCI compatibilityである。
-
-## その後
-
-OCI compatibilityは、単一fileのMiniBundleとruntime lifecycleが安定した後の将来方向とする。
-networkとproduction isolationはOCI compatibilityを含む後続作業でも保証しない。
+OCI対応は将来の拡張候補であり、採用する保存形式と実装順は未決定である。
+[第12章](../guide/12-oci-image-spec.md)では、配布形式への対応とLinuxアプリケーションの実行互換を区別している。
+ゲストのネットワーク機能と本番用途の分離は、現在の保証範囲に含まれない。
 
 制約と保証しない範囲は[脅威モデル](threat-model.md)を参照する。

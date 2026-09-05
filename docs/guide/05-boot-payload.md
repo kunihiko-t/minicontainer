@@ -29,6 +29,6 @@ miniOSは起動時にこの予約窓からELF byte sliceを取り出し、既存
 pathに`,`を含む場合はQEMUのoption構文を壊すため、起動前に型付きerrorで拒否する。
 `-kernel`へ渡すkernel pathはplainなargv要素のため、この制限の外にある。
 
-payload fileとdirectoryはrunの終了後に必ず削除する。
+payload fileとdirectoryはrunの終了後に削除を試みる。
 正常終了だけでなく、timeout、起動失敗、後始末失敗のどの経路でも除去を試み、失敗は診断として残す。
 詳しい状態遷移は第8章を参照する。

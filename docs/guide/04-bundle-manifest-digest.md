@@ -30,7 +30,9 @@ digestは、digest欄をzeroにしたheaderと後続bytes全体へのSHA-256で�
 header、manifest、padding、ELFのどこか一つの破損もdigest不一致として検出する。
 digestは破損検出とcontent addressingに使い、署名や配布元の認証を提供しない。
 
-storeのrootは絶対pathでなければならず、symlinkやroot外への脱出は拒否する。
+ストアのルートは絶対パスで指定する。
+ルートそのものと管理するディレクトリー、読み取るエントリーのシンボリックリンクを検査するが、親ディレクトリーのリンクまで一律に拒否するわけではない。
+ストアを同時に敵対的なプロセスが変更する状況の封じ込めは保証しない。
 `import`は検証済みbundleをdigest名で`images/sha256`へ書き込み、`tag`はtag名と小文字hex digestを対応付ける。
 `resolve`はtagからdigestを引き、bytesを再検証してdigestとpathの一致を確認してから返す。
 tag名はmanifestのname文法に従い、単一path成分でない名前は別途拒否する。
