@@ -205,7 +205,7 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
     ));
 
     log("e2e: ensuring the pinned miniOS kernel");
-    let kernel = ensure_kernel(workspace)?;
+    let kernel = ensure_kernel(workspace, &mut log)?;
     log(&format!(
         "e2e: kernel ready at {} (rev {MINIOS_KERNEL_REV}, abi {MINIOS_ABI_TAG})",
         kernel.display()
@@ -277,11 +277,11 @@ pub fn import_hello_store(store_root: &Path) -> Result<[u8; 32], E2EError> {
 /// 絶対pathで与えられた場合はそのcheckoutを読み取り専用として扱い、fetchや
 /// checkoutやin-place buildで書き換えず、target directoryだけworkspace側へ
 /// 隔離してbuildする。
-fn ensure_kernel(workspace: &Path) -> Result<PathBuf, E2EError> {
+fn ensure_kernel(workspace: &Path, log: &mut dyn FnMut(&str)) -> Result<PathBuf, E2EError> {
     match std::env::var_os("MINICTR_E2E_MINIOS_DIR") {
         Some(directory) => {
             let directory = PathBuf::from(directory);
-            verify_checkout_rev(&directory)?;
+            verify_checkout_rev(&directory, MINIOS_KERNEL_REV)?;
             verify_clean_checkout(&directory)?;
             let target_dir = workspace.join("target/e2e/minios-override-target");
             std::fs::create_dir_all(&target_dir)
@@ -290,13 +290,38 @@ fn ensure_kernel(workspace: &Path) -> Result<PathBuf, E2EError> {
         }
         None => {
             let directory = workspace.join("target/e2e/minios");
-            prepare_checkout(&directory)?;
+            prepare_checkout(&directory, log, MINIOS_REPO_URL, MINIOS_KERNEL_REV)?;
             build_kernel(&directory, None)
         }
     }
 }
 
-fn prepare_checkout(directory: &Path) -> Result<(), E2EError> {
+/// pin留めkernelのcheckoutを用意し、初回失敗時はdirectoryごと破棄して
+/// fresh cloneから一度だけ再試行する。CI cacheから復元した壊れたcheckout
+/// が残ると、再試行なしでは同じ失敗を繰り返してgateが赤信号のまま固まる。
+/// 再試行も失敗したときは再試行のerrorを返す。初回errorの要約はtranscript
+/// に残す。
+fn prepare_checkout(
+    directory: &Path,
+    log: &mut dyn FnMut(&str),
+    repo_url: &str,
+    rev: &str,
+) -> Result<(), E2EError> {
+    match prepare_checkout_once(directory, repo_url, rev) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            let summary = first.to_string();
+            let summary = summary.lines().next().unwrap_or("unknown failure");
+            log(&format!(
+                "e2e: checkout unusable ({summary}); discarding and re-cloning once"
+            ));
+            let _ = std::fs::remove_dir_all(directory);
+            prepare_checkout_once(directory, repo_url, rev)
+        }
+    }
+}
+
+fn prepare_checkout_once(directory: &Path, repo_url: &str, rev: &str) -> Result<(), E2EError> {
     if !directory.join(".git").exists() {
         if let Some(parent) = directory.parent() {
             std::fs::create_dir_all(parent).map_err(|error| E2EError::Store(error.to_string()))?;
@@ -305,7 +330,7 @@ fn prepare_checkout(directory: &Path) -> Result<(), E2EError> {
             "git",
             &[
                 OsString::from("clone"),
-                OsString::from(MINIOS_REPO_URL),
+                OsString::from(repo_url),
                 directory.as_os_str().to_owned(),
             ],
             None,
@@ -313,7 +338,7 @@ fn prepare_checkout(directory: &Path) -> Result<(), E2EError> {
             KERNEL_BUILD_TIMEOUT,
         )?;
     }
-    if !rev_present(directory) {
+    if !rev_present(directory, rev) {
         run_checked(
             "git",
             &[
@@ -321,7 +346,7 @@ fn prepare_checkout(directory: &Path) -> Result<(), E2EError> {
                 directory.as_os_str().to_owned(),
                 OsString::from("fetch"),
                 OsString::from("origin"),
-                OsString::from(MINIOS_KERNEL_REV),
+                OsString::from(rev),
             ],
             None,
             &[],
@@ -334,17 +359,17 @@ fn prepare_checkout(directory: &Path) -> Result<(), E2EError> {
             OsString::from("-C"),
             directory.as_os_str().to_owned(),
             OsString::from("checkout"),
-            OsString::from(MINIOS_KERNEL_REV),
+            OsString::from(rev),
         ],
         None,
         &[],
         CHECKOUT_TIMEOUT,
     )?;
-    verify_checkout_rev(directory)?;
+    verify_checkout_rev(directory, rev)?;
     verify_clean_checkout(directory)
 }
 
-fn rev_present(directory: &Path) -> bool {
+fn rev_present(directory: &Path, rev: &str) -> bool {
     run_checked(
         "git",
         &[
@@ -352,7 +377,7 @@ fn rev_present(directory: &Path) -> bool {
             directory.as_os_str().to_owned(),
             OsString::from("cat-file"),
             OsString::from("-e"),
-            OsString::from(MINIOS_KERNEL_REV),
+            OsString::from(rev),
         ],
         None,
         &[],
@@ -361,7 +386,7 @@ fn rev_present(directory: &Path) -> bool {
     .is_ok()
 }
 
-fn verify_checkout_rev(directory: &Path) -> Result<(), E2EError> {
+fn verify_checkout_rev(directory: &Path, expected_rev: &str) -> Result<(), E2EError> {
     let stdout = run_checked(
         "git",
         &[
@@ -375,9 +400,9 @@ fn verify_checkout_rev(directory: &Path) -> Result<(), E2EError> {
         COMMAND_TIMEOUT,
     )?;
     let actual = String::from_utf8_lossy(&stdout).trim().to_owned();
-    if actual != MINIOS_KERNEL_REV {
+    if actual != expected_rev {
         return Err(E2EError::UnexpectedKernelRev {
-            expected: MINIOS_KERNEL_REV.to_owned(),
+            expected: expected_rev.to_owned(),
             actual,
         });
     }
@@ -1530,6 +1555,148 @@ mod tests {
                 Err(E2EError::DirtyCheckout { .. })
             ),
             "an untracked file must fail the cleanliness check"
+        );
+    }
+
+    fn git(current_dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(current_dir)
+            .status()
+            .expect("git must run");
+        assert!(status.success(), "git {args:?} must succeed");
+    }
+
+    fn commit_fixture(directory: &Path, message: &str) -> String {
+        git(directory, &["init"]);
+        git(
+            directory,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+        );
+        git_head(directory)
+    }
+
+    fn git_head(directory: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(directory)
+            .output()
+            .expect("git must run");
+        assert!(output.status.success(), "rev-parse must succeed");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    // Catches a poisoned checkout failing the gate permanently: when the
+    // first attempt fails (e.g. a stale CI cache whose remote no longer
+    // serves the rev), prepare_checkout discards the checkout and recovers
+    // from a fresh clone instead of failing.
+    #[test]
+    fn prepare_checkout_recovers_from_a_poisoned_checkout() {
+        let origin = TempDir::create("minictr-e2e-origin-").expect("a scratch directory");
+        let rev = commit_fixture(origin.path(), "origin");
+        let scratch = TempDir::create("minictr-e2e-poison-").expect("a scratch directory");
+        let checkout = scratch.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("a poison directory");
+        commit_fixture(&checkout, "poison");
+        git(
+            &checkout,
+            &["remote", "add", "origin", "definitely-not-a-repository"],
+        );
+
+        let mut transcript = String::new();
+        let mut log = |line: &str| {
+            transcript.push_str(line);
+            transcript.push('\n');
+        };
+        prepare_checkout(
+            &checkout,
+            &mut log,
+            origin.path().to_str().expect("a UTF-8 scratch path"),
+            &rev,
+        )
+        .expect("the retry must recover from a fresh clone");
+
+        assert_eq!(
+            git_head(&checkout),
+            rev,
+            "the recovered checkout must point at the rev"
+        );
+        assert!(
+            transcript.contains("discarding and re-cloning once"),
+            "the recovery must be visible in the transcript: {transcript}"
+        );
+    }
+
+    // Catches retrying a checkout that already succeeded: the fresh-clone
+    // retry must only run after a failure, never on the happy path.
+    #[test]
+    fn prepare_checkout_skips_retry_when_first_attempt_succeeds() {
+        let origin = TempDir::create("minictr-e2e-origin-").expect("a scratch directory");
+        let rev = commit_fixture(origin.path(), "origin");
+        let scratch = TempDir::create("minictr-e2e-fresh-").expect("a scratch directory");
+        let checkout = scratch.path().join("checkout");
+
+        let mut transcript = String::new();
+        let mut log = |line: &str| {
+            transcript.push_str(line);
+            transcript.push('\n');
+        };
+        prepare_checkout(
+            &checkout,
+            &mut log,
+            origin.path().to_str().expect("a UTF-8 scratch path"),
+            &rev,
+        )
+        .expect("a fresh clone must succeed");
+
+        assert_eq!(
+            git_head(&checkout),
+            rev,
+            "the fresh checkout must point at the rev"
+        );
+        assert!(
+            !transcript.contains("discarding and re-cloning once"),
+            "a successful first attempt must not retry: {transcript}"
+        );
+    }
+
+    // Catches swallowing the retry outcome: when the fresh clone also
+    // fails, prepare_checkout reports the retry failure after attempting
+    // the recovery exactly once.
+    #[test]
+    fn prepare_checkout_reports_the_retry_failure() {
+        let scratch = TempDir::create("minictr-e2e-broken-").expect("a scratch directory");
+        let checkout = scratch.path().join("checkout");
+
+        let mut transcript = String::new();
+        let mut log = |line: &str| {
+            transcript.push_str(line);
+            transcript.push('\n');
+        };
+        let error = prepare_checkout(
+            &checkout,
+            &mut log,
+            "definitely-not-a-repository",
+            "missing",
+        )
+        .expect_err("an unusable origin must fail even after the retry");
+
+        assert!(
+            matches!(error, E2EError::CommandFailed { .. }),
+            "the retry failure must surface, got {error}"
+        );
+        assert!(
+            transcript.contains("discarding and re-cloning once"),
+            "the attempted recovery must be visible in the transcript: {transcript}"
         );
     }
 
