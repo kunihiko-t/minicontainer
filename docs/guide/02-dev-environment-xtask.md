@@ -1,0 +1,33 @@
+# 開発環境と`cargo xtask`
+
+この章は、Rust、RISC-V target、QEMU、Gitを診断し、同じrelease gateをlocalとCIで実行できるようにする。
+gateの段階の内訳は第11章を参照する。
+
+## 対象環境
+
+主要な開発環境はApple Silicon搭載macOS、継続検証の対象はUbuntu 24.04である。
+Windowsは対象外であり、Windows上の動作は検証しない。
+
+必要なtoolはRust 1.98.0、`riscv64gc-unknown-none-elf` target、QEMU 8.2.0以上、Gitである。
+Rustは1.98.0 stableの完全一致を要求する。
+
+## setupで診断する
+
+最初に`cargo xtask setup`を実行する。
+このcommandは環境を変更せず、toolの有無とversionだけを診断する。
+不足があれば導入手順つきの診断を出して失敗するため、表示に従ってtoolを揃える。
+
+## checkで検証する
+
+次に`cargo xtask check`を実行する。
+書式、文書link、公開条件、crateごとのClippyと単体試験、workspace build、実QEMU end-to-end検証を15段階で順に実行し、最初の失敗で停止する。
+依存解決を伴うphaseはすべて`--locked`で実行する。
+
+CIは同じ二つのcommandをUbuntu 24.04で実行する。
+変更後は手元でgateを通してから共有する。
+
+## 初回実行までの流れ
+
+`minictr run hello`までの手順は`README.md`のQuick startに従う。
+固定revisionのminiOSからguest kernelをbuildし、hello bundleをstoreへ取り込んで`hello` tagを作り、`minictr run`で実行する。
+storeとkernelの解決、実行結果の読み方は第9章、失敗の切り分けは第10章を参照する。

@@ -27,13 +27,17 @@ MiniContainerは検証済みbundleをboot payload予約領域へ渡し、QEMU子
 `minictr run hello`の標準出力、標準エラー出力、終了code 42、QEMU回収、一時directory cleanupを確認する。
 timeoutとmalformed-frameの失敗経路では非0終了と残留の不在も確認する。
 
+**失敗と診断の扱い**の節目は完了した。
+
+ガイド全12章の本文が現在の実装に対応した。
+第10章はhost error、guest failure、protocol破損の三分類と終了code、timeoutの二層強制、診断logの扱いを説明する。
+第11章は`setup`と15段階の`check`、公開条件の検査、CIとの同一性を説明する。
+第1章から第4章は境界、環境、ELFとGuest ABI、MiniBundleを、第12章はOCI imageとの差と拡張順の計画を扱う。
+
 ## 次
 
-次の受け入れ単位は、失敗と診断の扱いの拡張である。
-
-- 失敗、timeout、診断logの章 (第10章) の本文を現在の実装に合わせて書く。
-- テストハーネスと公開gateの章 (第11章) の本文を15段階のgateに合わせて書く。
-- 残りの章 (第1章から第4章、第12章) の本文を書く。
+次の受け入れ単位はまだ定めていない。
+将来方向はその後のOCI compatibilityである。
 
 ## その後
 
