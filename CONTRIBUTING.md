@@ -30,6 +30,12 @@ server-side mergeではGitHubがcommitter identityを生成するため、この
 続いて、headの作者とcommitterがnoreply形式だけを使い、`cargo xtask check`とrequired checkが成功していることを確認する。
 検証済みheadはforce optionを付けず、`main`へfast-forward pushする。
 
+## Dependabotの更新
+
+DependabotのPull Requestは直接統合しない。
+Dependabotのcommitはnoreply形式のauthorとcommitterを使わないため、このリポジトリの統合条件を満たさない。
+保守者は現`main`の先端から同等の依存更新をやり直し、検証済みheadをfast-forward pushで統合した後、DependabotのPull Requestをsupersededとしてクローズする。
+
 ## ライセンス
 
 コントリビューションはMIT LicenseまたはApache License 2.0の条件で提供することに同意したものとして扱う。
