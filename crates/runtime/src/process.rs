@@ -355,7 +355,7 @@ mod tests {
     use std::{
         env,
         io::{self, Read, Write},
-        process::{Command, Stdio},
+        process::Command,
         sync::mpsc,
         time::{Duration, Instant},
     };
@@ -530,14 +530,12 @@ mod tests {
     }
 
     fn pid_is_alive(pid: u32) -> bool {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        // 外部の`kill` binaryは使わない。platformで挙動が異なるため、
+        // `kill(2)`を直接呼ぶ。signal 0はprocessを殺さず存在と権限だけを
+        // 検査する。
+        // SAFETY: `kill(2)`にsignal 0を渡す呼び出しは副作用がなく、
+        // `pid`はspawn直後の子のPIDで`pid_t`に収まる。
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
     struct FailingReader;

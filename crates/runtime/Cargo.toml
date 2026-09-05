@@ -10,3 +10,6 @@ repository.workspace = true
 minicontainer-bundle = { path = "../bundle" }
 minicontainer-protocol = { path = "../protocol" }
 minios-abi.workspace = true
+
+[dev-dependencies]
+libc = "0.2"
