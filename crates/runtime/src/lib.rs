@@ -42,6 +42,12 @@ impl<B: ProcessBackend> Runtime<B> {
 
     /// MiniBundleを検証し、QEMUで実行してguest outcomeを返す。
     pub fn run(&self, request: RunRequest<'_>) -> Result<RunOutcome, RuntimeError> {
+        // 表現できない期限は、payloadや子processを取得する前に型付きerrorへ
+        // 変える。`Instant + Duration`のoverflow panicを副作用の後で起こさず、
+        // Dropを実装しないbackendでも子processを残さない。
+        let deadline = Instant::now()
+            .checked_add(request.deadline)
+            .ok_or(RuntimeError::InvalidDeadline)?;
         minicontainer_bundle::parse(request.bundle).map_err(RuntimeError::Bundle)?;
         let payload = PayloadTemp::create(request.bundle)?;
         let command = match QemuCommand::new(request.kernel, payload.path()) {
@@ -53,9 +59,13 @@ impl<B: ProcessBackend> Runtime<B> {
             Err(error) => return finish_without_child(Err(RuntimeError::Process(error)), &payload),
         };
 
-        let deadline = Instant::now() + request.deadline;
         let mut session = Session::new();
         let primary = loop {
+            // queueにeventが残っていても全体の期限を強制する。backendが期限
+            // 過ぎの出力を返し続けても、この検査がrunをtimeoutで終わらせる。
+            if Instant::now() >= deadline {
+                break Err(RuntimeError::Process(ProcessError::TimedOut));
+            }
             match child.next_event(deadline) {
                 Ok(ProcessEvent::Uart(bytes)) => {
                     if let Err(error) = session.push_uart(&bytes) {
@@ -270,6 +280,85 @@ mod tests {
         );
         assert_eq!(trace.borrow().as_slice(), ["spawn"]);
         assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches postponing the overall deadline while output keeps arriving:
+    // an endless diagnostic stream must still end the run with a timeout.
+    #[test]
+    fn run_enforces_the_deadline_despite_continuous_output() {
+        struct FloodChild;
+
+        impl ProcessControl for FloodChild {
+            fn id(&self) -> u32 {
+                7
+            }
+
+            fn next_event(&mut self, _deadline: Instant) -> Result<ProcessEvent, ProcessError> {
+                Ok(ProcessEvent::Diagnostic(vec![0x78]))
+            }
+
+            fn terminate_and_reap(&mut self) -> Result<ProcessStatus, ProcessError> {
+                Ok(successful_process())
+            }
+        }
+
+        struct FloodBackend;
+
+        impl ProcessBackend for FloodBackend {
+            type Child = FloodChild;
+
+            fn spawn(&self, _command: &QemuCommand) -> Result<Self::Child, ProcessError> {
+                Ok(FloodChild)
+            }
+        }
+
+        let started = Instant::now();
+        let error = Runtime::new(FloodBackend)
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_millis(100),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Process(ProcessError::TimedOut)),
+            "continuous output must not bypass the deadline, got {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the deadline must end the run promptly"
+        );
+    }
+
+    // Catches an unrepresentable public deadline panicking after the child
+    // is spawned: the deadline is validated before any side effect.
+    #[test]
+    fn run_rejects_an_unrepresentable_deadline_before_spawn() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(trace.clone(), payload.clone(), vec![]));
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::MAX,
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::InvalidDeadline),
+            "Duration::MAX must be a typed error, got {error:?}"
+        );
+        assert!(
+            trace.borrow().is_empty(),
+            "no child may be spawned for an invalid deadline"
+        );
+        assert!(
+            payload.borrow().is_none(),
+            "no payload may be materialized for an invalid deadline"
+        );
     }
 
     // Catches hiding the guest failure when process cleanup also fails. The

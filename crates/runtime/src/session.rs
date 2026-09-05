@@ -38,7 +38,8 @@ pub enum SessionError {
     FrameBeforeReady(FrameKind),
     /// Running中にReadyを再度受信した。
     DuplicateReady,
-    /// Exit後にcontrol frameを受信した。
+    /// Exit後に出力・再handshake・再終了のcontrol frameを受信した。
+    /// Diagnosticの成功markerとGuestErrorは別variantで扱う。
     FrameAfterExit(FrameKind),
     /// QEMU終了時までにguest Exitを受信しなかった。
     MissingExit,
@@ -241,10 +242,32 @@ impl Session {
             match self.state {
                 State::AwaitReady => self.handle_initial_frame(frame, &mut events)?,
                 State::Running => self.handle_running_frame(frame, &mut events)?,
-                State::Exited(_) => return Err(SessionError::FrameAfterExit(frame.kind)),
+                State::Exited(_) => self.handle_exited_frame(frame, &mut events)?,
             }
         }
         Ok(events)
+    }
+
+    /// Exit受信後のframeを処理する。
+    ///
+    /// production kernelはExitの後にresource回収の成功markerをDiagnostic
+    /// frameで送り、回収失敗時はGuestError frameで異常shutdownする。どちらも
+    /// hostの診断情報であり、確定した終了codeは変えない。出力と再handshakeは
+    /// 終了後に意味を持たないため引き続き拒否する。
+    fn handle_exited_frame(
+        &mut self,
+        frame: Frame,
+        events: &mut Vec<SessionEvent>,
+    ) -> Result<(), SessionError> {
+        match frame.kind {
+            FrameKind::Diagnostic => {
+                self.diagnostics.extend_from_slice(&frame.payload);
+                events.push(SessionEvent::Diagnostic(frame.payload));
+                Ok(())
+            }
+            FrameKind::GuestError => Err(SessionError::GuestError(frame.payload)),
+            _ => Err(SessionError::FrameAfterExit(frame.kind)),
+        }
     }
 
     fn handle_initial_frame(
@@ -392,6 +415,81 @@ mod tests {
             session.push_uart(&frame(FrameKind::Stdout, b"late")),
             Err(SessionError::FrameAfterExit(FrameKind::Stdout))
         );
+    }
+
+    // Catches rejecting the production kernel's post-Exit resource-cleanup
+    // marker, which arrives as a Diagnostic frame after the Exit frame.
+    #[test]
+    fn diagnostic_after_exit_is_kept_as_host_diagnostics() {
+        let mut session = ready_session();
+        session
+            .push_uart(&frame(FrameKind::Exit, &42_u32.to_le_bytes()))
+            .unwrap();
+
+        assert_eq!(
+            session.push_uart(&frame(FrameKind::Diagnostic, b"MiniOS payload: ok code=42")),
+            Ok(vec![SessionEvent::Diagnostic(
+                b"MiniOS payload: ok code=42".to_vec()
+            )])
+        );
+        assert_eq!(
+            session.finish(successful_process()),
+            Ok(RunOutcome {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: 42,
+                diagnostics: b"MiniOS payload: ok code=42".to_vec(),
+            })
+        );
+    }
+
+    // Catches masking a post-Exit guest failure (for example a failed
+    // resource-recovery check) as a successful run.
+    #[test]
+    fn guest_error_after_exit_is_a_typed_failure() {
+        let mut session = ready_session();
+        session
+            .push_uart(&frame(FrameKind::Exit, &42_u32.to_le_bytes()))
+            .unwrap();
+
+        assert_eq!(
+            session.push_uart(&frame(FrameKind::GuestError, b"MiniOS payload: recovery")),
+            Err(SessionError::GuestError(
+                b"MiniOS payload: recovery".to_vec()
+            ))
+        );
+    }
+
+    // Catches allowing output, a second handshake, or a second exit to revise
+    // an already final guest result.
+    #[test]
+    fn output_handshake_and_exit_after_exit_are_rejected() {
+        let cases = [
+            (
+                FrameKind::Stderr,
+                frame(FrameKind::Stderr, b"late"),
+                SessionError::FrameAfterExit(FrameKind::Stderr),
+            ),
+            (
+                FrameKind::Ready,
+                ready_frame(),
+                SessionError::FrameAfterExit(FrameKind::Ready),
+            ),
+            (
+                FrameKind::Exit,
+                frame(FrameKind::Exit, &7_u32.to_le_bytes()),
+                SessionError::FrameAfterExit(FrameKind::Exit),
+            ),
+        ];
+
+        for (kind, bytes, expected) in cases {
+            let mut session = ready_session();
+            session
+                .push_uart(&frame(FrameKind::Exit, &7_u32.to_le_bytes()))
+                .unwrap();
+
+            assert_eq!(session.push_uart(&bytes), Err(expected), "{kind:?}");
+        }
     }
 
     // Catches reporting a host-successful QEMU exit as a successful guest run

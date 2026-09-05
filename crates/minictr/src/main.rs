@@ -161,6 +161,16 @@ pub fn execute(
         let _ = writeln!(stderr, "minictr: failed to write stderr: {error}");
         return RUNTIME_EXIT;
     }
+    // `main` ends with `process::exit`, which skips destructors, so buffered
+    // standard streams must be flushed explicitly before reporting success.
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = stderr.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stderr: {error}");
+        return RUNTIME_EXIT;
+    }
     match u8::try_from(outcome.exit_code) {
         Ok(code) => i32::from(code),
         Err(_) => {
@@ -258,6 +268,24 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// Buffers writes like a piped standard stream and reports the buffered
+    /// bytes only through an explicit flush, which can fail.
+    struct FlushFailingWriter {
+        buffered: Vec<u8>,
+        message: &'static str,
+    }
+
+    impl Write for FlushFailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffered.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other(self.message))
         }
     }
 
@@ -368,6 +396,57 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = FailingWriter {
             message: "stderr broken",
+        };
+
+        let code = execute(
+            b"bundle",
+            Path::new("/kernel"),
+            Duration::from_secs(5),
+            &runner,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert_eq!(stdout, b"");
+    }
+
+    // Catches losing buffered guest bytes when the host stdout flush fails:
+    // without an explicit flush, `process::exit` would still report success.
+    #[test]
+    fn maps_a_stdout_flush_failure_to_a_host_error() {
+        let runner = FakeRunner::ok(outcome(b"out", b"", 42));
+        let mut stdout = FlushFailingWriter {
+            buffered: Vec::new(),
+            message: "stdout flush broken",
+        };
+        let mut stderr = Vec::new();
+
+        let code = execute(
+            b"bundle",
+            Path::new("/kernel"),
+            Duration::from_secs(5),
+            &runner,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("failed to flush stdout"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    // Catches losing buffered guest bytes when the host stderr flush fails.
+    #[test]
+    fn maps_a_stderr_flush_failure_to_a_host_error() {
+        let runner = FakeRunner::ok(outcome(b"", b"err", 42));
+        let mut stdout = Vec::new();
+        let mut stderr = FlushFailingWriter {
+            buffered: Vec::new(),
+            message: "stderr flush broken",
         };
 
         let code = execute(

@@ -12,3 +12,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
+
+[dependencies]
+minicontainer-bundle = { path = "../crates/bundle" }

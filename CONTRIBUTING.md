@@ -13,7 +13,7 @@ cargo xtask check
 ```
 
 `setup`はRust、RISC-V target、QEMU、Gitのversionを変更せずに診断する。
-`check`は依存関係を解決するすべてのCargo phaseを`--locked`で実行し、10段階の検査を最初の失敗で停止する。
+`check`は依存関係を解決するすべてのCargo phaseを`--locked`で実行し、15段階の検査を最初の失敗で停止する。
 
 ## コメントと言語
 

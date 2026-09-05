@@ -36,6 +36,8 @@ impl Error for CleanupFailure {
 pub enum RuntimeError {
     /// MiniBundleを検証できなかった。
     Bundle(BundleError),
+    /// 要求された待機期限が時刻として表現できない。
+    InvalidDeadline,
     /// payload pathに、QEMU `-device` optionの構文を壊す文字 (`,`) が含まれる。
     UnsafePayloadPath(PathBuf),
     /// 一時fileやdirectoryの操作が失敗した。
@@ -59,6 +61,12 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bundle(error) => write!(formatter, "invalid MiniBundle: {error}"),
+            Self::InvalidDeadline => {
+                write!(
+                    formatter,
+                    "invalid deadline: the timeout cannot be represented"
+                )
+            }
             Self::UnsafePayloadPath(path) => write!(
                 formatter,
                 "payload path must not contain ',': {}",
@@ -89,6 +97,7 @@ impl Error for RuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Bundle(error) => Some(error),
+            Self::InvalidDeadline => None,
             Self::UnsafePayloadPath(_) => None,
             Self::Io(error) => Some(error),
             Self::Process(error) => Some(error),

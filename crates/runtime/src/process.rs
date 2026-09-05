@@ -209,6 +209,11 @@ impl ProcessControl for SystemProcess {
 
     fn next_event(&mut self, deadline: Instant) -> Result<ProcessEvent, ProcessError> {
         loop {
+            // queueに残ったreader messageより時計を先に見る。期限過ぎの
+            // backlogを返し続けてtimeoutを先送りしない。
+            if Instant::now() >= deadline {
+                return Ok(ProcessEvent::TimedOut);
+            }
             match self.reader_events.try_recv() {
                 Ok(message) => {
                     if let Some(event) = self.handle_reader_message(message)? {
@@ -402,6 +407,28 @@ mod tests {
         };
 
         assert!(!pid_is_alive(pid));
+    }
+
+    // Catches returning stale queued or exit state after the deadline has
+    // passed: the clock governs even when output remains available.
+    #[test]
+    fn expired_deadline_wins_over_an_observed_exit() {
+        let mut child = spawn_helper("emit").unwrap();
+        let generous = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.next_event(generous).unwrap() {
+                ProcessEvent::Exited(_) => break,
+                ProcessEvent::Uart(_) | ProcessEvent::Diagnostic(_) => {}
+                ProcessEvent::TimedOut => panic!("the helper must exit before the deadline"),
+            }
+        }
+
+        assert!(matches!(
+            child
+                .next_event(Instant::now() - Duration::from_secs(1))
+                .unwrap(),
+            ProcessEvent::TimedOut
+        ));
     }
 
     // Catches wiring both QEMU pipes to one stream or dropping their bytes

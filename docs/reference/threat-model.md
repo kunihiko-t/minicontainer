@@ -7,23 +7,25 @@ MiniContainerは、信頼できる開発者が作成したRISC-V 64アプリケ�
 
 ## 信頼する入力
 
-現在は、miniOS Guest ABIの固定Git tagと、manifestおよびゲストELFを含むMiniBundleのバイト列を信頼する入力として扱う。
+miniOS Guest ABIの固定Git tag、実行kernelの固定revision、manifestおよびゲストELFを含むMiniBundleのバイト列を信頼する入力として扱う。
 QEMU実行ファイルと開発者が指定する設定は、runtimeが扱う段階でも信頼する入力とする。
 これらの入力を敵対者が作成または改変できる環境は、現在の対象外である。
 
+## 信頼する計算基盤
+
+QEMUとminiOSは信頼する計算基盤である。
+ゲストの分離、ELF loaderの検証、user pointerの検査、system callの実行はminiOSに依存する。
+ホスト側のdecoderとstore検証は破損検出のための層であり、ゲスト側の再検証を省略する根拠にはならない。
+QEMUまたはminiOSの脆弱性はこのモデルの前提を崩す。
+
 ## 仮想マシン境界
 
-M1では、一つのRISC-V 64アプリケーションを一つのQEMU仮想マシンで実行する。
+一つのRISC-V 64アプリケーションを一つのQEMU仮想マシンで実行する。
 ゲストのU-modeとS-mode、QEMUの仮想マシンは、設計上の分離点である。
 これらの分離点は教育用の実装境界であり、敵対的な入力に対する本番の封じ込め保証ではない。
 
 ## 保証しない範囲
 
 MiniContainerは本番用のセキュリティー境界ではありません。
-未信頼コードを扱うマルチテナント環境、guest escapeの防止、Linuxアプリケーション互換、ネットワーク隔離、永続ボリューム隔離、性能SLAは保証しない。
-ホスト側の検証が将来追加されても、ゲスト側の再検証を省略する根拠にはならない。
-
-## Digest
-
-MiniBundleのSHA-256 digestは、破損検出とcontent addressingのための識別子である。
-digestは署名ではなく、配布元の認証、作成者の身元、鍵の所有、改変されていない配布経路を保証しない。
+未信頼コードを扱うマルチテナント環境、guest escapeの防止、Linuxアプリケーション互換、ネットワーク隔離、永続ボリューム隔離、OCI互換、性能SLAは保証しない。
+Windowsは対象外であり、Windows上の動作は検証しない。

@@ -1,43 +1,102 @@
 # MiniContainer
 
-MiniContainerは、miniOSをゲストカーネルとして使い、RISC-V 64アプリケーションをQEMU仮想マシンで実行する仕組みを段階的に学ぶための小型ランタイムである。
-信頼できる開発者による個人開発、デモ、OS教材、ランタイム実験で使う実用的な学習用ランタイムを目標にする。
-
-## 現在の実装範囲
-
-現在はFoundation、Guest ABI、ホスト側codecの範囲を実装している。
-
-- **Foundation**：Cargo workspace、Rust 1.98.0、RISC-V target、miniOS Guest ABI依存を固定している。
-- **MiniBundle**：canonical bundleの構築と検証、SHA-256 digest、manifestの制限、content-addressed storeへのimport、tag、resolveを実装している。
-- **UART control frame**：固定したGuest ABIに従う分割入力decoderを実装し、不正headerと64 KiBのpayload上限を検査する。
-- **開発ハーネス**：環境診断と10段階のrelease gateを`cargo xtask`から実行できる。
-
-QEMUの起動、miniOSへのpayload受け渡し、ゲストアプリケーションの実行、`minictr` CLIはまだ実装していない。
-現在のリポジトリを「QEMUでコンテナを実行できるruntime」として使うことはできない。
-
-## 到達点
-
-M1では、`minictr run hello`が静的にリンクしたRISC-V 64 ELFを一つのQEMU仮想マシンで起動し、標準出力、標準エラー出力、終了コード、タイムアウトをホストへ返す到達点を実装する。
-OCI互換は将来の方向であり、現在の機能ではない。
+MiniContainerは、miniOSをゲストカーネルとして使い、RISC-V 64アプリケーションをQEMU仮想マシンで実行する小さなコンテナランタイムである。
+仕組みを追える学習用実装を軸に、信頼できるコードを使った個人開発、デモ、OS教材、ランタイム実験で実際に動かせることを目標にしている。
 
 ## 対応環境
 
 主要な開発環境はApple Silicon搭載macOSである。
 継続検証の対象はUbuntu 24.04である。
 Windowsは対象外である。
-RISC-V 64、QEMU、Git、Rust 1.98.0を使用する。
 
-## 開発コマンド
+必要なツールはRust 1.98.0、`riscv64gc-unknown-none-elf`ターゲット、QEMU 8.2.0以上、Gitである。
+`cargo xtask setup`は環境を変更せずに診断だけを行う。
 
-現在の公開verification entry pointは次の二つである。
+## Quick start
+
+`minictr run hello`で、同じ結果を再現できるhelloゲストを実行する。
+標準出力に`hello stdout`、標準エラー出力に`hello stderr`が届き、終了コード42で終わる。
+最初に、新しいシェルで次の変数を設定する。
+
+```sh
+MINIOS="$(mktemp -d)/minios"
+STORE="$(mktemp -d)/store"
+```
+
+まず開発用バイナリーをビルドする。
+
+```sh
+cargo xtask setup
+cargo build -p minictr --locked
+```
+
+ゲストカーネルはminiOSの固定リビジョンからビルドする。
+`$MINIOS`はminiOSのチェックアウト先であり、この時点では存在しないパスである。
+
+```sh
+git clone https://github.com/kunihiko-t/minios.git "$MINIOS"
+git -C "$MINIOS" checkout 9be99255a59d58d19db25b835af0e28a8d2a4036
+cargo build --manifest-path "$MINIOS/Cargo.toml" -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --locked
+```
+
+ビルド成果物`$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel`が実行カーネルである。
+Guest ABIは`minios-abi-v0.1.1`に固定している。
+
+次にhello bundleを`store`へ取り込み、`hello`タグを作る。
+`$STORE`は絶対パスで指定した保存先であり、`Store::new`が作成する。
+
+```sh
+cargo run -p xtask --example prepare_hello_store -- "$STORE"
+```
+
+最後に`minictr run`で実行する。
+
+```sh
+./target/debug/minictr run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" hello
+echo "exit=$?"
+```
+
+期待する結果は次の通りである。
+
+```text
+hello stdout
+exit=42
+```
+
+`hello stderr`は標準エラー出力に届く。
+`minictr`はゲストの終了コードをそのまま返す。
+使い方の誤りは終了コード2、ホスト側の失敗（`store`の解決失敗、QEMUの失敗、タイムアウトを含む）は終了コード125になる。
+
+## 現在の機能と制限
+
+`minictr`が実装するコマンドは`run`だけである。
+
+```text
+usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
+```
+
+`--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
+`--timeout-ms`の既定値は5000である。
+
+MiniBundleの構築と検証、SHA-256ダイジェスト、manifestの制限、content-addressed storeへの取り込み、タグ付け、解決ができる。
+UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
+QEMU backendは再現可能な引数で起動し、子プロセスの回収と一時領域の後始末をすべての終了経路で行う。
+
+OCI互換、ネットワーク、永続ボリューム、Linuxアプリケーション互換、マルチテナント分離は現在の機能ではない。
+詳細は[脅威モデル](docs/reference/threat-model.md)で確認できる。
+
+## 検証
+
+公開前検証の入口は次の二つである。
 
 ```sh
 cargo xtask setup
 cargo xtask check
 ```
 
-`setup`はRust 1.98.0、`riscv64gc-unknown-none-elf`、QEMU 8.2.0以上、Gitを変更せずに診断する。
-`check`はrustfmt、Markdown link、publication file、crateごとのClippyと単体試験、lockfileを使うworkspace buildを10段階で実行する。
+`check`はrustfmt、Markdownリンク、公開対象ファイル、crateごとのClippyと単体テスト、lockfileを使ったworkspaceのビルド、実QEMU end-to-end検証を15段階で実行する。
+E2Eは固定リビジョンのminiOSカーネルをビルドし、`minictr run hello`の標準出力、標準エラー出力、終了コード42、QEMUの回収、一時ディレクトリーの後始末を確認する。
+タイムアウトと不正フレームの失敗経路では、非0終了と残留物がないことも確認する。
 
 ## 教材
 

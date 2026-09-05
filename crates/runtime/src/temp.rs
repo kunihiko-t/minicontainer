@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::RuntimeError;
+use crate::{CleanupFailure, RuntimeError};
 
 const PAYLOAD_FILE_NAME: &str = "payload.mcb";
 const TEMP_CREATE_ATTEMPTS: usize = 64;
@@ -58,31 +58,55 @@ impl PayloadTemp {
     /// 指定されたroot (まだ存在しないこと) へpayloadを書き込む。
     ///
     /// 書き込みに失敗した場合は、部分書き込みのfileと空のdirectoryを
-    /// できる限り取り除いてからerrorを返す。
+    /// できる限り取り除いてからerrorを返す。取り除き自体が失敗した場合は、
+    /// 書き込みerrorを主原因、取り除き失敗をcleanup診断として両方残す。
+    /// 部分fileが存在しないためのNotFoundは失敗として数えない。
     fn create_in(bytes: &[u8], root: &Path) -> Result<Self, RuntimeError> {
-        Self::create_in_with_writer(bytes, root, write_payload)
+        Self::create_in_with_writer(
+            bytes,
+            root,
+            write_payload,
+            |path: &Path| std::fs::remove_file(path),
+            |path: &Path| std::fs::remove_dir(path),
+        )
     }
 
-    fn create_in_with_writer<F>(
+    fn create_in_with_writer<F, RemoveFile, RemoveDir>(
         bytes: &[u8],
         root: &Path,
         write_payload: F,
+        remove_file: RemoveFile,
+        remove_dir: RemoveDir,
     ) -> Result<Self, RuntimeError>
     where
         F: FnOnce(&Path, &[u8]) -> io::Result<()>,
+        RemoveFile: Fn(&Path) -> io::Result<()>,
+        RemoveDir: Fn(&Path) -> io::Result<()>,
     {
         // create_dirは既存entry (symlink含む) の上では失敗するため、
         // 他人のpathを横取りしない。
         create_private_root(root).map_err(RuntimeError::Io)?;
         let payload = root.join(PAYLOAD_FILE_NAME);
 
-        let write_result = write_payload(&payload, bytes);
-        if let Err(error) = write_result {
-            // 部分書き込みのfileが残っていれば取り除き、空になったdirectoryも
-            // 取り除く。directoryの削除は失敗してもerrorを上書きしない。
-            let _ = std::fs::remove_file(&payload);
-            let _ = std::fs::remove_dir(root);
-            return Err(RuntimeError::Io(error));
+        if let Err(write_error) = write_payload(&payload, bytes) {
+            let mut failures = Vec::new();
+            if let Err(error) = remove_file(&payload)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                failures.push(CleanupFailure::Payload(error));
+            }
+            if let Err(error) = remove_dir(root)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                failures.push(CleanupFailure::Payload(error));
+            }
+            if failures.is_empty() {
+                return Err(RuntimeError::Io(write_error));
+            }
+            return Err(RuntimeError::Cleanup {
+                primary: Box::new(RuntimeError::Io(write_error)),
+                failures,
+            });
         }
 
         Ok(Self {
@@ -129,9 +153,89 @@ impl Drop for PayloadTemp {
 #[cfg(test)]
 mod tests {
     use super::{PayloadTemp, write_payload};
+    use crate::{CleanupFailure, RuntimeError};
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicU64;
+
+    // Catches losing cleanup diagnostics when payload creation fails and
+    // removal also fails: both the write error and the removal failure stay
+    // available, while an absent partial file is not reported as a failure.
+    #[test]
+    fn failed_write_with_failed_removal_retains_both_diagnostics() {
+        let root = std::env::temp_dir().join(format!(
+            "minicontainer-runtime-test-{}-removal-failure",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let outcome = PayloadTemp::create_in_with_writer(
+            b"payload",
+            &root,
+            |payload, bytes| {
+                std::fs::write(payload, bytes)?;
+                Err(io::Error::other("injected write failure"))
+            },
+            |_| -> io::Result<()> {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected removal",
+                ))
+            },
+            |path: &Path| std::fs::remove_dir(path),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match outcome {
+            Err(error @ RuntimeError::Cleanup { .. }) => {
+                let RuntimeError::Cleanup { primary, failures } = error else {
+                    unreachable!("matched Cleanup")
+                };
+                assert!(
+                    matches!(*primary, RuntimeError::Io(_)),
+                    "the write error stays primary"
+                );
+                assert!(
+                    matches!(
+                        failures.as_slice(),
+                        [CleanupFailure::Payload(_), CleanupFailure::Payload(_)]
+                    ),
+                    "both failed removals stay available, got {failures:?}"
+                );
+            }
+            Err(error) => panic!("expected primary and cleanup failures, got {error:?}"),
+            Ok(_) => panic!("the injected writer must fail"),
+        }
+    }
+
+    // Catches reporting a missing partial file as a cleanup failure when the
+    // writer fails before creating anything.
+    #[test]
+    fn failed_write_without_a_partial_file_reports_only_the_write_error() {
+        let root = std::env::temp_dir().join(format!(
+            "minicontainer-runtime-test-{}-absent-partial",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let outcome: Result<PayloadTemp, RuntimeError> = PayloadTemp::create_in_with_writer(
+            b"payload",
+            &root,
+            |_, _| -> io::Result<()> { Err(io::Error::other("injected write failure")) },
+            |path| -> io::Result<()> {
+                assert_eq!(path.file_name().unwrap(), "payload.mcb");
+                Err(io::Error::new(io::ErrorKind::NotFound, "no partial file"))
+            },
+            |path: &Path| std::fs::remove_dir(path),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match outcome {
+            Err(RuntimeError::Io(_)) => {}
+            Err(error) => panic!("an absent partial file is not a cleanup failure: {error:?}"),
+            Ok(_) => panic!("the injected writer must fail"),
+        }
+    }
 
     // Catches leaving the payload file or its directory behind after the run.
     #[test]
@@ -163,7 +267,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
 
-        let outcome = PayloadTemp::create_in_with_writer(
+        let outcome: Result<PayloadTemp, RuntimeError> = PayloadTemp::create_in_with_writer(
             b"MINICTR\0payload bytes",
             &root,
             |payload, bytes| {
@@ -171,6 +275,8 @@ mod tests {
                 file.write_all(&bytes[..4])?;
                 Err(io::Error::other("injected write failure"))
             },
+            |path: &Path| std::fs::remove_file(path),
+            |path: &Path| std::fs::remove_dir(path),
         );
 
         assert!(outcome.is_err(), "the injected writer must fail");

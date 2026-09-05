@@ -4,6 +4,7 @@ pub mod cargo;
 pub mod cli;
 pub mod docs;
 pub mod publication;
+pub mod runtime;
 pub mod tools;
 
 use std::io::{self, Write};
@@ -20,11 +21,16 @@ enum Phase {
     PublicationFiles,
     ClippyBundle,
     ClippyProtocol,
+    ClippyRuntime,
+    ClippyMinictr,
     ClippyXtask,
     BundleTests,
     ProtocolTests,
+    RuntimeTests,
+    MinictrTests,
     XtaskTests,
     LockedBuild,
+    EndToEnd,
 }
 
 impl Phase {
@@ -52,6 +58,26 @@ impl Phase {
                 "-D",
                 "warnings",
             ]),
+            Self::ClippyRuntime => Some(&[
+                "clippy",
+                "-p",
+                "minicontainer-runtime",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ]),
+            Self::ClippyMinictr => Some(&[
+                "clippy",
+                "-p",
+                "minictr",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ]),
             Self::ClippyXtask => Some(&[
                 "clippy",
                 "-p",
@@ -64,8 +90,11 @@ impl Phase {
             ]),
             Self::BundleTests => Some(&["test", "-p", "minicontainer-bundle", "--locked"]),
             Self::ProtocolTests => Some(&["test", "-p", "minicontainer-protocol", "--locked"]),
+            Self::RuntimeTests => Some(&["test", "-p", "minicontainer-runtime", "--locked"]),
+            Self::MinictrTests => Some(&["test", "-p", "minictr", "--locked"]),
             Self::XtaskTests => Some(&["test", "-p", "xtask", "--locked"]),
             Self::LockedBuild => Some(&["build", "--workspace", "--locked"]),
+            Self::EndToEnd => None,
         }
     }
 
@@ -74,6 +103,7 @@ impl Phase {
             || match self {
                 Self::DocsLinks => "check local Markdown links".to_owned(),
                 Self::PublicationFiles => "check publication policy".to_owned(),
+                Self::EndToEnd => "run real QEMU end-to-end verification".to_owned(),
                 _ => unreachable!("Cargo phases returned above"),
             },
             |args| format!("cargo {}", args.join(" ")),
@@ -93,11 +123,16 @@ fn check_phases() -> Vec<Phase> {
         Phase::PublicationFiles,
         Phase::ClippyBundle,
         Phase::ClippyProtocol,
+        Phase::ClippyRuntime,
+        Phase::ClippyMinictr,
         Phase::ClippyXtask,
         Phase::BundleTests,
         Phase::ProtocolTests,
+        Phase::RuntimeTests,
+        Phase::MinictrTests,
         Phase::XtaskTests,
         Phase::LockedBuild,
+        Phase::EndToEnd,
     ]
 }
 
@@ -224,6 +259,7 @@ pub enum XtaskError {
     Cargo(cargo::CargoError),
     Docs(docs::DocsError),
     Publication(publication::PublicationError),
+    Runtime(runtime::E2EError),
     Tool(tools::ToolError),
     Output(OutputError),
 }
@@ -234,6 +270,7 @@ impl fmt::Display for XtaskError {
             Self::Cargo(error) => error.fmt(formatter),
             Self::Docs(error) => error.fmt(formatter),
             Self::Publication(error) => error.fmt(formatter),
+            Self::Runtime(error) => error.fmt(formatter),
             Self::Tool(error) => error.fmt(formatter),
             Self::Output(error) => error.fmt(formatter),
         }
@@ -246,6 +283,7 @@ impl std::error::Error for XtaskError {
             Self::Cargo(error) => Some(error),
             Self::Docs(error) => Some(error),
             Self::Publication(error) => Some(error),
+            Self::Runtime(error) => Some(error),
             Self::Tool(error) => Some(error),
             Self::Output(error) => Some(error),
         }
@@ -270,6 +308,12 @@ impl From<publication::PublicationError> for XtaskError {
     }
 }
 
+impl From<runtime::E2EError> for XtaskError {
+    fn from(error: runtime::E2EError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
 impl From<tools::ToolError> for XtaskError {
     fn from(error: tools::ToolError) -> Self {
         Self::Tool(error)
@@ -290,6 +334,7 @@ fn execute_phase(workspace: &Path, phase: Phase) -> Result<String, XtaskError> {
     match phase {
         Phase::DocsLinks => docs::check_local_links(workspace)?,
         Phase::PublicationFiles => publication::check(workspace)?,
+        Phase::EndToEnd => return runtime::run_e2e(workspace).map_err(XtaskError::Runtime),
         _ => unreachable!("Cargo phases returned above"),
     }
     Ok(String::new())
@@ -335,13 +380,19 @@ mod tests {
                 Phase::PublicationFiles,
                 Phase::ClippyBundle,
                 Phase::ClippyProtocol,
+                Phase::ClippyRuntime,
+                Phase::ClippyMinictr,
                 Phase::ClippyXtask,
                 Phase::BundleTests,
                 Phase::ProtocolTests,
+                Phase::RuntimeTests,
+                Phase::MinictrTests,
                 Phase::XtaskTests,
                 Phase::LockedBuild,
+                Phase::EndToEnd,
             ]
         );
+        assert_eq!(check_phases().len(), 15);
     }
 
     #[test]
@@ -484,12 +535,46 @@ mod tests {
                 ],
             ),
             (
+                Phase::ClippyRuntime,
+                vec![
+                    "clippy",
+                    "-p",
+                    "minicontainer-runtime",
+                    "--all-targets",
+                    "--locked",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+            ),
+            (
+                Phase::ClippyMinictr,
+                vec![
+                    "clippy",
+                    "-p",
+                    "minictr",
+                    "--all-targets",
+                    "--locked",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+            ),
+            (
                 Phase::BundleTests,
                 vec!["test", "-p", "minicontainer-bundle", "--locked"],
             ),
             (
                 Phase::ProtocolTests,
                 vec!["test", "-p", "minicontainer-protocol", "--locked"],
+            ),
+            (
+                Phase::RuntimeTests,
+                vec!["test", "-p", "minicontainer-runtime", "--locked"],
+            ),
+            (
+                Phase::MinictrTests,
+                vec!["test", "-p", "minictr", "--locked"],
             ),
             (Phase::XtaskTests, vec!["test", "-p", "xtask", "--locked"]),
             (Phase::LockedBuild, vec!["build", "--workspace", "--locked"]),
@@ -504,5 +589,6 @@ mod tests {
         }
         assert!(Phase::DocsLinks.cargo_invocation(root).is_none());
         assert!(Phase::PublicationFiles.cargo_invocation(root).is_none());
+        assert!(Phase::EndToEnd.cargo_invocation(root).is_none());
     }
 }

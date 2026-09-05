@@ -169,6 +169,15 @@ pub fn check_setup() -> Result<(), XtaskError> {
     run_setup(&mut output, run_command)
 }
 
+/// Checks that an external program needed by the E2E gate runs and reports
+/// its version line. Returns the captured stdout.
+pub fn require_program(
+    program: &'static str,
+    arguments: &'static [&'static str],
+) -> Result<String, ToolError> {
+    run_command(SetupCommand { program, arguments })
+}
+
 fn run_setup(
     output: &mut impl Write,
     mut runner: impl FnMut(SetupCommand) -> Result<String, ToolError>,

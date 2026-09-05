@@ -119,46 +119,51 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
     let mut image: Option<String> = None;
     let mut store: Option<PathBuf> = None;
     let mut kernel: Option<PathBuf> = None;
-    let mut timeout = DEFAULT_TIMEOUT;
+    let mut timeout: Option<Duration> = None;
 
-    let mut pending: Vec<OsString> = arguments.collect();
-    // `--opt=value`形式を`--opt value`へ正規化する。非UTF-8引数は分割せず、
-    // 共通経路でNonUtf8Argumentとして型付きerrorにする。
-    let mut expanded: Vec<OsString> = Vec::with_capacity(pending.len());
-    for argument in pending.drain(..) {
-        match argument.to_str() {
-            Some(text) if text.starts_with("--") && text.contains('=') => {
-                let (name, value) = text.split_once('=').expect("contains '='");
-                expanded.push(OsString::from(name));
-                expanded.push(OsString::from(value));
-            }
-            _ => expanded.push(argument),
-        }
-    }
-
-    let mut rest = expanded.into_iter().peekable();
+    // `--opt=value`はoption位置のtokenだけを分割する。`--store`や`--kernel`が
+    // 消費した値はOS pathとして不透明に扱い、`--`で始まり`=`を含むpathを
+    // 壊さない。
+    let pending: Vec<OsString> = arguments.collect();
+    let mut rest = pending.into_iter().peekable();
     while let Some(argument) = rest.next() {
         if is_option(&argument) {
-            let name = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
             match name.as_str() {
                 "--store" => {
                     if store.is_some() {
                         return Err(CliError::DuplicateOption("--store"));
                     }
-                    let value = rest.next().ok_or(CliError::MissingValue("--store"))?;
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
                     store = Some(PathBuf::from(value));
                 }
                 "--kernel" => {
                     if kernel.is_some() {
                         return Err(CliError::DuplicateOption("--kernel"));
                     }
-                    let value = rest.next().ok_or(CliError::MissingValue("--kernel"))?;
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--kernel"))?,
+                    };
                     kernel = Some(PathBuf::from(value));
                 }
                 "--timeout-ms" => {
-                    let value = rest.next().ok_or(CliError::MissingValue("--timeout-ms"))?;
+                    if timeout.is_some() {
+                        return Err(CliError::DuplicateOption("--timeout-ms"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--timeout-ms"))?,
+                    };
                     let value = value.into_string().map_err(CliError::NonUtf8Argument)?;
-                    timeout = parse_timeout(&value)?;
+                    timeout = Some(parse_timeout(&value)?);
                 }
                 unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
             }
@@ -179,7 +184,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         image,
         store,
         kernel,
-        timeout,
+        timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
     }))
 }
 
@@ -386,6 +391,56 @@ mod tests {
         assert_eq!(
             parse(["run", "--kernel", "/a", "--kernel", "/b", "hello"]),
             Err(CliError::DuplicateOption("--kernel"))
+        );
+    }
+
+    // Catches silently preferring the last of two timeouts, which can
+    // replace a short timeout with a much longer one.
+    #[test]
+    fn rejects_duplicate_timeout_options_in_every_spelling() {
+        assert_eq!(
+            parse(["run", "--timeout-ms", "1", "--timeout-ms", "200", "hello"]),
+            Err(CliError::DuplicateOption("--timeout-ms"))
+        );
+        assert_eq!(
+            parse(["run", "--timeout-ms=1", "--timeout-ms=200", "hello"]),
+            Err(CliError::DuplicateOption("--timeout-ms"))
+        );
+        assert_eq!(
+            parse(["run", "--timeout-ms", "1", "--timeout-ms=200", "hello"]),
+            Err(CliError::DuplicateOption("--timeout-ms"))
+        );
+        assert_eq!(
+            parse(["run", "--timeout-ms=1", "--timeout-ms", "200", "hello"]),
+            Err(CliError::DuplicateOption("--timeout-ms"))
+        );
+    }
+
+    // Catches expanding equals syntax inside a consumed path value: a
+    // kernel path beginning with `--` and containing `=` is opaque.
+    #[test]
+    fn keeps_equals_in_a_consumed_path_value_opaque() {
+        assert_eq!(
+            parse(["run", "--kernel", "--foo=bar", "hello"]),
+            Ok(Command::Run(RunArgs {
+                image: "hello".into(),
+                store: None,
+                kernel: Some(PathBuf::from("--foo=bar")),
+                timeout: Duration::from_secs(5),
+            }))
+        );
+        assert_eq!(
+            parse(["run", "--store", "--foo=bar", "hello"]),
+            Ok(Command::Run(RunArgs {
+                image: "hello".into(),
+                store: Some(PathBuf::from("--foo=bar")),
+                kernel: None,
+                timeout: Duration::from_secs(5),
+            }))
+        );
+        assert_eq!(
+            parse(["run", "--kernel", "--foo=bar"]),
+            Err(CliError::MissingImage)
         );
     }
 
