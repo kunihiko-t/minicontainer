@@ -5,11 +5,13 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`image build`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
+usage: minictr image list [--store PATH]
+usage: minictr image inspect [--store PATH] IMAGE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -27,12 +29,14 @@ command名、option名、image名はUTF-8でなければならず、storeとkern
 IMAGEはUTF-8でなければならず、ELFは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `--arg`の値はmanifestへ格納するためUTF-8でなければならない。
 optionはIMAGEとELFの前後どこに置いてもよい。
+`image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
+`image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
 
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
-`image build`のstore解決も同じ順序を使う。
+`image build`、`image list`、`image inspect`のstore解決も同じ順序を使う。
 
 ## imageの登録
 
@@ -49,6 +53,30 @@ ELFの中身はhostでは検証せず、guestのloaderが検証する。
 tag名とゲスト引数の文法はbundle構築時に検証し、不正な入力はhost側の失敗として終わる。
 tag付けに失敗した後に未参照のdigestが残ることは許容する。
 同じbytesのblobは再利用でき、削除やrollbackを加えるほうがstore操作を複雑にするためである。
+
+## imageの確認
+
+`image list`は次のようにheaderとbyte順の一覧を出す。
+空のstoreではheaderだけを出す。
+
+```text
+TAG	DIGEST
+myapp	sha256:<64桁の小文字16進数>
+```
+
+`image inspect`は次の安定した5行を出す。
+`digest`は解決したbundle headerの値であり、tag fileの内容ではない。
+
+```text
+tag: myapp
+name: myapp
+digest: sha256:<64桁の小文字16進数>
+args: 0
+elf-bytes: 4096
+```
+
+manifest引数の内容は表示せず、件数だけを表示する。
+未参照のtagは一覧に出るが、同じtagのinspectは`resolve`経由で失敗する。
 
 ## 実行と入出力
 
@@ -67,6 +95,7 @@ guestの終了codeは0から255の範囲でそのままprocess終了codeにな�
 timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、診断は標準エラー出力へ出る。
 `image build`では、ELFの読み取り失敗、上限超過、bundle構築失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
 `image build`のparse失敗とstore解決失敗は使い方の誤りとして終了code 2になる。
+`image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore解決失敗は終了code 2になる。
 
 ## 失敗の調べ方
 
