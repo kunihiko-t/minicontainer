@@ -20,6 +20,28 @@ pub enum Command {
     Version,
     /// MiniBundleを一つのQEMU仮想machineで実行する。
     Run(RunArgs),
+    /// imageのbuildなどstore内容を操作する。
+    Image(ImageCommand),
+}
+
+/// `image` commandの型付きsubcommand。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageCommand {
+    /// 静的ELFからMiniBundleを構築してstoreへ登録する。
+    Build(ImageBuildArgs),
+}
+
+/// `image build`の型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBuildArgs {
+    /// store内で付けるimage tag。
+    pub image: String,
+    /// 読み取る静的ELFのpath。
+    pub elf: PathBuf,
+    /// manifestへ格納するguest引数。
+    pub args: Vec<String>,
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
 }
 
 /// `run` commandの型付き引数。
@@ -48,6 +70,19 @@ pub struct ResolvedRun {
     pub timeout: Duration,
 }
 
+/// `image build`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBuild {
+    /// store内で付けるimage tag。
+    pub image: String,
+    /// 読み取る静的ELFのpath。
+    pub elf: PathBuf,
+    /// manifestへ格納するguest引数。
+    pub args: Vec<String>,
+    /// bundle storeのroot。
+    pub store: PathBuf,
+}
+
 /// command parseまたは既定path解決が失敗した理由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -57,6 +92,10 @@ pub enum CliError {
     UnknownCommand(String),
     /// `run`にimageが与えられなかった。
     MissingImage,
+    /// `image build`にimageが与えられなかった。
+    MissingBuildImage,
+    /// `image build`にELF pathが与えられなかった。
+    MissingElf,
     /// 余分なpositional引数。
     UnexpectedArgument(String),
     /// 対応していないoption。
@@ -83,6 +122,10 @@ impl fmt::Display for CliError {
                 write!(formatter, "unknown minictr command: {command}")
             }
             Self::MissingImage => formatter.write_str("missing image for `minictr run`"),
+            Self::MissingBuildImage => {
+                formatter.write_str("missing image for `minictr image build`")
+            }
+            Self::MissingElf => formatter.write_str("missing ELF for `minictr image build`"),
             Self::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected minictr argument: {argument}")
             }
@@ -111,7 +154,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE"
+    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF"
 }
 
 /// OS引数からcommandをparseする。
@@ -123,6 +166,16 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         "help" | "--help" => return parse_bare_command(arguments, Command::Help),
         "--version" => return parse_bare_command(arguments, Command::Version),
         "run" => {}
+        "image" => {
+            let subcommand = arguments.next().ok_or(CliError::MissingCommand)?;
+            let subcommand = subcommand
+                .into_string()
+                .map_err(CliError::NonUtf8Argument)?;
+            match subcommand.as_str() {
+                "build" => return parse_image_build(arguments),
+                unknown => return Err(CliError::UnknownCommand(unknown.to_owned())),
+            }
+        }
         unknown => return Err(CliError::UnknownCommand(unknown.to_owned())),
     }
 
@@ -196,6 +249,76 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         kernel,
         timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
     }))
+}
+
+/// `image build`の引数をparseする。optionはIMAGEとELFの前後どこに
+/// 置いてもよく、`--arg`だけが複数回の指定を蓄積する。
+fn parse_image_build(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut image: Option<String> = None;
+    let mut elf: Option<PathBuf> = None;
+    let mut args: Vec<String> = Vec::new();
+    let mut store: Option<PathBuf> = None;
+
+    // `run`と同じく`--opt=value`はoption位置のtokenだけを分割し、
+    // 消費した値はOS pathまたはUTF-8引数として不透明に扱う。
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                "--arg" => {
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--arg"))?,
+                    };
+                    let value = value.into_string().map_err(CliError::NonUtf8Argument)?;
+                    args.push(value);
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        if image.is_none() {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            image = Some(text);
+            continue;
+        }
+        if elf.is_none() {
+            elf = Some(PathBuf::from(argument));
+            continue;
+        }
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        return Err(CliError::UnexpectedArgument(text));
+    }
+
+    let Some(image) = image else {
+        return Err(CliError::MissingBuildImage);
+    };
+    let Some(elf) = elf else {
+        return Err(CliError::MissingElf);
+    };
+    Ok(Command::Image(ImageCommand::Build(ImageBuildArgs {
+        image,
+        elf,
+        args,
+        store,
+    })))
 }
 
 /// 引数を取らないcommandを確定する。後続のtokenは、optionの形でも
@@ -274,6 +397,23 @@ pub fn resolve(args: &RunArgs, env: &dyn Environ) -> Result<ResolvedRun, CliErro
         store,
         kernel,
         timeout: args.timeout,
+    })
+}
+
+/// parse済み`image build`引数と環境からstore pathを解決する。
+pub fn resolve_build(args: &ImageBuildArgs, env: &dyn Environ) -> Result<ResolvedBuild, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedBuild {
+        image: args.image.clone(),
+        elf: args.elf.clone(),
+        args: args.args.clone(),
+        store,
     })
 }
 
@@ -648,7 +788,261 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE"
+            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF"
         );
+    }
+
+    // Catches drifting from the Task 18 acceptance syntax: `image build`
+    // takes an image tag and an ELF path with no options by default.
+    #[test]
+    fn parses_image_build_with_defaults() {
+        assert_eq!(
+            parse(["image", "build", "hello", "./hello.elf"]),
+            Ok(Command::Image(ImageCommand::Build(ImageBuildArgs {
+                image: "hello".into(),
+                elf: PathBuf::from("./hello.elf"),
+                args: Vec::new(),
+                store: None,
+            })))
+        );
+    }
+
+    // Catches rejecting a valid option order: options may precede, split,
+    // or follow the IMAGE and ELF positionals.
+    #[test]
+    fn parses_image_build_options_in_any_order() {
+        let expected = Command::Image(ImageCommand::Build(ImageBuildArgs {
+            image: "hello".into(),
+            elf: PathBuf::from("./hello.elf"),
+            args: vec!["fast".to_owned()],
+            store: Some(PathBuf::from("/data/store")),
+        }));
+        assert_eq!(
+            parse([
+                "image",
+                "build",
+                "--store",
+                "/data/store",
+                "--arg",
+                "fast",
+                "hello",
+                "./hello.elf",
+            ]),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "build",
+                "--arg=fast",
+                "hello",
+                "--store=/data/store",
+                "./hello.elf",
+            ]),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "build",
+                "hello",
+                "./hello.elf",
+                "--store",
+                "/data/store",
+                "--arg",
+                "fast",
+            ]),
+            Ok(expected)
+        );
+    }
+
+    // Catches keeping only the last `--arg`: every occurrence appends in order.
+    #[test]
+    fn accumulates_repeated_arg_options_in_order() {
+        assert_eq!(
+            parse([
+                "image",
+                "build",
+                "--arg",
+                "first",
+                "--arg=second",
+                "--arg",
+                "third",
+                "hello",
+                "./hello.elf",
+            ]),
+            Ok(Command::Image(ImageCommand::Build(ImageBuildArgs {
+                image: "hello".into(),
+                elf: PathBuf::from("./hello.elf"),
+                args: vec!["first".to_owned(), "second".to_owned(), "third".to_owned(),],
+                store: None,
+            })))
+        );
+    }
+
+    // Catches silently preferring one of two `--store` values for `image build`.
+    #[test]
+    fn rejects_duplicate_store_for_image_build() {
+        assert_eq!(
+            parse([
+                "image",
+                "build",
+                "--store",
+                "/a",
+                "--store",
+                "/b",
+                "hello",
+                "./hello.elf",
+            ]),
+            Err(CliError::DuplicateOption("--store"))
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "build",
+                "--store=/a",
+                "--store=/b",
+                "hello",
+                "./hello.elf",
+            ]),
+            Err(CliError::DuplicateOption("--store"))
+        );
+    }
+
+    // Catches running `image build` without an image tag or an ELF path,
+    // or with a second unexpected positional.
+    #[test]
+    fn rejects_missing_image_elf_and_extra_positional_for_image_build() {
+        assert_eq!(parse(["image", "build"]), Err(CliError::MissingBuildImage));
+        assert_eq!(
+            parse(["image", "build", "hello"]),
+            Err(CliError::MissingElf)
+        );
+        assert_eq!(
+            parse(["image", "build", "hello", "./hello.elf", "--arg"]),
+            Err(CliError::MissingValue("--arg"))
+        );
+        assert_eq!(
+            parse(["image", "build", "hello", "./a.elf", "./b.elf"]),
+            Err(CliError::UnexpectedArgument("./b.elf".to_owned()))
+        );
+    }
+
+    // Catches misrouting a bare `image` or an unknown subcommand to build.
+    #[test]
+    fn rejects_missing_and_unknown_image_subcommands() {
+        assert_eq!(parse(["image"]), Err(CliError::MissingCommand));
+        assert_eq!(
+            parse(["image", "list"]),
+            Err(CliError::UnknownCommand("list".to_owned()))
+        );
+        assert_eq!(
+            parse(["image", "build", "--volume", "data", "hello", "./hello.elf"]),
+            Err(CliError::UnknownOption("--volume".to_owned()))
+        );
+    }
+
+    // Catches rejecting undecodable ELF and store paths while accepting an
+    // undecodable image tag: only the tag must be UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn keeps_non_utf8_build_paths_as_paths() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0xff]);
+        let parsed = parse_os([
+            OsString::from("image"),
+            OsString::from("build"),
+            OsString::from("hello"),
+            raw.clone(),
+        ])
+        .unwrap();
+        let Command::Image(ImageCommand::Build(args)) = parsed else {
+            panic!("expected an image build command");
+        };
+        assert_eq!(args.elf.as_os_str().as_bytes(), raw.as_bytes());
+
+        let parsed = parse_os([
+            OsString::from("image"),
+            OsString::from("build"),
+            OsString::from("--store"),
+            raw.clone(),
+            OsString::from("hello"),
+            OsString::from("./hello.elf"),
+        ])
+        .unwrap();
+        let Command::Image(ImageCommand::Build(args)) = parsed else {
+            panic!("expected an image build command");
+        };
+        assert_eq!(args.store.unwrap().as_os_str().as_bytes(), raw.as_bytes());
+
+        assert_eq!(
+            parse_os([
+                OsString::from("image"),
+                OsString::from("build"),
+                raw.clone(),
+                OsString::from("./hello.elf"),
+            ]),
+            Err(CliError::NonUtf8Argument(raw.clone()))
+        );
+        assert_eq!(
+            parse_os([
+                OsString::from("image"),
+                OsString::from("build"),
+                OsString::from("hello"),
+                OsString::from("./hello.elf"),
+                OsString::from("--arg"),
+                raw.clone(),
+            ]),
+            Err(CliError::NonUtf8Argument(raw))
+        );
+    }
+
+    // Catches resolving the build store from the wrong environment variable
+    // or losing an explicit CLI path to an override.
+    #[test]
+    fn resolves_build_store_from_the_documented_environment() {
+        let args = ImageBuildArgs {
+            image: "hello".into(),
+            elf: PathBuf::from("./hello.elf"),
+            args: vec!["fast".to_owned()],
+            store: None,
+        };
+        let resolved = resolve_build(&args, &home_env()).unwrap();
+        assert_eq!(
+            resolved,
+            ResolvedBuild {
+                image: "hello".into(),
+                elf: PathBuf::from("./hello.elf"),
+                args: vec!["fast".to_owned()],
+                store: PathBuf::from("/home/test/.minicontainer"),
+            }
+        );
+
+        let env = FakeEnv {
+            store: Some(OsString::from("/env/store")),
+            kernel: None,
+            home: Some(OsString::from("/home/test")),
+        };
+        assert_eq!(
+            resolve_build(&args, &env).unwrap().store,
+            PathBuf::from("/env/store")
+        );
+
+        let explicit = ImageBuildArgs {
+            store: Some(PathBuf::from("/cli/store")),
+            ..args.clone()
+        };
+        assert_eq!(
+            resolve_build(&explicit, &env).unwrap().store,
+            PathBuf::from("/cli/store")
+        );
+
+        let env = FakeEnv {
+            store: None,
+            kernel: None,
+            home: None,
+        };
+        assert_eq!(resolve_build(&args, &env), Err(CliError::MissingHome));
     }
 }

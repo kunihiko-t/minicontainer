@@ -23,8 +23,7 @@ git clone https://github.com/kunihiko-t/minicontainer.git
 cd minicontainer
 ```
 
-`minictr run hello`で、同じ結果を再現できるhelloゲストを実行する。
-標準出力に`hello stdout`、標準エラー出力に`hello stderr`が届き、終了コード42で終わる。
+利用者が用意した静的RISC-V 64 ELFを`image build`で登録し、`minictr run`で実行する。
 以下は同じシェルで、MiniContainerのリポジトリ直下から順に実行する。
 作業用のminiOSとストアは一時ディレクトリーに作成するため、長期保存には別の保存先を指定する。
 
@@ -52,43 +51,59 @@ cargo build --manifest-path "$MINIOS/Cargo.toml" --target-dir "$MINIOS/target" -
 ビルド成果物`$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel`が実行カーネルである。
 Guest ABIは`minios-abi-v0.1.1`に固定している。
 
-次にhello bundleを`store`へ取り込み、`hello`タグを作る。
+次に静的RISC-V 64 ELFを`image build`で`store`へ登録し、`myapp`タグを付ける。
 `$STORE`は絶対パスで指定した保存先であり、`Store::new`が作成する。
+`./app.elf`の部分は、利用者が用意した静的RISC-V 64 ELFのパスに置き換える。
+ELF入力の上限は8 MiBであり、ELFの中身はhostでは検証せずguestのloaderが検証する。
 
 ```sh
-cargo run -p xtask --locked --example prepare_hello_store -- "$STORE"
+cargo run -p minictr --locked -- image build --store "$STORE" myapp ./app.elf
+```
+
+成功すると、タグとSHA-256 digestの一行だけが表示される。
+
+```text
+myapp sha256:<64桁の小文字16進数>
 ```
 
 最後に`minictr run`で実行する。
 
 ```sh
 exit_code=0
-cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" hello || exit_code=$?
+cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" myapp || exit_code=$?
 echo "exit=$exit_code"
 ```
 
-期待する結果は次の通りである。
+期待する結果は、ゲストの標準出力がそのまま表示され、`exit=`にゲストの終了コードが入ることである。
+たとえばゲストが標準出力へ`hello stdout`と書いて42で終わる場合、次のようになる。
 
 ```text
 hello stdout
 exit=42
 ```
 
-`hello stderr`は標準エラー出力に届く。Cargoのビルド状況も標準エラー出力に表示される。
+ゲストの標準エラー出力は`minictr`の標準エラー出力に届く。Cargoのビルド状況も標準エラー出力に表示される。
 この例の42は意図した終了コードであり、シェルの`set -e`が有効でも結果を確認できる形にしている。
 `minictr`は0〜255のゲスト終了コードをそのまま返し、範囲外はホスト側の失敗として扱う。
-使い方の誤りは終了コード2、ホスト側の失敗（`store`の解決失敗、QEMUの失敗、タイムアウトを含む）は終了コード125になる。
+使い方の誤りは終了コード2、ホスト側の失敗（`image build`の失敗、`store`の解決失敗、QEMUの失敗、タイムアウトを含む）は終了コード125になる。
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`image build`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
+usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
 `--version`は`minictr 0.1.0`を標準出力へ出して0で終わる。
+
+`image build`は静的RISC-V 64 ELFからMiniBundleを構築し、指定したタグでローカルストアへ登録する。
+`--arg`は繰り返し指定でき、順にmanifestのゲスト引数になる。
+成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
+`--store`の省略時解決は`run`と同じである。
+ELF入力の上限は8 MiBであり、超える入力は本体を読む前に拒否する。
 
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。
