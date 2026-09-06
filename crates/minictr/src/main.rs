@@ -2,12 +2,21 @@
 
 mod cli;
 
-use std::{ffi::OsString, io::Write, path::Path, time::Duration};
+use std::{
+    ffi::OsString,
+    fs::File,
+    io::{Read, Write},
+    path::Path,
+    time::Duration,
+};
 
-use minicontainer_bundle::Store;
+use minicontainer_bundle::{ImageSpec, MAX_BUNDLE_LEN, Store, build, format_digest};
 use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, SystemProcessBackend};
 
-use cli::{Command, Environ, RealEnv, ResolvedRun, VERSION, help, parse_os, resolve};
+use cli::{
+    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedRun, VERSION, help, parse_os,
+    resolve, resolve_build,
+};
 
 /// usage errorのprocess終了code。
 pub const USAGE_EXIT: i32 = 2;
@@ -59,6 +68,17 @@ pub fn real_main(
             };
             run_resolved(&resolved, &RealRunner, &RealStore, stdout, stderr)
         }
+        Command::Image(ImageCommand::Build(args)) => {
+            let resolved = match resolve_build(&args, env) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = writeln!(stderr, "minictr: {error}");
+                    let _ = writeln!(stderr, "{help}", help = help());
+                    return USAGE_EXIT;
+                }
+            };
+            build_resolved(&resolved, &RealStore, stdout, stderr)
+        }
     }
 }
 
@@ -66,6 +86,10 @@ pub fn real_main(
 pub trait ImageStore {
     /// image tagを検証済みbundle bytesとして返す。
     fn resolve(&self, store_root: &Path, image: &str) -> Result<Vec<u8>, StoreError>;
+    /// bundle bytesをstoreへimportしてdigestを返す。
+    fn import(&self, store_root: &Path, bytes: &[u8]) -> Result<[u8; 32], StoreError>;
+    /// digestへimage tagを付ける。
+    fn tag(&self, store_root: &Path, name: &str, digest: [u8; 32]) -> Result<(), StoreError>;
 }
 
 /// bundle store失敗の公開分類。
@@ -90,6 +114,54 @@ impl ImageStore for RealStore {
     fn resolve(&self, store_root: &Path, image: &str) -> Result<Vec<u8>, StoreError> {
         let store = Store::new(store_root).map_err(StoreError::Store)?;
         store.resolve(image).map_err(StoreError::Store)
+    }
+
+    fn import(&self, store_root: &Path, bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+        let store = Store::new(store_root).map_err(StoreError::Store)?;
+        store.import(bytes).map_err(StoreError::Store)
+    }
+
+    fn tag(&self, store_root: &Path, name: &str, digest: [u8; 32]) -> Result<(), StoreError> {
+        let store = Store::new(store_root).map_err(StoreError::Store)?;
+        store.tag(name, digest).map_err(StoreError::Store)
+    }
+}
+
+/// image build失敗の公開分類。
+#[derive(Debug)]
+pub enum BuildError {
+    /// ELF入力の読み取りが失敗した。
+    ElfIo(std::io::Error),
+    /// ELF入力が8 MiB上限を超えた。
+    ElfTooLarge,
+    /// MiniBundleの構築が失敗した。
+    Bundle(minicontainer_bundle::BundleError),
+    /// store操作が失敗した。
+    Store(minicontainer_bundle::StoreError),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ElfIo(error) => write!(formatter, "failed to read ELF input: {error}"),
+            Self::ElfTooLarge => formatter.write_str("ELF input exceeds the 8 MiB payload limit"),
+            Self::Bundle(error) => write!(formatter, "invalid MiniBundle: {error}"),
+            Self::Store(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl From<minicontainer_bundle::BundleError> for BuildError {
+    fn from(error: minicontainer_bundle::BundleError) -> Self {
+        Self::Bundle(error)
+    }
+}
+
+impl From<StoreError> for BuildError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Store(error) => Self::Store(error),
+        }
     }
 }
 
@@ -146,6 +218,78 @@ pub fn run_resolved(
         stdout,
         stderr,
     )
+}
+
+/// 解決済み`image build`を実行し、process終了codeを返す。
+pub fn build_resolved(
+    resolved: &ResolvedBuild,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let digest = match build_and_store(resolved, store) {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    if let Err(error) = writeln!(
+        stdout,
+        "{image} sha256:{digest}",
+        image = resolved.image,
+        digest = format_digest(digest)
+    ) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    // `main` ends with `process::exit`, which skips destructors, so a piped
+    // success line must be flushed explicitly before reporting success.
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// ELFのmetadata確認、上限付きread、bundle構築、import、tagを順に行う。
+/// ELFの中身は検証せずminiOSのloaderへ委ねる。tag失敗後に残る未参照
+/// blobは消さない。同じbytesは再利用でき、rollbackのほうがstore操作を
+/// 複雑にするためである。
+fn build_and_store(
+    resolved: &ResolvedBuild,
+    store: &dyn ImageStore,
+) -> Result<[u8; 32], BuildError> {
+    let elf = read_elf(&resolved.elf)?;
+    let args: Vec<&str> = resolved.args.iter().map(String::as_str).collect();
+    let bundle = build(ImageSpec {
+        name: &resolved.image,
+        args: &args,
+        elf: &elf,
+    })?;
+    let digest = store.import(&resolved.store, &bundle)?;
+    store.tag(&resolved.store, &resolved.image, digest)?;
+    Ok(digest)
+}
+
+/// ELF入力をmetadata確認つきの上限付きで読む。本体を読む前に8 MiBを
+/// 超える入力を拒否し、metadata確認後に伸びた入力もsentinelで拒否する。
+fn read_elf(path: &Path) -> Result<Vec<u8>, BuildError> {
+    if std::fs::metadata(path).map_err(BuildError::ElfIo)?.len() > MAX_BUNDLE_LEN {
+        return Err(BuildError::ElfTooLarge);
+    }
+    let file = File::open(path).map_err(BuildError::ElfIo)?;
+    if file.metadata().map_err(BuildError::ElfIo)?.len() > MAX_BUNDLE_LEN {
+        return Err(BuildError::ElfTooLarge);
+    }
+    let mut bounded = file.take(MAX_BUNDLE_LEN + 1);
+    let mut bytes = Vec::new();
+    bounded.read_to_end(&mut bytes).map_err(BuildError::ElfIo)?;
+    let len = u64::try_from(bytes.len()).map_err(|_| BuildError::ElfTooLarge)?;
+    if len > MAX_BUNDLE_LEN {
+        return Err(BuildError::ElfTooLarge);
+    }
+    Ok(bytes)
 }
 
 /// 取得済みbundleを実行し、guest入出力をhostへ接続する。
@@ -264,6 +408,91 @@ mod tests {
                 .clone()
                 .map_err(|_| StoreError::Store(minicontainer_bundle::StoreError::UnsafeStorePath))
         }
+
+        fn import(&self, _store_root: &Path, _bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+            panic!("run tests do not import bundles");
+        }
+
+        fn tag(
+            &self,
+            _store_root: &Path,
+            _name: &str,
+            _digest: [u8; 32],
+        ) -> Result<(), StoreError> {
+            panic!("run tests do not tag bundles");
+        }
+    }
+
+    struct RecordingStore {
+        calls: RefCell<Vec<String>>,
+        imported: RefCell<Vec<u8>>,
+        tagged: RefCell<Vec<(String, [u8; 32])>>,
+        digest: [u8; 32],
+        fail_tag: bool,
+    }
+
+    impl RecordingStore {
+        fn ok(digest: [u8; 32]) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                imported: RefCell::new(Vec::new()),
+                tagged: RefCell::new(Vec::new()),
+                digest,
+                fail_tag: false,
+            }
+        }
+
+        fn tag_fails(digest: [u8; 32]) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                imported: RefCell::new(Vec::new()),
+                tagged: RefCell::new(Vec::new()),
+                digest,
+                fail_tag: true,
+            }
+        }
+    }
+
+    impl ImageStore for RecordingStore {
+        fn resolve(&self, _store_root: &Path, _image: &str) -> Result<Vec<u8>, StoreError> {
+            panic!("image build tests do not resolve tags");
+        }
+
+        fn import(&self, _store_root: &Path, bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+            self.calls.borrow_mut().push("import".to_owned());
+            *self.imported.borrow_mut() = bytes.to_vec();
+            Ok(self.digest)
+        }
+
+        fn tag(&self, _store_root: &Path, name: &str, digest: [u8; 32]) -> Result<(), StoreError> {
+            self.calls.borrow_mut().push(format!("tag {name}"));
+            self.tagged.borrow_mut().push((name.to_owned(), digest));
+            if self.fail_tag {
+                return Err(StoreError::Store(
+                    minicontainer_bundle::StoreError::UnsafeStorePath,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn resolved_build(elf: &Path) -> ResolvedBuild {
+        ResolvedBuild {
+            image: "hello".to_owned(),
+            elf: elf.to_path_buf(),
+            args: vec!["fast".to_owned()],
+            store: Path::new("/store").to_path_buf(),
+        }
+    }
+
+    fn write_temp_elf(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "minictr-test-elf-{}-{id}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 
     fn outcome(stdout: &[u8], stderr: &[u8], exit_code: u32) -> RunOutcome {
@@ -499,6 +728,14 @@ mod tests {
                     minicontainer_bundle::StoreError::RootNotAbsolute,
                 ))
             }
+
+            fn import(&self, _root: &Path, _bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+                panic!("run tests do not import bundles");
+            }
+
+            fn tag(&self, _root: &Path, _name: &str, _digest: [u8; 32]) -> Result<(), StoreError> {
+                panic!("run tests do not tag bundles");
+            }
         }
 
         let runner = FakeRunner::ok(outcome(b"", b"", 0));
@@ -620,5 +857,162 @@ mod tests {
 
         assert_eq!(code, RUNTIME_EXIT);
         assert!(!stderr.is_empty());
+    }
+
+    // Catches reordering build, import, and tag, or printing anything but
+    // the single `IMAGE sha256:DIGEST` success line.
+    #[test]
+    fn build_imports_tags_and_reports_the_digest_in_order() {
+        let elf_path = write_temp_elf("order.elf", b"ELF");
+        let digest = [0xab; 32];
+        let store = RecordingStore::ok(digest);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = build_resolved(&resolved_build(&elf_path), &store, &mut stdout, &mut stderr);
+
+        let expected_bundle = build(ImageSpec {
+            name: "hello",
+            args: &["fast"],
+            elf: b"ELF",
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            stdout,
+            format!("hello sha256:{}\n", "ab".repeat(32)).into_bytes()
+        );
+        assert!(stderr.is_empty());
+        assert_eq!(store.calls.borrow().as_slice(), ["import", "tag hello"]);
+        assert_eq!(*store.imported.borrow(), expected_bundle);
+        assert_eq!(
+            store.tagged.borrow().as_slice(),
+            [("hello".to_owned(), digest)]
+        );
+        std::fs::remove_file(&elf_path).unwrap();
+    }
+
+    // Catches reading an ELF larger than the 8 MiB boot window into memory:
+    // the metadata length rejects it before import runs.
+    #[test]
+    fn rejects_an_elf_larger_than_the_bundle_limit_before_importing() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let elf_path = std::env::temp_dir().join(format!(
+            "minictr-test-oversized-elf-{}-{id}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&elf_path)
+            .unwrap();
+        file.set_len(minicontainer_bundle::MAX_BUNDLE_LEN + 1)
+            .unwrap();
+        drop(file);
+        let store = RecordingStore::ok([0; 32]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = build_resolved(&resolved_build(&elf_path), &store, &mut stdout, &mut stderr);
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("exceeds the 8 MiB"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(store.calls.borrow().is_empty());
+        std::fs::remove_file(&elf_path).unwrap();
+    }
+
+    // Catches reporting success or exiting zero when tagging the imported
+    // bundle fails.
+    #[test]
+    fn maps_a_tag_failure_to_a_host_error_without_a_success_line() {
+        let elf_path = write_temp_elf("tag-fail.elf", b"ELF");
+        let store = RecordingStore::tag_fails([0xab; 32]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = build_resolved(&resolved_build(&elf_path), &store, &mut stdout, &mut stderr);
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+        assert_eq!(store.calls.borrow().as_slice(), ["import", "tag hello"]);
+        std::fs::remove_file(&elf_path).unwrap();
+    }
+
+    // Catches reporting success when the ELF input cannot be read.
+    #[test]
+    fn maps_a_missing_elf_to_a_host_error() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let elf_path = std::env::temp_dir().join(format!(
+            "minictr-test-missing-elf-{}-{id}.elf",
+            std::process::id()
+        ));
+        let store = RecordingStore::ok([0; 32]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = build_resolved(&resolved_build(&elf_path), &store, &mut stdout, &mut stderr);
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+        assert!(store.calls.borrow().is_empty());
+    }
+
+    // Catches wiring `image build` to anything but parse, store resolution,
+    // bounded ELF read, bundle build, import, and tag.
+    #[test]
+    fn image_build_registers_a_tag_through_the_public_cli() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-build-store-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let elf_path = root.join("hello.elf");
+        std::fs::write(&elf_path, b"ELF").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("build"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("hello"),
+                elf_path.into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        let expected_bundle = build(ImageSpec {
+            name: "hello",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        let stored = Store::new(&root).unwrap().resolve("hello").unwrap();
+        assert_eq!(stored, expected_bundle);
+        let digest = minicontainer_bundle::parse(&stored).unwrap().header.digest;
+        assert_eq!(
+            stdout,
+            format!(
+                "hello sha256:{}\n",
+                minicontainer_bundle::format_digest(digest)
+            )
+            .into_bytes()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -1,4 +1,4 @@
-use crate::{BundleError, StoreError, manifest, parse};
+use crate::{BundleError, StoreError, format_digest, manifest, parse};
 use minios_abi::boot::BUNDLE_MAX_LEN;
 use std::{
     fs::{self, File, OpenOptions},
@@ -51,7 +51,7 @@ impl Store {
     pub fn tag(&self, name: &str, digest: [u8; 32]) -> Result<(), StoreError> {
         validate_tag_name(name)?;
         self.ensure_layout()?;
-        let encoded = encode_digest(digest);
+        let encoded = format_digest(digest);
         atomic_write(&self.root.join("tags").join(name), encoded.as_bytes())?;
         Ok(())
     }
@@ -81,7 +81,7 @@ impl Store {
     fn image_path(&self, digest: [u8; 32]) -> PathBuf {
         self.root
             .join("images/sha256")
-            .join(format!("{}.mcb", encode_digest(digest)))
+            .join(format!("{}.mcb", format_digest(digest)))
     }
 
     fn ensure_layout(&self) -> Result<(), StoreError> {
@@ -212,16 +212,6 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         io::ErrorKind::AlreadyExists,
         "could not allocate a unique atomic temporary file",
     ))
-}
-
-fn encode_digest(digest: [u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
 }
 
 fn decode_digest(encoded: &[u8]) -> Option<[u8; 32]> {
@@ -481,7 +471,7 @@ mod tests {
         })
         .unwrap();
         let digest = store.import(&bytes).unwrap();
-        let encoded = encode_digest(digest);
+        let encoded = format_digest(digest);
         fs::write(outside.path().join("tag"), encoded.as_bytes()).unwrap();
         symlink(outside.path().join("tag"), home.path().join("tags/link")).unwrap();
 

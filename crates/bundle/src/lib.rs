@@ -15,6 +15,20 @@ use sha2::{Digest, Sha256};
 pub use error::{BundleError, StoreError};
 pub use store::Store;
 
+/// MiniBundle全体の公開上限。pin留めABIのboot windowと同一である。
+pub const MAX_BUNDLE_LEN: u64 = BUNDLE_MAX_LEN;
+
+/// digestをstore pathやtag、CLI表示で共有する小文字hex64桁へ変換する。
+pub fn format_digest(digest: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 /// Source fields used to construct a canonical MiniBundle.
 pub struct ImageSpec<'a> {
     pub name: &'a str,
@@ -396,6 +410,36 @@ mod tests {
             Err(BundleError::Manifest(
                 ManifestError::ArgumentContainsCarriageReturn
             ))
+        );
+    }
+
+    // Production break caught: the published bundle limit drifts from
+    // the pinned ABI boot window that builders and CLIs enforce.
+    #[test]
+    fn published_bundle_limit_matches_the_pinned_abi() {
+        assert_eq!(MAX_BUNDLE_LEN, BUNDLE_MAX_LEN);
+        assert_eq!(MAX_BUNDLE_LEN, 8 * 1024 * 1024);
+    }
+
+    // Production break caught: digest display diverges from the lowercase
+    // hex shared by store paths, tag files, and CLI success output.
+    #[test]
+    fn formats_digests_as_lowercase_hex() {
+        assert_eq!(
+            format_digest([
+                0xd2, 0xe0, 0xc6, 0x02, 0xac, 0xbf, 0x71, 0x1b, 0x5d, 0x1c, 0xb7, 0xa2, 0xae, 0x07,
+                0xdd, 0x19, 0xd9, 0xed, 0xa0, 0xf6, 0x8c, 0xb7, 0x36, 0xa5, 0x07, 0xb9, 0x7a, 0x73,
+                0x9e, 0xa9, 0x7d, 0x48,
+            ]),
+            "d2e0c602acbf711b5d1cb7a2ae07dd19d9eda0f68cb736a507b97a739ea97d48"
+        );
+        assert_eq!(
+            format_digest([0; 32]),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            format_digest([0xff; 32]),
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
     }
 

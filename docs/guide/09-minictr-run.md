@@ -1,14 +1,15 @@
 # `minictr run`を完成させる
 
-この章は、imageの解決からQEMUの終了までを一つのCLI flowとして実行する方法を説明する。
+この章は、imageの登録と解決からQEMUの終了までを一つのCLI flowとして実行する方法を説明する。
 store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`image build`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
+usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -21,9 +22,32 @@ usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 `--timeout-ms`の既定値は5000であり、0と非数値は拒否する。
 command名、option名、image名はUTF-8でなければならず、storeとkernelの値だけが非UTF-8 byteを透過的に扱う。
 
+`image build`の`--store`も一度だけ指定でき、重複は型付きerrorになる。
+`--arg`は繰り返し指定でき、順にmanifestのゲスト引数になる。
+IMAGEはUTF-8でなければならず、ELFは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
+`--arg`の値はmanifestへ格納するためUTF-8でなければならない。
+optionはIMAGEとELFの前後どこに置いてもよい。
+`image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
+
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
+`image build`のstore解決も同じ順序を使う。
+
+## imageの登録
+
+`image build`は、ELFのmetadata確認、上限付きread、MiniBundleの構築、`import`、`tag`を順に行う。
+成功すると次のようにタグとdigestの一行だけを標準出力へ出す。
+
+```text
+myapp sha256:<64桁の小文字16進数>
+```
+
+ELF入力の上限は8 MiBであり、超える入力は本体を読む前に拒否する。
+ELFの中身はhostでは検証せず、guestのloaderが検証する。
+tag名とゲスト引数の文法はbundle構築時に検証し、不正な入力はhost側の失敗として終わる。
+tag付けに失敗した後に未参照のdigestが残ることは許容する。
+同じbytesのblobは再利用でき、削除やrollbackを加えるほうがstore操作を複雑にするためである。
 
 ## 実行と入出力
 
@@ -40,6 +64,8 @@ guestの終了codeは0から255の範囲でそのままprocess終了codeにな�
 範囲外の終了codeはhost失敗として扱う。
 使い方の誤りは終了code 2、store解決失敗とruntime失敗は終了code 125である。
 timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、診断は標準エラー出力へ出る。
+`image build`では、ELFの読み取り失敗、上限超過、bundle構築失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
+`image build`のparse失敗とstore解決失敗は使い方の誤りとして終了code 2になる。
 
 ## 失敗の調べ方
 
