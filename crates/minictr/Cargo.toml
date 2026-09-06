@@ -11,5 +11,6 @@ name = "minictr"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 minicontainer-bundle = { path = "../bundle" }
 minicontainer-runtime = { path = "../runtime" }
