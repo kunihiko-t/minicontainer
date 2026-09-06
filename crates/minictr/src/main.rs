@@ -7,7 +7,7 @@ use std::{ffi::OsString, io::Write, path::Path, time::Duration};
 use minicontainer_bundle::Store;
 use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, SystemProcessBackend};
 
-use cli::{Command, Environ, RealEnv, ResolvedRun, help, parse_os, resolve};
+use cli::{Command, Environ, RealEnv, ResolvedRun, VERSION, help, parse_os, resolve};
 
 /// usage errorのprocess終了code。
 pub const USAGE_EXIT: i32 = 2;
@@ -39,16 +39,27 @@ pub fn real_main(
             return USAGE_EXIT;
         }
     };
-    let Command::Run(args) = command;
-    let resolved = match resolve(&args, env) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            let _ = writeln!(stderr, "minictr: {error}");
-            let _ = writeln!(stderr, "{help}", help = help());
-            return USAGE_EXIT;
+    match command {
+        Command::Help => {
+            let _ = writeln!(stdout, "{help}", help = help());
+            0
         }
-    };
-    run_resolved(&resolved, &RealRunner, &RealStore, stdout, stderr)
+        Command::Version => {
+            let _ = writeln!(stdout, "minictr {version}", version = VERSION);
+            0
+        }
+        Command::Run(args) => {
+            let resolved = match resolve(&args, env) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = writeln!(stderr, "minictr: {error}");
+                    let _ = writeln!(stderr, "{help}", help = help());
+                    return USAGE_EXIT;
+                }
+            };
+            run_resolved(&resolved, &RealRunner, &RealStore, stdout, stderr)
+        }
+    }
 }
 
 /// bundle取得の境界。testでは一時storeや偽装で差し替える。
@@ -549,6 +560,65 @@ mod tests {
 
         assert_eq!(code, USAGE_EXIT);
         assert!(String::from_utf8_lossy(&stderr).contains("usage: minictr run"));
+    }
+
+    // Catches printing help to stderr or exiting nonzero for a help request.
+    #[test]
+    fn help_commands_print_help_to_stdout_and_exit_0() {
+        struct UnusedEnv;
+        impl Environ for UnusedEnv {
+            fn store_override(&self) -> Option<OsString> {
+                None
+            }
+            fn kernel_override(&self) -> Option<OsString> {
+                None
+            }
+            fn home(&self) -> Option<OsString> {
+                None
+            }
+        }
+
+        for argv in [[OsString::from("help")], [OsString::from("--help")]] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let code = real_main(argv, &UnusedEnv, &mut stdout, &mut stderr);
+
+            assert_eq!(code, 0);
+            assert_eq!(stdout, format!("{}\n", help()).into_bytes());
+            assert!(stderr.is_empty());
+        }
+    }
+
+    // Catches reporting the version anywhere but stdout, or with unstable text.
+    #[test]
+    fn version_command_prints_name_and_version_and_exits_0() {
+        struct UnusedEnv;
+        impl Environ for UnusedEnv {
+            fn store_override(&self) -> Option<OsString> {
+                None
+            }
+            fn kernel_override(&self) -> Option<OsString> {
+                None
+            }
+            fn home(&self) -> Option<OsString> {
+                None
+            }
+        }
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [OsString::from("--version")],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"minictr 0.1.0\n");
+        assert!(stderr.is_empty());
     }
 
     // Catches resolving a real bundle through a temporary store.

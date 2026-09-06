@@ -81,11 +81,14 @@ exit=42
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`だけである。
+`minictr`が実装するコマンドは`run`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 ```
+
+`help`と`--help`は上記のusageを標準出力へ出して0で終わる。
+`--version`は`minictr 0.1.0`を標準出力へ出して0で終わる。
 
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。

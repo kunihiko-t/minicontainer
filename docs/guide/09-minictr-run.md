@@ -5,11 +5,15 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`だけである。
+`minictr`が実装するcommandは`run`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 ```
+
+`help`と`--help`は上記のusageを標準出力へ出して0で終わる。
+`--version`は`minictr 0.1.0`を標準出力へ出して0で終わる。
+どちらも引数を取らず、後続のtokenは型付きerrorになる。
 
 `--store`と`--kernel`の値はOS pathとして不透明に扱う。
 `--`で始まり`=`を含む値も分割しない。
