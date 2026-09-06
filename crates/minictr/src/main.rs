@@ -209,6 +209,22 @@ mod tests {
 
     static NEXT_TEMP_STORE: AtomicU64 = AtomicU64::new(0);
 
+    struct UnusedEnv;
+
+    impl Environ for UnusedEnv {
+        fn store_override(&self) -> Option<OsString> {
+            None
+        }
+
+        fn kernel_override(&self) -> Option<OsString> {
+            None
+        }
+
+        fn home(&self) -> Option<OsString> {
+            None
+        }
+    }
+
     struct FakeRunner {
         results: RefCell<VecDeque<Result<RunOutcome, RuntimeError>>>,
     }
@@ -504,19 +520,6 @@ mod tests {
     // Catches exiting nonzero without telling the operator how to invoke us.
     #[test]
     fn usage_errors_print_usage_and_exit_2() {
-        struct UnusedEnv;
-        impl Environ for UnusedEnv {
-            fn store_override(&self) -> Option<OsString> {
-                None
-            }
-            fn kernel_override(&self) -> Option<OsString> {
-                None
-            }
-            fn home(&self) -> Option<OsString> {
-                None
-            }
-        }
-
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = real_main(
@@ -536,19 +539,6 @@ mod tests {
     fn non_utf8_argument_prints_usage_and_exits_2() {
         use std::os::unix::ffi::OsStringExt;
 
-        struct UnusedEnv;
-        impl Environ for UnusedEnv {
-            fn store_override(&self) -> Option<OsString> {
-                None
-            }
-            fn kernel_override(&self) -> Option<OsString> {
-                None
-            }
-            fn home(&self) -> Option<OsString> {
-                None
-            }
-        }
-
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = real_main(
@@ -565,19 +555,6 @@ mod tests {
     // Catches printing help to stderr or exiting nonzero for a help request.
     #[test]
     fn help_commands_print_help_to_stdout_and_exit_0() {
-        struct UnusedEnv;
-        impl Environ for UnusedEnv {
-            fn store_override(&self) -> Option<OsString> {
-                None
-            }
-            fn kernel_override(&self) -> Option<OsString> {
-                None
-            }
-            fn home(&self) -> Option<OsString> {
-                None
-            }
-        }
-
         for argv in [[OsString::from("help")], [OsString::from("--help")]] {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
@@ -593,19 +570,6 @@ mod tests {
     // Catches reporting the version anywhere but stdout, or with unstable text.
     #[test]
     fn version_command_prints_name_and_version_and_exits_0() {
-        struct UnusedEnv;
-        impl Environ for UnusedEnv {
-            fn store_override(&self) -> Option<OsString> {
-                None
-            }
-            fn kernel_override(&self) -> Option<OsString> {
-                None
-            }
-            fn home(&self) -> Option<OsString> {
-                None
-            }
-        }
-
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
