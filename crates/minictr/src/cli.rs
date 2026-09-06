@@ -1,4 +1,4 @@
-//! `minictr run`のargument parseと既定path解決。
+//! `minictr`のargument parseと既定path解決。
 //!
 //! parseはUTF-8のimage名とoption名だけを受け付け、storeとkernelの値は
 //! OS pathとして非UTF-8 byteも透過的に扱う。
@@ -8,9 +8,16 @@ use std::{ffi::OsString, fmt, path::PathBuf, time::Duration};
 /// `--timeout-ms`を省略したときの待ち時間。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `minictr` binaryのversion。`--version`がそのまま表示する。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// `minictr`が公開するcommand。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// help全文を表示する。
+    Help,
+    /// binary名とversionを表示する。
+    Version,
     /// MiniBundleを一つのQEMU仮想machineで実行する。
     Run(RunArgs),
 }
@@ -112,8 +119,11 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
     let mut arguments = arguments.into_iter();
     let command = arguments.next().ok_or(CliError::MissingCommand)?;
     let command = command.into_string().map_err(CliError::NonUtf8Argument)?;
-    if command != "run" {
-        return Err(CliError::UnknownCommand(command));
+    match command.as_str() {
+        "help" | "--help" => return parse_bare_command(arguments, Command::Help),
+        "--version" => return parse_bare_command(arguments, Command::Version),
+        "run" => {}
+        unknown => return Err(CliError::UnknownCommand(unknown.to_owned())),
     }
 
     let mut image: Option<String> = None;
@@ -186,6 +196,20 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         kernel,
         timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
     }))
+}
+
+/// 引数を取らないcommandを確定する。後続のtokenは、optionの形でも
+/// 受け付けず、打ち間違いとして型付きerrorにする。
+fn parse_bare_command(
+    arguments: impl Iterator<Item = OsString>,
+    command: Command,
+) -> Result<Command, CliError> {
+    let mut arguments = arguments;
+    if let Some(extra) = arguments.next() {
+        let extra = extra.into_string().map_err(CliError::NonUtf8Argument)?;
+        return Err(CliError::UnexpectedArgument(extra));
+    }
+    Ok(command)
 }
 
 fn is_option(argument: &OsString) -> bool {
@@ -381,6 +405,37 @@ mod tests {
         );
     }
 
+    // Catches confusing the bare help and version commands with run or
+    // with an unknown command.
+    #[test]
+    fn parses_help_and_version_commands() {
+        assert_eq!(parse(["help"]), Ok(Command::Help));
+        assert_eq!(parse(["--help"]), Ok(Command::Help));
+        assert_eq!(parse(["--version"]), Ok(Command::Version));
+        assert_eq!(
+            parse(["status"]),
+            Err(CliError::UnknownCommand("status".to_owned()))
+        );
+    }
+
+    // Catches silently accepting trailing tokens after a bare command,
+    // which would hide a mistyped invocation.
+    #[test]
+    fn rejects_trailing_arguments_after_help_and_version() {
+        assert_eq!(
+            parse(["help", "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+        assert_eq!(
+            parse(["--help", "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+        assert_eq!(
+            parse(["--version", "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+    }
+
     // Catches silently preferring one of two repeated options.
     #[test]
     fn rejects_duplicate_options() {
@@ -488,6 +543,20 @@ mod tests {
         );
     }
 
+    // Catches interpreting undecodable trailing bytes after a bare
+    // command as an accepted invocation.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_utf8_trailing_argument_after_help() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            parse_os([OsString::from("--help"), invalid.clone()]),
+            Err(CliError::NonUtf8Argument(invalid))
+        );
+    }
+
     // Catches keeping non-UTF-8 store paths from reaching QEMU.
     #[cfg(unix)]
     #[test]
@@ -506,7 +575,9 @@ mod tests {
             OsString::from("hello"),
         ])
         .unwrap();
-        let Command::Run(args) = parsed;
+        let Command::Run(args) = parsed else {
+            panic!("expected a Run command");
+        };
         assert_eq!(args.store.unwrap().as_os_str().as_bytes(), raw.as_bytes());
     }
 
