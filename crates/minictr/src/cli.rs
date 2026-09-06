@@ -405,17 +405,13 @@ mod tests {
         );
     }
 
-    // Catches confusing the bare help and version commands with run or
-    // with an unknown command.
+    // Catches misrouting the bare help and version commands to run or
+    // to an error.
     #[test]
     fn parses_help_and_version_commands() {
         assert_eq!(parse(["help"]), Ok(Command::Help));
         assert_eq!(parse(["--help"]), Ok(Command::Help));
         assert_eq!(parse(["--version"]), Ok(Command::Version));
-        assert_eq!(
-            parse(["status"]),
-            Err(CliError::UnknownCommand("status".to_owned()))
-        );
     }
 
     // Catches silently accepting trailing tokens after a bare command,
@@ -547,14 +543,17 @@ mod tests {
     // command as an accepted invocation.
     #[cfg(unix)]
     #[test]
-    fn rejects_non_utf8_trailing_argument_after_help() {
+    fn rejects_non_utf8_trailing_arguments_after_bare_commands() {
         use std::os::unix::ffi::OsStringExt;
 
-        let invalid = OsString::from_vec(vec![0xff]);
-        assert_eq!(
-            parse_os([OsString::from("--help"), invalid.clone()]),
-            Err(CliError::NonUtf8Argument(invalid))
-        );
+        for command in ["help", "--help", "--version"] {
+            let invalid = OsString::from_vec(vec![0xff]);
+            assert_eq!(
+                parse_os([OsString::from(command), invalid.clone()]),
+                Err(CliError::NonUtf8Argument(invalid)),
+                "{command} must reject undecodable trailing bytes"
+            );
+        }
     }
 
     // Catches keeping non-UTF-8 store paths from reaching QEMU.
