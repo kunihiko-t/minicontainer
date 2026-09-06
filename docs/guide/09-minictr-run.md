@@ -43,7 +43,8 @@ optionはIMAGEとELFの前後どこに置いてもよい。
 myapp sha256:<64桁の小文字16進数>
 ```
 
-ELF入力の上限は8 MiBであり、超える入力は本体を読む前に拒否する。
+8 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
+実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
 ELFの中身はhostでは検証せず、guestのloaderが検証する。
 tag名とゲスト引数の文法はbundle構築時に検証し、不正な入力はhost側の失敗として終わる。
 tag付けに失敗した後に未参照のdigestが残ることは許容する。

@@ -54,7 +54,9 @@ Guest ABIは`minios-abi-v0.1.1`に固定している。
 次に静的RISC-V 64 ELFを`image build`で`store`へ登録し、`myapp`タグを付ける。
 `$STORE`は絶対パスで指定した保存先であり、`Store::new`が作成する。
 `./app.elf`の部分は、利用者が用意した静的RISC-V 64 ELFのパスに置き換える。
-ELF入力の上限は8 MiBであり、ELFの中身はhostでは検証せずguestのloaderが検証する。
+8 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
+実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
+ELFの中身はhostでは検証せずguestのloaderが検証する。
 
 ```sh
 cargo run -p minictr --locked -- image build --store "$STORE" myapp ./app.elf
@@ -103,7 +105,8 @@ usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 `--arg`は繰り返し指定でき、順にmanifestのゲスト引数になる。
 成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
 `--store`の省略時解決は`run`と同じである。
-ELF入力の上限は8 MiBであり、超える入力は本体を読む前に拒否する。
+8 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
+実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
 
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。
