@@ -29,6 +29,10 @@ pub enum Command {
 pub enum ImageCommand {
     /// 静的ELFからMiniBundleを構築してstoreへ登録する。
     Build(ImageBuildArgs),
+    /// 登録済みtagを一覧する。
+    List(ImageListArgs),
+    /// 一つのtagのmanifestを確認する。
+    Inspect(ImageInspectArgs),
 }
 
 /// `image build`の型付き引数。
@@ -40,6 +44,22 @@ pub struct ImageBuildArgs {
     pub elf: PathBuf,
     /// manifestへ格納するguest引数。
     pub args: Vec<String>,
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
+}
+
+/// `image list`の型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageListArgs {
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
+}
+
+/// `image inspect`の型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInspectArgs {
+    /// store内で解決するimage tag。
+    pub image: String,
     /// `--store`の指定値。`None`なら環境とHOMEから解決する。
     pub store: Option<PathBuf>,
 }
@@ -83,6 +103,22 @@ pub struct ResolvedBuild {
     pub store: PathBuf,
 }
 
+/// `image list`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedList {
+    /// bundle storeのroot。
+    pub store: PathBuf,
+}
+
+/// `image inspect`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedInspect {
+    /// store内で解決するimage tag。
+    pub image: String,
+    /// bundle storeのroot。
+    pub store: PathBuf,
+}
+
 /// command parseまたは既定path解決が失敗した理由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -96,6 +132,8 @@ pub enum CliError {
     MissingBuildImage,
     /// `image build`にELF pathが与えられなかった。
     MissingElf,
+    /// `image inspect`にimageが与えられなかった。
+    MissingInspectImage,
     /// 余分なpositional引数。
     UnexpectedArgument(String),
     /// 対応していないoption。
@@ -126,6 +164,9 @@ impl fmt::Display for CliError {
                 formatter.write_str("missing image for `minictr image build`")
             }
             Self::MissingElf => formatter.write_str("missing ELF for `minictr image build`"),
+            Self::MissingInspectImage => {
+                formatter.write_str("missing image for `minictr image inspect`")
+            }
             Self::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected minictr argument: {argument}")
             }
@@ -154,7 +195,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF"
+    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
 }
 
 /// OS引数からcommandをparseする。
@@ -173,6 +214,8 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
                 .map_err(CliError::NonUtf8Argument)?;
             match subcommand.as_str() {
                 "build" => return parse_image_build(arguments),
+                "list" => return parse_image_list(arguments),
+                "inspect" => return parse_image_inspect(arguments),
                 unknown => return Err(CliError::UnknownCommand(unknown.to_owned())),
             }
         }
@@ -321,6 +364,88 @@ fn parse_image_build(arguments: impl IntoIterator<Item = OsString>) -> Result<Co
     })))
 }
 
+/// `image list`の引数をparseする。positionalは取らない。
+fn parse_image_list(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut store: Option<PathBuf> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        return Err(CliError::UnexpectedArgument(text));
+    }
+
+    Ok(Command::Image(ImageCommand::List(ImageListArgs { store })))
+}
+
+/// `image inspect`の引数をparseする。optionはIMAGEの前後どこに置いてもよい。
+fn parse_image_inspect(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut image: Option<String> = None;
+    let mut store: Option<PathBuf> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        if image.is_some() {
+            return Err(CliError::UnexpectedArgument(text));
+        }
+        image = Some(text);
+    }
+
+    let Some(image) = image else {
+        return Err(CliError::MissingInspectImage);
+    };
+    Ok(Command::Image(ImageCommand::Inspect(ImageInspectArgs {
+        image,
+        store,
+    })))
+}
+
 /// 引数を取らないcommandを確定する。後続のtokenは、optionの形でも
 /// 受け付けず、打ち間違いとして型付きerrorにする。
 fn parse_bare_command(
@@ -413,6 +538,36 @@ pub fn resolve_build(args: &ImageBuildArgs, env: &dyn Environ) -> Result<Resolve
         image: args.image.clone(),
         elf: args.elf.clone(),
         args: args.args.clone(),
+        store,
+    })
+}
+
+/// parse済み`image list`引数と環境からstore pathを解決する。
+pub fn resolve_list(args: &ImageListArgs, env: &dyn Environ) -> Result<ResolvedList, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedList { store })
+}
+
+/// parse済み`image inspect`引数と環境からstore pathを解決する。
+pub fn resolve_inspect(
+    args: &ImageInspectArgs,
+    env: &dyn Environ,
+) -> Result<ResolvedInspect, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedInspect {
+        image: args.image.clone(),
         store,
     })
 }
@@ -788,7 +943,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF"
+            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
         );
     }
 
@@ -933,8 +1088,8 @@ mod tests {
     fn rejects_missing_and_unknown_image_subcommands() {
         assert_eq!(parse(["image"]), Err(CliError::MissingCommand));
         assert_eq!(
-            parse(["image", "list"]),
-            Err(CliError::UnknownCommand("list".to_owned()))
+            parse(["image", "prune"]),
+            Err(CliError::UnknownCommand("prune".to_owned()))
         );
         assert_eq!(
             parse(["image", "build", "--volume", "data", "hello", "./hello.elf"]),
@@ -1044,5 +1199,169 @@ mod tests {
             home: None,
         };
         assert_eq!(resolve_build(&args, &env), Err(CliError::MissingHome));
+    }
+
+    // Catches drifting from the Task 19 acceptance syntax: `image list`
+    // takes no image and an optional store.
+    #[test]
+    fn parses_image_list_with_defaults() {
+        assert_eq!(
+            parse(["image", "list"]),
+            Ok(Command::Image(ImageCommand::List(ImageListArgs {
+                store: None
+            })))
+        );
+        assert_eq!(
+            parse(["image", "list", "--store", "/data/store"]),
+            Ok(Command::Image(ImageCommand::List(ImageListArgs {
+                store: Some(PathBuf::from("/data/store")),
+            })))
+        );
+        assert_eq!(
+            parse(["image", "list", "--store=/data/store"]),
+            Ok(Command::Image(ImageCommand::List(ImageListArgs {
+                store: Some(PathBuf::from("/data/store")),
+            })))
+        );
+    }
+
+    // Catches silently accepting positionals or repeated stores for `image list`.
+    #[test]
+    fn rejects_image_list_extras() {
+        assert_eq!(
+            parse(["image", "list", "hello"]),
+            Err(CliError::UnexpectedArgument("hello".to_owned()))
+        );
+        assert_eq!(
+            parse(["image", "list", "--store", "/a", "--store", "/b"]),
+            Err(CliError::DuplicateOption("--store"))
+        );
+        assert_eq!(
+            parse(["image", "list", "--volume", "data"]),
+            Err(CliError::UnknownOption("--volume".to_owned()))
+        );
+        assert_eq!(
+            parse(["image", "list", "--store"]),
+            Err(CliError::MissingValue("--store"))
+        );
+    }
+
+    // Catches drifting from the Task 19 acceptance syntax: `image inspect`
+    // takes an image tag with an optional store in any order.
+    #[test]
+    fn parses_image_inspect_with_defaults() {
+        assert_eq!(
+            parse(["image", "inspect", "hello"]),
+            Ok(Command::Image(ImageCommand::Inspect(ImageInspectArgs {
+                image: "hello".into(),
+                store: None,
+            })))
+        );
+        assert_eq!(
+            parse(["image", "inspect", "--store", "/data/store", "hello"]),
+            Ok(Command::Image(ImageCommand::Inspect(ImageInspectArgs {
+                image: "hello".into(),
+                store: Some(PathBuf::from("/data/store")),
+            })))
+        );
+        assert_eq!(
+            parse(["image", "inspect", "hello", "--store=/data/store"]),
+            Ok(Command::Image(ImageCommand::Inspect(ImageInspectArgs {
+                image: "hello".into(),
+                store: Some(PathBuf::from("/data/store")),
+            })))
+        );
+    }
+
+    // Catches running `image inspect` without an image tag or with extras.
+    #[test]
+    fn rejects_missing_image_and_extras_for_image_inspect() {
+        assert_eq!(
+            parse(["image", "inspect"]),
+            Err(CliError::MissingInspectImage)
+        );
+        assert_eq!(
+            parse(["image", "inspect", "hello", "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+        assert_eq!(
+            parse([
+                "image", "inspect", "--store", "/a", "--store", "/b", "hello"
+            ]),
+            Err(CliError::DuplicateOption("--store"))
+        );
+        assert_eq!(
+            parse(["image", "inspect", "--volume", "data", "hello"]),
+            Err(CliError::UnknownOption("--volume".to_owned()))
+        );
+        assert_eq!(
+            parse(["image", "inspect", "hello", "--store"]),
+            Err(CliError::MissingValue("--store"))
+        );
+    }
+
+    // Catches resolving the list and inspect stores from anything but the
+    // documented explicit option, environment, and HOME order.
+    #[test]
+    fn resolves_list_and_inspect_stores_from_the_documented_environment() {
+        let list = ImageListArgs { store: None };
+        assert_eq!(
+            resolve_list(&list, &home_env()).unwrap(),
+            ResolvedList {
+                store: PathBuf::from("/home/test/.minicontainer"),
+            }
+        );
+        let inspect = ImageInspectArgs {
+            image: "hello".into(),
+            store: None,
+        };
+        assert_eq!(
+            resolve_inspect(&inspect, &home_env()).unwrap(),
+            ResolvedInspect {
+                image: "hello".into(),
+                store: PathBuf::from("/home/test/.minicontainer"),
+            }
+        );
+
+        let env = FakeEnv {
+            store: Some(OsString::from("/env/store")),
+            kernel: None,
+            home: Some(OsString::from("/home/test")),
+        };
+        assert_eq!(
+            resolve_list(&list, &env).unwrap().store,
+            PathBuf::from("/env/store")
+        );
+        assert_eq!(
+            resolve_inspect(&inspect, &env).unwrap().store,
+            PathBuf::from("/env/store")
+        );
+
+        let explicit_list = ImageListArgs {
+            store: Some(PathBuf::from("/cli/store")),
+        };
+        assert_eq!(
+            resolve_list(&explicit_list, &env).unwrap().store,
+            PathBuf::from("/cli/store")
+        );
+        let explicit_inspect = ImageInspectArgs {
+            image: "hello".into(),
+            store: Some(PathBuf::from("/cli/store")),
+        };
+        assert_eq!(
+            resolve_inspect(&explicit_inspect, &env).unwrap(),
+            ResolvedInspect {
+                image: "hello".into(),
+                store: PathBuf::from("/cli/store"),
+            }
+        );
+
+        let env = FakeEnv {
+            store: None,
+            kernel: None,
+            home: None,
+        };
+        assert_eq!(resolve_list(&list, &env), Err(CliError::MissingHome));
+        assert_eq!(resolve_inspect(&inspect, &env), Err(CliError::MissingHome));
     }
 }

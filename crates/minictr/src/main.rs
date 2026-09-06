@@ -10,12 +10,14 @@ use std::{
     time::Duration,
 };
 
-use minicontainer_bundle::{ImageSpec, MAX_BUNDLE_LEN, Store, build, format_digest};
+use minicontainer_bundle::{
+    ImageSpec, MAX_BUNDLE_LEN, Store, TagRecord, build, format_digest, parse,
+};
 use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, SystemProcessBackend};
 
 use cli::{
-    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedRun, VERSION, help, parse_os,
-    resolve, resolve_build,
+    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedInspect, ResolvedList,
+    ResolvedRun, VERSION, help, parse_os, resolve, resolve_build, resolve_inspect, resolve_list,
 };
 
 /// usage errorのprocess終了code。
@@ -68,17 +70,41 @@ pub fn real_main(
             };
             run_resolved(&resolved, &RealRunner, &RealStore, stdout, stderr)
         }
-        Command::Image(ImageCommand::Build(args)) => {
-            let resolved = match resolve_build(&args, env) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    let _ = writeln!(stderr, "minictr: {error}");
-                    let _ = writeln!(stderr, "{help}", help = help());
-                    return USAGE_EXIT;
-                }
-            };
-            build_resolved(&resolved, &RealStore, stdout, stderr)
-        }
+        Command::Image(command) => match command {
+            ImageCommand::Build(args) => {
+                let resolved = match resolve_build(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                build_resolved(&resolved, &RealStore, stdout, stderr)
+            }
+            ImageCommand::List(args) => {
+                let resolved = match resolve_list(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                list_resolved(&resolved, &RealStore, stdout, stderr)
+            }
+            ImageCommand::Inspect(args) => {
+                let resolved = match resolve_inspect(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                inspect_resolved(&resolved, &RealStore, stdout, stderr)
+            }
+        },
     }
 }
 
@@ -90,6 +116,8 @@ pub trait ImageStore {
     fn import(&self, store_root: &Path, bytes: &[u8]) -> Result<[u8; 32], StoreError>;
     /// digestへimage tagを付ける。
     fn tag(&self, store_root: &Path, name: &str, digest: [u8; 32]) -> Result<(), StoreError>;
+    /// 登録済みtagをbyte順で返す。
+    fn list_tags(&self, store_root: &Path) -> Result<Vec<TagRecord>, StoreError>;
 }
 
 /// bundle store失敗の公開分類。
@@ -124,6 +152,11 @@ impl ImageStore for RealStore {
     fn tag(&self, store_root: &Path, name: &str, digest: [u8; 32]) -> Result<(), StoreError> {
         let store = Store::new(store_root).map_err(StoreError::Store)?;
         store.tag(name, digest).map_err(StoreError::Store)
+    }
+
+    fn list_tags(&self, store_root: &Path) -> Result<Vec<TagRecord>, StoreError> {
+        let store = Store::new(store_root).map_err(StoreError::Store)?;
+        store.list_tags().map_err(StoreError::Store)
     }
 }
 
@@ -245,6 +278,82 @@ pub fn build_resolved(
     }
     // `main` ends with `process::exit`, which skips destructors, so a piped
     // success line must be flushed explicitly before reporting success.
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// 解決済み`image list`を実行し、process終了codeを返す。
+pub fn list_resolved(
+    resolved: &ResolvedList,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let records = match store.list_tags(&resolved.store) {
+        Ok(records) => records,
+        Err(error) => {
+            let _ = writeln!(stderr, "{error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    if let Err(error) = writeln!(stdout, "TAG\tDIGEST") {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    for record in &records {
+        if let Err(error) = writeln!(
+            stdout,
+            "{name}\tsha256:{digest}",
+            name = record.name,
+            digest = format_digest(record.digest),
+        ) {
+            let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+            return RUNTIME_EXIT;
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// 解決済み`image inspect`を実行し、process終了codeを返す。
+pub fn inspect_resolved(
+    resolved: &ResolvedInspect,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let bytes = match store.resolve(&resolved.store, &resolved.image) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = writeln!(stderr, "{error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    let bundle = match parse(&bytes) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: invalid stored bundle: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    let output = format!(
+        "tag: {tag}\nname: {name}\ndigest: sha256:{digest}\nargs: {args}\nelf-bytes: {elf}\n",
+        tag = resolved.image,
+        name = bundle.manifest.name(),
+        digest = format_digest(bundle.header.digest),
+        args = bundle.manifest.args().count(),
+        elf = bundle.elf.len(),
+    );
+    if let Err(error) = stdout.write_all(output.as_bytes()) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
     if let Err(error) = stdout.flush() {
         let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
         return RUNTIME_EXIT;
@@ -430,6 +539,10 @@ mod tests {
         ) -> Result<(), StoreError> {
             panic!("run tests do not tag bundles");
         }
+
+        fn list_tags(&self, _store_root: &Path) -> Result<Vec<TagRecord>, StoreError> {
+            panic!("run tests do not list tags");
+        }
     }
 
     struct RecordingStore {
@@ -482,6 +595,10 @@ mod tests {
                 ));
             }
             Ok(())
+        }
+
+        fn list_tags(&self, _store_root: &Path) -> Result<Vec<TagRecord>, StoreError> {
+            panic!("image build tests do not list tags");
         }
     }
 
@@ -744,6 +861,10 @@ mod tests {
 
             fn tag(&self, _root: &Path, _name: &str, _digest: [u8; 32]) -> Result<(), StoreError> {
                 panic!("run tests do not tag bundles");
+            }
+
+            fn list_tags(&self, _root: &Path) -> Result<Vec<TagRecord>, StoreError> {
+                panic!("run tests do not list tags");
             }
         }
 
@@ -1053,6 +1174,198 @@ mod tests {
             )
             .into_bytes()
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches drifting list output from the stable header and byte-sorted `TAG\tDIGEST` rows.
+    #[test]
+    fn image_list_prints_header_and_byte_sorted_tags() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-list-store-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::new(&root).unwrap();
+        let first = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"first",
+        })
+        .unwrap();
+        let second = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"second",
+        })
+        .unwrap();
+        let first_digest = store.import(&first).unwrap();
+        let second_digest = store.import(&second).unwrap();
+        store.tag("b", first_digest).unwrap();
+        store.tag("a", second_digest).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("list"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            stdout,
+            format!(
+                "TAG\tDIGEST\na\tsha256:{}\nb\tsha256:{}\n",
+                minicontainer_bundle::format_digest(second_digest),
+                minicontainer_bundle::format_digest(first_digest),
+            )
+            .into_bytes()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches printing phantom rows or failing for an empty store instead of the header alone.
+    #[test]
+    fn image_list_prints_header_only_for_an_empty_store() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-list-empty-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("list"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout, b"TAG\tDIGEST\n");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches drifting inspect output from the stable five lines for tag, manifest, digest, args, and ELF bytes.
+    #[test]
+    fn image_inspect_prints_the_stable_five_lines() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-inspect-store-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::new(&root).unwrap();
+        let bytes = build(ImageSpec {
+            name: "inner",
+            args: &["first", "second"],
+            elf: b"ELF-bytes",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        store.tag("outer", digest).unwrap();
+        let header_digest = minicontainer_bundle::parse(&bytes).unwrap().header.digest;
+        assert_eq!(digest, header_digest);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("inspect"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("outer"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            stdout,
+            format!(
+                "tag: outer\nname: inner\ndigest: sha256:{}\nargs: 2\nelf-bytes: 9\n",
+                minicontainer_bundle::format_digest(header_digest),
+            )
+            .into_bytes()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches hiding a dangling tag from the listing or inspecting it without failing through resolve.
+    #[test]
+    fn dangling_tag_is_listed_but_inspect_fails() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("minictr-test-dangling-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::new(&root).unwrap();
+        let digest = [0x5a; 32];
+        store.tag("dangling", digest).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("list"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            stdout,
+            format!(
+                "TAG\tDIGEST\ndangling\tsha256:{}\n",
+                minicontainer_bundle::format_digest(digest),
+            )
+            .into_bytes()
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("inspect"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("dangling"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

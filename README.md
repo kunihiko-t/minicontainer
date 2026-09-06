@@ -91,11 +91,13 @@ exit=42
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`、`image build`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
+usage: minictr image list [--store PATH]
+usage: minictr image inspect [--store PATH] IMAGE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -108,10 +110,16 @@ usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 8 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
 実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
 
+`image list`は`TAG`と`DIGEST`のheaderに続き、タグ名のbyte順でタグと`sha256:<digest>`をTAB区切りで出す。
+空のstoreではheaderだけを出す。
+`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
+`digest`は解決したbundle headerの値であり、`args`は件数だけを表示する。
+どちらの`--store`省略時解決も`run`と同じである。
+
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。
 
-MiniBundleの構築と検証、SHA-256ダイジェスト、manifestの制限、content-addressed storeへの取り込み、タグ付け、解決ができる。
+MiniBundleの構築と検証、SHA-256ダイジェスト、manifestの制限、content-addressed storeへの取り込み、タグ付け、解決、一覧ができる。
 UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
 QEMUバックエンドは固定した引数で起動し、通常の成功経路とエラー経路で子プロセスの回収と一時領域の削除を試みる。
 後始末の失敗もエラーとして返す。ホストの停止や`SIGKILL`による強制終了では、後始末を実行できない場合がある。

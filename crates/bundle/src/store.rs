@@ -1,5 +1,5 @@
 use crate::{BundleError, StoreError, format_digest, manifest, parse};
-use minios_abi::boot::BUNDLE_MAX_LEN;
+use minios_abi::{boot::BUNDLE_MAX_LEN, manifest::ManifestError};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -10,6 +10,13 @@ use std::{
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 const TEMP_CREATE_ATTEMPTS: usize = 128;
 const TAG_DIGEST_LEN: usize = 64;
+
+/// A tag name with the digest its tag file names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRecord {
+    pub name: String,
+    pub digest: [u8; 32],
+}
 
 /// Local content-addressed storage for validated MiniBundles.
 pub struct Store {
@@ -76,6 +83,31 @@ impl Store {
             return Err(StoreError::DigestPathMismatch);
         }
         Ok(bytes)
+    }
+
+    /// Lists every tag by UTF-8 byte order without resolving its image.
+    pub fn list_tags(&self) -> Result<Vec<TagRecord>, StoreError> {
+        self.ensure_layout()?;
+        let tags = self.root.join("tags");
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&tags)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                return Err(StoreError::InvalidTag(ManifestError::InvalidUtf8));
+            };
+            validate_tag_name(name)?;
+            let encoded_digest =
+                read_store_file_up_to(&self.root, &tags.join(name), TAG_DIGEST_LEN)?
+                    .ok_or(StoreError::TagTooLarge)?;
+            let digest = decode_digest(&encoded_digest).ok_or(StoreError::InvalidTagDigest)?;
+            records.push(TagRecord {
+                name: name.to_owned(),
+                digest,
+            });
+        }
+        records.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        Ok(records)
     }
 
     fn image_path(&self, digest: [u8; 32]) -> PathBuf {
@@ -691,5 +723,135 @@ mod tests {
         let resolved = store.resolve("maximum").unwrap();
         assert_eq!(resolved.len(), 8 * 1024 * 1024);
         assert_eq!(&resolved[resolved.len() - 8..], &[0x5a; 8]);
+    }
+
+    // Production break caught: an empty store lists a phantom tag or fails instead of returning no records.
+    #[test]
+    fn lists_empty_store_as_empty() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+
+        assert_eq!(store.list_tags().unwrap(), Vec::new());
+    }
+
+    // Production break caught: tag listing is unordered or drops tags instead of sorting by UTF-8 byte order.
+    #[test]
+    fn lists_multiple_tags_in_byte_order() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let first = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"first",
+        })
+        .unwrap();
+        let second = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"second",
+        })
+        .unwrap();
+        let third = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"third",
+        })
+        .unwrap();
+        let first_digest = store.import(&first).unwrap();
+        let second_digest = store.import(&second).unwrap();
+        let third_digest = store.import(&third).unwrap();
+        store.tag("b", first_digest).unwrap();
+        store.tag("a-", second_digest).unwrap();
+        store.tag("a", third_digest).unwrap();
+
+        let listed = store.list_tags().unwrap();
+
+        assert_eq!(
+            listed,
+            vec![
+                crate::TagRecord {
+                    name: "a".to_owned(),
+                    digest: third_digest,
+                },
+                crate::TagRecord {
+                    name: "a-".to_owned(),
+                    digest: second_digest,
+                },
+                crate::TagRecord {
+                    name: "b".to_owned(),
+                    digest: first_digest,
+                },
+            ]
+        );
+    }
+
+    // Production break caught: a dangling tag disappears from the listing or resolves instead of failing.
+    #[test]
+    fn dangling_tag_is_listed_but_resolve_fails() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let digest = [0x5a; 32];
+        store.tag("dangling", digest).unwrap();
+
+        let listed = store.list_tags().unwrap();
+
+        assert_eq!(
+            listed,
+            vec![crate::TagRecord {
+                name: "dangling".to_owned(),
+                digest,
+            }]
+        );
+        assert!(store.resolve("dangling").is_err());
+    }
+
+    // Production break caught: listing silently skips a non-UTF-8 tag name instead of returning a typed error.
+    // macOS APFS requires UTF-8 file names, so this runs only where the file system can store them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn list_rejects_non_utf8_tag_name() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        fs::write(home.path().join("tags").join(raw), [b'a'; 64]).unwrap();
+
+        assert!(matches!(store.list_tags(), Err(StoreError::InvalidTag(_))));
+    }
+
+    // Production break caught: listing follows a symlinked tag instead of rejecting it as unsafe.
+    #[cfg(unix)]
+    #[test]
+    fn list_rejects_symlinked_tag() {
+        use std::os::unix::fs::symlink;
+
+        let home = TempHome::new();
+        let outside = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        fs::write(outside.path().join("tag"), [b'a'; 64]).unwrap();
+        symlink(outside.path().join("tag"), home.path().join("tags/link")).unwrap();
+
+        assert!(matches!(
+            store.list_tags(),
+            Err(StoreError::UnsafeStorePath)
+        ));
+    }
+
+    // Production break caught: listing silently skips a corrupt tag digest instead of returning a typed error.
+    #[test]
+    fn list_rejects_broken_tag_digest() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        fs::write(home.path().join("tags/corrupt"), [b'g'; 64]).unwrap();
+
+        assert!(matches!(
+            store.list_tags(),
+            Err(StoreError::InvalidTagDigest)
+        ));
+
+        fs::write(home.path().join("tags/corrupt"), [b'a'; 65]).unwrap();
+
+        assert!(matches!(store.list_tags(), Err(StoreError::TagTooLarge)));
     }
 }

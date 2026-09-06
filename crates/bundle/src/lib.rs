@@ -13,7 +13,7 @@ use minios_abi::{
 use sha2::{Digest, Sha256};
 
 pub use error::{BundleError, StoreError};
-pub use store::Store;
+pub use store::{Store, TagRecord};
 
 /// MiniBundle全体の公開上限。pin留めABIのboot windowと同一である。
 pub const MAX_BUNDLE_LEN: u64 = BUNDLE_MAX_LEN;
