@@ -10,7 +10,8 @@
 //! kernelをQEMU `-kernel` で起動し、`SessionError::Protocol` になることを
 //! 検査する (guestはcontrol headerを直接書けないため)。出力上限経路は1 MiB
 //! を超える連打guestをminiOS経由で走らせ、`SessionError::GuestOutputTooLarge`
-//! になることを検査する。
+//! になることを検査する。割り込み経路は回転中のguestへSIGINTをgroup宛に
+//! 送り、125終了とQEMU・一時領域の非残留を検査する。
 //!
 //! 実kernelのwire契約 (pin `9be99255a59d58d19db25b835af0e28a8d2a4036` の
 //! `run_boot_payload`、`console::enter_control_mode`、`user::run` から確認):
@@ -27,8 +28,8 @@ use std::{
     ffi::{OsStr, OsString},
     fmt, io,
     path::{Path, PathBuf},
-    process::Command,
     process::ExitStatus,
+    process::{Child, Command},
     thread,
     time::{Duration, Instant},
 };
@@ -58,6 +59,13 @@ const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(120);
 const HAPPY_PATH_TIMEOUT_MS: &str = "30000";
 const SPIN_TIMEOUT_MS: &str = "800";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// 割り込み経路でQEMU出現を待つ上限。`minictr`自体の30秒期限より短くし、
+/// signal前に自己timeoutで終わる空振りを防ぐ。
+const INTERRUPT_BOOT_TIMEOUT: Duration = Duration::from_secs(20);
+/// QEMU出現後にguestを回してからSIGINTを送るまでの待ち時間。
+const INTERRUPT_SETTLE: Duration = Duration::from_secs(2);
+/// SIGINT後の`minictr`終了を待つ上限。
+const INTERRUPT_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 実QEMU E2Eが失敗した理由。
 #[derive(Debug)]
@@ -258,6 +266,16 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         capped.qemu_before,
         capped.qemu_after,
         capped.elapsed.as_secs_f64()
+    ));
+
+    log("e2e: interrupt path (SIGINT to a running group exits 125 without leftovers)");
+    let interrupted = run_interrupt_path(&minictr, &kernel)?;
+    log(&format!(
+        "e2e: interrupt path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
+        interrupted.minictr_pid,
+        interrupted.qemu_before,
+        interrupted.qemu_after,
+        interrupted.elapsed.as_secs_f64()
     ));
 
     Ok(transcript)
@@ -519,37 +537,9 @@ fn run_case(
     let qemu_before = qemu_pids()?;
     let payload_before = payload_temp_leftovers();
     let started = Instant::now();
-    // `minictr`の成否にかかわらず、下の全検査を実行する。どれか一つでも
-    // `?`で即返すと、後続の残留物を見逃す。QEMU snapshotはkillせず観測だけ
-    // 行い、新規残留があれば失敗にする。報告は固定順 (QEMU残留、snapshot
-    // 失敗、payload残留、store残留、command結果) の最初の失敗に決める。
     let outcome = run_minictr(minictr, &store.path, kernel, timeout_ms, E2E_IMAGE);
     let elapsed = started.elapsed();
-    let mut failure: Option<E2EError> = None;
-    let mut check = |result: Result<(), E2EError>| {
-        if failure.is_none() {
-            failure = result.err();
-        }
-    };
-    let mut qemu_after = Vec::new();
-    match qemu_pids() {
-        Ok(pids) => {
-            check(check_no_new_qemu(&qemu_before, &pids));
-            qemu_after = pids;
-        }
-        Err(error) => check(Err(error)),
-    }
-    check(check_no_leftovers(&payload_before));
-    drop(store);
-    if store_path.exists() {
-        check(Err(E2EError::Store(format!(
-            "temporary store was not removed: {}",
-            store_path.display()
-        ))));
-    }
-    if let Some(error) = failure {
-        return Err(error);
-    }
+    let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
     let completed = outcome?;
     Ok(CaseReport {
         minictr_pid: completed.pid,
@@ -560,6 +550,45 @@ fn run_case(
         stdout: completed.stdout,
         stderr: completed.stderr,
     })
+}
+
+/// `minictr`の成否にかかわらず、QEMU、payload、一時storeの全検査を実行し、
+/// 終了後のsnapshotを返す。どれか一つでも`?`で即返すと、後続の残留物を
+/// 見逃す。QEMU snapshotはkillせず観測だけ行い、新規残留があれば失敗に
+/// する。報告は固定順 (QEMU残留、snapshot失敗、payload残留、store残留) の
+/// 最初の失敗に決める。
+fn check_case_leftovers(
+    qemu_before: &[u32],
+    payload_before: &[PathBuf],
+    store: TempStore,
+    store_path: &Path,
+) -> Result<Vec<u32>, E2EError> {
+    let mut failure: Option<E2EError> = None;
+    let mut check = |result: Result<(), E2EError>| {
+        if failure.is_none() {
+            failure = result.err();
+        }
+    };
+    let mut qemu_after = Vec::new();
+    match qemu_pids() {
+        Ok(pids) => {
+            check(check_no_new_qemu(qemu_before, &pids));
+            qemu_after = pids;
+        }
+        Err(error) => check(Err(error)),
+    }
+    check(check_no_leftovers(payload_before));
+    drop(store);
+    if store_path.exists() {
+        check(Err(E2EError::Store(format!(
+            "temporary store was not removed: {}",
+            store_path.display()
+        ))));
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(qemu_after)
 }
 
 fn run_happy_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
@@ -677,6 +706,147 @@ fn run_output_cap_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EE
     Ok(report)
 }
 
+/// `minictr`のQEMUが現れるまで待ち、起動中のrunへsignalできる状態を
+/// 確認する。待ち時間内に現れなければ起動したrunを残さずtimeout error、
+/// 途中で`minictr`が終われば空振りとしてerrorにする。
+fn wait_for_qemu_boot(
+    mut spawned: SpawnedChild,
+    qemu_before: &[u32],
+) -> Result<SpawnedChild, E2EError> {
+    let deadline = Instant::now() + INTERRUPT_BOOT_TIMEOUT;
+    loop {
+        match spawned.child.try_wait() {
+            Ok(Some(_)) => {
+                signal_process_group(spawned.pid, libc::SIGKILL);
+                let _ = spawned.child.kill();
+                let _ = spawned.child.wait();
+                join_reader(spawned.stdout_reader, &spawned.command_line).ok();
+                join_reader(spawned.stderr_reader, &spawned.command_line).ok();
+                return Err(E2EError::UnexpectedRun {
+                    case: "interrupt pre-signal liveness",
+                    expected: "a running minictr".to_owned(),
+                    actual: "minictr exited before the interrupt".to_owned(),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                signal_process_group(spawned.pid, libc::SIGKILL);
+                let _ = spawned.child.kill();
+                let _ = spawned.child.wait();
+                return Err(E2EError::Command {
+                    command: spawned.command_line,
+                    message: error.to_string(),
+                });
+            }
+        }
+        let booted = qemu_pids()?.iter().any(|pid| !qemu_before.contains(pid));
+        if booted {
+            return Ok(spawned);
+        }
+        if Instant::now() >= deadline {
+            signal_process_group(spawned.pid, libc::SIGKILL);
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            join_reader(spawned.stdout_reader, &spawned.command_line).ok();
+            join_reader(spawned.stderr_reader, &spawned.command_line).ok();
+            return Err(E2EError::TimedOut {
+                command: format!("{} (waiting for QEMU boot)", spawned.command_line),
+            });
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// SIGINT直前に`minictr`がまだ走っていることを確認する。終わっていれば
+/// groupを掃除して空振りとしてerrorにする。
+fn assert_minictr_running(mut spawned: SpawnedChild) -> Result<SpawnedChild, E2EError> {
+    match spawned.child.try_wait() {
+        Ok(None) => Ok(spawned),
+        Ok(Some(_)) => {
+            signal_process_group(spawned.pid, libc::SIGKILL);
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            Err(E2EError::UnexpectedRun {
+                case: "interrupt pre-signal liveness",
+                expected: "a running minictr".to_owned(),
+                actual: "minictr exited before the interrupt".to_owned(),
+            })
+        }
+        Err(error) => {
+            signal_process_group(spawned.pid, libc::SIGKILL);
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            Err(E2EError::Command {
+                command: spawned.command_line,
+                message: error.to_string(),
+            })
+        }
+    }
+}
+
+fn run_interrupt_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
+    let store = prepare_store(&spin_elf_bytes())?;
+    let store_path = store.path.clone();
+    let qemu_before = qemu_pids()?;
+    let payload_before = payload_temp_leftovers();
+    let started = Instant::now();
+    let spawned = spawn_minictr(
+        minictr,
+        &store.path,
+        kernel,
+        HAPPY_PATH_TIMEOUT_MS,
+        E2E_IMAGE,
+    )?;
+    let spawned = wait_for_qemu_boot(spawned, &qemu_before)?;
+    thread::sleep(INTERRUPT_SETTLE);
+    let spawned = assert_minictr_running(spawned)?;
+    signal_process_group(spawned.pid, libc::SIGINT);
+    let completed = wait_for_exit(spawned, INTERRUPT_EXIT_TIMEOUT)?;
+    let elapsed = started.elapsed();
+    let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
+    let report = CaseReport {
+        minictr_pid: completed.pid,
+        qemu_before,
+        qemu_after,
+        elapsed,
+        status: completed.status.code(),
+        stdout: completed.stdout,
+        stderr: completed.stderr,
+    };
+    if report.status != Some(125) {
+        return Err(E2EError::UnexpectedRun {
+            case: "interrupt exit code",
+            expected: "exit 125".to_owned(),
+            actual: format!(
+                "status {:?} after SIGINT (stderr: {})",
+                report.status,
+                String::from_utf8_lossy(&report.stderr)
+            ),
+        });
+    }
+    if !String::from_utf8_lossy(&report.stderr).contains("without a guest Exit frame") {
+        return Err(E2EError::UnexpectedRun {
+            case: "interrupt diagnostic",
+            expected: "a MissingExit diagnostic on stderr".to_owned(),
+            actual: format!("stderr: {}", String::from_utf8_lossy(&report.stderr)),
+        });
+    }
+    Ok(report)
+}
+
+fn minictr_run_args(store: &Path, kernel: &Path, timeout_ms: &str, image: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("run"),
+        OsString::from("--store"),
+        store.as_os_str().to_owned(),
+        OsString::from("--kernel"),
+        kernel.as_os_str().to_owned(),
+        OsString::from("--timeout-ms"),
+        OsString::from(timeout_ms),
+        OsString::from(image),
+    ]
+}
+
 fn run_minictr(
     minictr: &Path,
     store: &Path,
@@ -686,20 +856,75 @@ fn run_minictr(
 ) -> Result<CompletedProcess, E2EError> {
     run_with_timeout(
         minictr,
-        &[
-            OsString::from("run"),
-            OsString::from("--store"),
-            store.as_os_str().to_owned(),
-            OsString::from("--kernel"),
-            kernel.as_os_str().to_owned(),
-            OsString::from("--timeout-ms"),
-            OsString::from(timeout_ms),
-            OsString::from(image),
-        ],
+        &minictr_run_args(store, kernel, timeout_ms, image),
         None,
         &[],
         QEMU_RUN_TIMEOUT,
     )
+}
+
+/// `minictr run`を自groupのleaderとして起動し、待たずに返す。signalを
+/// 送ってから終了を観測する経路が使う。
+fn spawn_minictr(
+    minictr: &Path,
+    store: &Path,
+    kernel: &Path,
+    timeout_ms: &str,
+    image: &str,
+) -> Result<SpawnedChild, E2EError> {
+    spawn_in_own_group(
+        minictr,
+        &minictr_run_args(store, kernel, timeout_ms, image),
+        None,
+        &[],
+    )
+}
+
+/// 起動済みの子を期限まで待つ。期限切れではgroupへSIGKILLを送って回収し、
+/// 残骸を残さずにtimeout errorを返す。
+fn wait_for_exit(
+    mut spawned: SpawnedChild,
+    timeout: Duration,
+) -> Result<CompletedProcess, E2EError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match spawned.child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = join_reader(spawned.stdout_reader, &spawned.command_line)?;
+                let stderr = join_reader(spawned.stderr_reader, &spawned.command_line)?;
+                return Ok(CompletedProcess {
+                    pid: spawned.pid,
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    signal_process_group(spawned.pid, libc::SIGKILL);
+                    let _ = spawned.child.kill();
+                    let _ = spawned.child.wait();
+                    join_reader(spawned.stdout_reader, &spawned.command_line).ok();
+                    join_reader(spawned.stderr_reader, &spawned.command_line).ok();
+                    return Err(E2EError::TimedOut {
+                        command: spawned.command_line,
+                    });
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(error) => {
+                signal_process_group(spawned.pid, libc::SIGKILL);
+                let _ = spawned.child.kill();
+                let _ = spawned.child.wait();
+                join_reader(spawned.stdout_reader, &spawned.command_line).ok();
+                join_reader(spawned.stderr_reader, &spawned.command_line).ok();
+                return Err(E2EError::Command {
+                    command: spawned.command_line,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// 終了した外部commandの出力。
@@ -718,13 +943,23 @@ struct CompletedProcess {
 /// してdeadlockする。子は自前のUnix process groupのleaderとして起動するた
 /// め、timeout時とwait error時はgroup全体へsignalしてから直接の子をkill・
 /// wait・joinする。`minictr`が残したQEMUのような孫processもorphan化しない。
-fn run_with_timeout(
+/// 自groupのleaderとして起動した子と、その出力をdrainするreader。
+struct SpawnedChild {
+    child: Child,
+    pid: u32,
+    stdout_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stderr_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    command_line: String,
+}
+
+/// commandを自前のprocess groupのleaderとして起動し、両pipeのdrainを
+/// 始める。group宛のsignalはharnessへ届かず、子の子孫まで届く。
+fn spawn_in_own_group(
     program: impl AsRef<OsStr>,
     args: &[OsString],
     current_dir: Option<&Path>,
     extra_env: &[(&str, &str)],
-    timeout: Duration,
-) -> Result<CompletedProcess, E2EError> {
+) -> Result<SpawnedChild, E2EError> {
     use std::process::Stdio;
 
     let command_line = command_line(&program, args);
@@ -760,6 +995,29 @@ fn run_with_timeout(
         .expect("piped stderr must be available after spawn");
     let stdout_reader = thread::spawn(move || read_all(stdout_pipe));
     let stderr_reader = thread::spawn(move || read_all(stderr_pipe));
+    Ok(SpawnedChild {
+        child,
+        pid,
+        stdout_reader,
+        stderr_reader,
+        command_line,
+    })
+}
+
+fn run_with_timeout(
+    program: impl AsRef<OsStr>,
+    args: &[OsString],
+    current_dir: Option<&Path>,
+    extra_env: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<CompletedProcess, E2EError> {
+    let SpawnedChild {
+        mut child,
+        pid,
+        stdout_reader,
+        stderr_reader,
+        command_line,
+    } = spawn_in_own_group(program, args, current_dir, extra_env)?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -775,7 +1033,7 @@ fn run_with_timeout(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    kill_process_group(pid);
+                    signal_process_group(pid, libc::SIGKILL);
                     let _ = child.kill();
                     let _ = child.wait();
                     join_reader(stdout_reader, &command_line).ok();
@@ -787,7 +1045,7 @@ fn run_with_timeout(
                 thread::sleep(POLL_INTERVAL);
             }
             Err(error) => {
-                kill_process_group(pid);
+                signal_process_group(pid, libc::SIGKILL);
                 let _ = child.kill();
                 let _ = child.wait();
                 join_reader(stdout_reader, &command_line).ok();
@@ -801,19 +1059,19 @@ fn run_with_timeout(
     }
 }
 
-/// harnessの子のprocess group全体へSIGKILLを送る。子は `process_group(0)`
+/// harnessの子のprocess group全体へsignalを送る。子は `process_group(0)`
 /// で自groupのleaderとして起動するため、PIDはPGIDと等しく、子孫 (timeout
 /// した`minictr`が残したQEMUなど) まで届く。既死groupのerrorは無視する。
-/// 呼び出し側は必ず直接のkillとwaitも行う。
+/// SIGKILLで止める呼び出し側は、必ず直接のkillとwaitも行う。
 ///
 /// 外部の`kill` binaryは使わない。procpsの`kill`は`-pgid`形式をexit 0の
 /// まま黙って無視し、孫processを生かしたまま残す。`kill(2)`を直接呼ぶ。
-fn kill_process_group(pid: u32) {
+fn signal_process_group(pid: u32, signal: libc::c_int) {
     let target = -(pid as libc::pid_t);
     // SAFETY: `kill(2)`の第一引数が負のときはprocess groupを指定する。
     // `pid`はspawn直後の子のPIDで`pid_t`に収まる。戻り値は既死groupの
     // errorを含めて無視する。
-    let _ = unsafe { libc::kill(target, libc::SIGKILL) };
+    let _ = unsafe { libc::kill(target, signal) };
 }
 
 fn read_all(mut stream: impl io::Read + Send + 'static) -> io::Result<Vec<u8>> {
@@ -1490,6 +1748,26 @@ mod tests {
                 >= 262_144,
             "all flooded stderr must be captured, got {} bytes",
             completed.stderr.len()
+        );
+    }
+
+    // Catches a broken interrupt harness: SIGINT to the spawned group
+    // must stop the sleeper without touching the test runner itself.
+    // The runner surviving this test proves the group isolation.
+    #[test]
+    fn spawned_group_receives_sigint_without_touching_the_runner() {
+        let program = std::env::current_exe().expect("the test binary path must exist");
+        let spawned = spawn_in_own_group(&program, &helper_args(), None, &[(HELPER_ENV, "sleep")])
+            .expect("the sleep helper must spawn");
+        std::thread::sleep(Duration::from_millis(500));
+        signal_process_group(spawned.pid, libc::SIGINT);
+        let completed =
+            wait_for_exit(spawned, Duration::from_secs(10)).expect("SIGINT must stop the sleeper");
+
+        assert_ne!(
+            completed.status.code(),
+            Some(0),
+            "a SIGINT death must not look like success"
         );
     }
 

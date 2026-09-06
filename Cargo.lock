@@ -96,6 +96,7 @@ dependencies = [
 name = "minictr"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "minicontainer-bundle",
  "minicontainer-runtime",
 ]

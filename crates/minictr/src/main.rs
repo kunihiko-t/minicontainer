@@ -26,6 +26,12 @@ pub const USAGE_EXIT: i32 = 2;
 pub const RUNTIME_EXIT: i32 = 125;
 
 fn main() {
+    // Ctrl-CはQEMUだけが受けて終了し、後始末はこのprocessが行う。起動直後に
+    // SIGINTを無視設定へ固定する（後始末前の被弾でpayload残留を残さない）。
+    // SAFETY: process起動直後のmain threadで一度だけ呼び、handlerは設けない。
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+    }
     let code = real_main(
         std::env::args_os().skip(1),
         &RealEnv,
