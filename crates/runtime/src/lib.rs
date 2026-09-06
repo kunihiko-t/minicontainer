@@ -200,6 +200,13 @@ mod tests {
                     ProcessEvent::Exited(successful_process()),
                 ],
             ),
+            (
+                "output cap",
+                vec![
+                    ProcessEvent::Uart(output_flood_stream()),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            ),
             ("timeout", vec![]),
             (
                 "early qemu exit",
@@ -544,6 +551,15 @@ mod tests {
         let mut malformed = frame(FrameKind::Stdout, b"ignored");
         malformed[0] = b'X';
         stream.extend_from_slice(&malformed);
+        stream
+    }
+
+    fn output_flood_stream() -> Vec<u8> {
+        let mut stream = ready_frame();
+        let chunk = vec![b'o'; 32 * 1024];
+        for _ in 0..33 {
+            stream.extend_from_slice(&frame(FrameKind::Stdout, &chunk));
+        }
         stream
     }
 

@@ -4,11 +4,13 @@
 //! MiniBundleを一時storeへimportして`hello` tagを作り、`minictr run`の標準出力、
 //! 標準エラー出力、終了code、QEMU回収、一時directory cleanupを確認する。
 //!
-//! timeoutとmalformed-frameの経路では、非0終了と一時領域の非残留に加え、
-//! happy-pathの成功内容が混入していないことも検査する。malformed-frame経路
+//! timeout、malformed-frame、出力上限の経路では、非0終了と一時領域の非残留
+//! に加え、失敗時にguest出力を転送しないことも検査する。malformed-frame経路
 //! はminiOSを経由せず、不正control headerをUARTへ直接書く最小supervisor
 //! kernelをQEMU `-kernel` で起動し、`SessionError::Protocol` になることを
-//! 検査する (guestはcontrol headerを直接書けないため)。
+//! 検査する (guestはcontrol headerを直接書けないため)。出力上限経路は1 MiB
+//! を超える連打guestをminiOS経由で走らせ、`SessionError::GuestOutputTooLarge`
+//! になることを検査する。
 //!
 //! 実kernelのwire契約 (pin `9be99255a59d58d19db25b835af0e28a8d2a4036` の
 //! `run_boot_payload`、`console::enter_control_mode`、`user::run` から確認):
@@ -246,6 +248,16 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         malformed.qemu_before,
         malformed.qemu_after,
         malformed.elapsed.as_secs_f64()
+    ));
+
+    log("e2e: output-cap path (a chatty guest exceeds 1 MiB, exits 125 without leftovers)");
+    let capped = run_output_cap_path(&minictr, &kernel)?;
+    log(&format!(
+        "e2e: output-cap path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
+        capped.minictr_pid,
+        capped.qemu_before,
+        capped.qemu_after,
+        capped.elapsed.as_secs_f64()
     ));
 
     Ok(transcript)
@@ -632,6 +644,33 @@ fn run_malformed_frame_path(minictr: &Path) -> Result<CaseReport, E2EError> {
         return Err(E2EError::UnexpectedRun {
             case: "malformed-frame diagnostic",
             expected: "an invalid-UART-frame protocol failure".to_owned(),
+            actual: String::from_utf8_lossy(&report.stderr).into_owned(),
+        });
+    }
+    Ok(report)
+}
+
+fn run_output_cap_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
+    let report = run_case(minictr, &chatty_elf_bytes(), kernel, HAPPY_PATH_TIMEOUT_MS)?;
+
+    if report.status != Some(125) {
+        return Err(E2EError::UnexpectedRun {
+            case: "output-cap exit code",
+            expected: "exit 125".to_owned(),
+            actual: format!("status {:?}", report.status),
+        });
+    }
+    if !report.stdout.is_empty() {
+        return Err(E2EError::UnexpectedRun {
+            case: "output-cap stdout",
+            expected: "no forwarded guest output on host failure".to_owned(),
+            actual: format!("{} forwarded bytes", report.stdout.len()),
+        });
+    }
+    if !String::from_utf8_lossy(&report.stderr).contains("guest output exceeds 1 MiB") {
+        return Err(E2EError::UnexpectedRun {
+            case: "output-cap diagnostic",
+            expected: "an output-cap host failure".to_owned(),
             actual: String::from_utf8_lossy(&report.stderr).into_owned(),
         });
     }
@@ -1050,6 +1089,25 @@ fn spin_elf_bytes() -> Vec<u8> {
     build_elf(&[LOOP])
 }
 
+/// 1 MiBを大きく超える出力を連打してから、killされるまで回り続けるguest。
+///
+/// 1024 byteの`write`を1400回 (約1.37 MiB) 展開し、hostの出力合計上限に
+/// 当ててからspinする。上限が効かなければhost timeoutで終わるため、E2Eの
+/// 診断照合が上限の有無を判定する。分岐encodingを持ち込まず、展開した
+/// `write`と末尾のspinだけで組む。
+fn chatty_elf_bytes() -> Vec<u8> {
+    const CHATTY_WRITES: usize = 1400;
+    const CHATTY_LEN: usize = 1024;
+    let mut code: Vec<u32> = Vec::new();
+    code.push(addi(REG_S0, REG_SP, -(CHATTY_LEN as i16)));
+    emit_string(&mut code, &[b'O'; CHATTY_LEN], 0);
+    for _ in 0..CHATTY_WRITES {
+        emit_write(&mut code, 1, CHATTY_LEN);
+    }
+    code.push(LOOP);
+    build_elf(&code)
+}
+
 /// 不正control headerをUARTへ直接書く最小supervisor kernel。
 ///
 /// miniOSを経由せずQEMU `-kernel` で起動する。virt UART MMIOへ`MCF1`と
@@ -1202,6 +1260,28 @@ mod tests {
         }
         let exit_42 = addi(REG_A0, REG_X0, 42).to_le_bytes();
         assert!(code.windows(4).any(|word| word == exit_42));
+    }
+
+    // Catches an output-cap fixture that emits less than the host
+    // accepts: the guest must spell 1400 unrolled 1024-byte writes and
+    // then spin, so only a missing host cap can let it survive.
+    #[test]
+    fn chatty_elf_spells_a_burst_over_1_mib_then_spins() {
+        let bytes = chatty_elf_bytes();
+        let code = &bytes[ELF_OFFSET as usize..];
+
+        let ecalls = code
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|word| **word == ECALL.to_le_bytes())
+            .count();
+        assert_eq!(ecalls, 1400, "unrolled write burst");
+        let materialized = addi(REG_T0, REG_X0, i16::from(b'O')).to_le_bytes();
+        assert!(code.windows(4).any(|word| word == materialized));
+        assert_eq!(&code[code.len() - 4..], LOOP.to_le_bytes());
+        let (kind, machine, _, entry, phnum) = elf_header(&bytes);
+        assert_eq!((kind, machine, entry, phnum), (2, 243, ELF_ENTRY, 1));
     }
 
     // Catches a timeout fixture that could exit on its own, which would turn

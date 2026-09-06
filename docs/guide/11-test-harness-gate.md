@@ -56,7 +56,7 @@ Pull Requestの統合条件は[コントリビュート](../../CONTRIBUTING.md)�
 ## E2Eは最終段階である
 
 第15段階は、pin留めしたminiOS revisionからguest kernelをbuildし、`minictr run hello`の標準出力、標準エラー出力、終了code 42を確認する。
-timeout経路とmalformed-frame経路では、非0終了に加えてQEMUと一時領域の残留がなく、happy-pathの内容が混入しないことを確認する。
+timeout経路、malformed-frame経路、出力上限経路では、非0終了に加えてQEMUと一時領域の残留がなく、失敗時にguest出力を転送しないことを確認する。
 プロセス残存検査には`ps`が必要であり、実行制限のあるサンドボックスでは権限エラーになることがある。
 通常は`target/e2e/minios`へ固定リビジョンを取得するため、初回はネットワーク接続も必要になる。
 既存の取得済みソースを使う場合は、`MINICTR_E2E_MINIOS_DIR`に固定リビジョンと一致する、未変更のチェックアウトを指定する。

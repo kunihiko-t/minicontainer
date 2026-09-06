@@ -37,6 +37,7 @@ backendが期限過ぎの出力を返し続けても、全体の期限でrunはt
 - bundle不正: QEMU起動前の拒否。
 - QEMU起動失敗: spawn error。
 - timeout: 全体の期限切れ。
+- 出力上限超過: stdout、stderr、diagnosticsの合計が1 MiBを超えた場合のhost拒否。
 - guest failure: `GuestError` frame。
 - protocol破損: 不正header、truncated frame、payload上限超過。
 - applicationの非0終了: guestの終了codeをそのまま返す。

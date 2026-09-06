@@ -12,6 +12,14 @@ use crate::ProcessStatus;
 
 const BOOT_PREAMBLE_LIMIT: usize = 64 * 1024;
 
+/// stdout、stderr、diagnosticsの合計蓄積量の上限。
+///
+/// 三つのbufferはguest frameから伸びるため、合計を抑えないと多弁なguestが
+/// timeoutまでの間にhost memoryを食い尽くす。hello guestの出力は数十byte
+/// であり、1 MiBは学習用途に十分な余裕と上限の両立になる。firmware由来の
+/// boot textは別上限 (`BOOT_PREAMBLE_LIMIT`) で抑える。
+const GUEST_OUTPUT_MAX_LEN: usize = 1024 * 1024;
+
 /// UART sessionで観測したguest control event。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
@@ -49,6 +57,8 @@ pub enum SessionError {
     InvalidExitPayload,
     /// guest自身が実行失敗を報告した。
     GuestError(Vec<u8>),
+    /// stdout、stderr、diagnosticsの合計蓄積量が上限を超えた。
+    GuestOutputTooLarge,
     /// guest Exit後にQEMUが失敗して終了した。
     ProcessFailed(ProcessStatus),
 }
@@ -75,6 +85,9 @@ impl fmt::Display for SessionError {
                 "guest reported an error: {}",
                 String::from_utf8_lossy(bytes)
             ),
+            Self::GuestOutputTooLarge => {
+                write!(formatter, "guest output exceeds 1 MiB")
+            }
             Self::ProcessFailed(status) => write!(
                 formatter,
                 "QEMU exited unsuccessfully (code: {:?})",
@@ -96,6 +109,7 @@ impl Error for SessionError {
             | Self::UnsupportedReadyAbi(_)
             | Self::InvalidExitPayload
             | Self::GuestError(_)
+            | Self::GuestOutputTooLarge
             | Self::ProcessFailed(_) => None,
         }
     }
@@ -223,6 +237,22 @@ impl Session {
         self.decoder.push(&bytes)
     }
 
+    /// 三つのguest出力bufferへ`extra` byteを足しても上限内に収まるか検査する。
+    ///
+    /// 飽和加算で合計するため、巨大なpayload長でもoverflow panicにならない。
+    fn check_output_room(&self, extra: usize) -> Result<(), SessionError> {
+        let total = self
+            .stdout
+            .len()
+            .saturating_add(self.stderr.len())
+            .saturating_add(self.diagnostics.len())
+            .saturating_add(extra);
+        if total > GUEST_OUTPUT_MAX_LEN {
+            return Err(SessionError::GuestOutputTooLarge);
+        }
+        Ok(())
+    }
+
     fn append_boot_diagnostic(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
         if self
             .boot_diagnostic
@@ -261,6 +291,7 @@ impl Session {
     ) -> Result<(), SessionError> {
         match frame.kind {
             FrameKind::Diagnostic => {
+                self.check_output_room(frame.payload.len())?;
                 self.diagnostics.extend_from_slice(&frame.payload);
                 events.push(SessionEvent::Diagnostic(frame.payload));
                 Ok(())
@@ -300,16 +331,19 @@ impl Session {
         match frame.kind {
             FrameKind::Ready => Err(SessionError::DuplicateReady),
             FrameKind::Stdout => {
+                self.check_output_room(frame.payload.len())?;
                 self.stdout.extend_from_slice(&frame.payload);
                 events.push(SessionEvent::Stdout(frame.payload));
                 Ok(())
             }
             FrameKind::Stderr => {
+                self.check_output_room(frame.payload.len())?;
                 self.stderr.extend_from_slice(&frame.payload);
                 events.push(SessionEvent::Stderr(frame.payload));
                 Ok(())
             }
             FrameKind::Diagnostic => {
+                self.check_output_room(frame.payload.len())?;
                 self.diagnostics.extend_from_slice(&frame.payload);
                 events.push(SessionEvent::Diagnostic(frame.payload));
                 Ok(())
@@ -376,6 +410,76 @@ mod tests {
         assert_eq!(
             session.push_uart(&boot_text),
             Err(SessionError::BootPreambleTooLarge)
+        );
+    }
+
+    // Catches growing host memory without a bound: exactly 1 MiB of
+    // accumulated guest output is kept, one byte more is refused.
+    #[test]
+    fn guest_output_over_1_mib_is_rejected_at_the_total_boundary() {
+        let mut session = ready_session();
+        let chunk = vec![b'o'; 32 * 1024];
+        let mut flood = Vec::new();
+        for _ in 0..32 {
+            flood.extend_from_slice(&frame(FrameKind::Stdout, &chunk));
+        }
+
+        assert!(session.push_uart(&flood).is_ok());
+        assert_eq!(
+            session.push_uart(&frame(FrameKind::Stdout, b"o")),
+            Err(SessionError::GuestOutputTooLarge)
+        );
+    }
+
+    // Catches capping each stream separately, which lets a guest triple
+    // host memory by spreading output across stdout, stderr, and
+    // diagnostics.
+    #[test]
+    fn output_cap_counts_all_three_buffers_together() {
+        let mut session = ready_session();
+        let chunk = vec![b'o'; 32 * 1024];
+        for kind in [FrameKind::Stdout, FrameKind::Stderr] {
+            let mut half = Vec::new();
+            for _ in 0..16 {
+                half.extend_from_slice(&frame(kind, &chunk));
+            }
+            assert!(session.push_uart(&half).is_ok());
+        }
+
+        assert_eq!(
+            session.push_uart(&frame(FrameKind::Diagnostic, b"o")),
+            Err(SessionError::GuestOutputTooLarge)
+        );
+    }
+
+    // Catches flooding diagnostics after Exit, which arrives after the
+    // guest result is final but still grows host memory until QEMU exits.
+    #[test]
+    fn diagnostic_flood_after_exit_is_rejected() {
+        let mut session = ready_session();
+        let chunk = vec![b'o'; 32 * 1024];
+        let mut flood = Vec::new();
+        for _ in 0..32 {
+            flood.extend_from_slice(&frame(FrameKind::Stdout, &chunk));
+        }
+        assert!(session.push_uart(&flood).is_ok());
+        session
+            .push_uart(&frame(FrameKind::Exit, &42_u32.to_le_bytes()))
+            .unwrap();
+
+        assert_eq!(
+            session.push_uart(&frame(FrameKind::Diagnostic, b"o")),
+            Err(SessionError::GuestOutputTooLarge)
+        );
+    }
+
+    // Catches drifting the triage diagnostic that operators and the
+    // end-to-end gate match for the output-cap failure.
+    #[test]
+    fn output_cap_failure_reports_a_stable_diagnostic() {
+        assert_eq!(
+            SessionError::GuestOutputTooLarge.to_string(),
+            "guest output exceeds 1 MiB"
         );
     }
 

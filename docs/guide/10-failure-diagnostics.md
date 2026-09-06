@@ -9,7 +9,7 @@ runの失敗は、出所で三つに分ける。
 アプリケーションの非0終了は、ランタイムの失敗とは区別してゲストの結果として返す。
 その値をアプリケーションの成功とみなすかは、呼び出し側が判断する。
 
-- host error: bundle不正、期限の表現不能、payload pathの拒否、QEMU起動失敗、入出力error、cleanup失敗、QEMUの非0終了。
+- host error: bundle不正、期限の表現不能、payload pathの拒否、QEMU起動失敗、入出力error、cleanup失敗、QEMUの非0終了、出力合計の上限超過。
 - guest failure: `GuestError` frame。実行中の異常に加え、Exit後のresource回収失敗もここに入る。
 - protocol破損: 不正header、truncated frame、順序違反、Exit欠落、ABI不一致、Exit payload違反、64 KiB超過（frame payloadとboot text）。
 
@@ -32,6 +32,7 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写る。
 - `invalid UART control frame`を含む行はprotocol破損である。
 - `guest reported an error`を含む行はguest自身の実行失敗である。
 - `runtime session failed: QEMU exited unsuccessfully`を含む行はExit後のQEMU非0終了である。
+- `guest output exceeds 1 MiB`を含む行は出力合計の上限超過である。
 - `; cleanup also failed`を含む行は、主操作に加えて後始末も失敗したことを示す。
 
 guest stderrのbytes自体にも`minictr:`は付かない。
@@ -50,6 +51,17 @@ event loopの先頭で毎回時計を見て、期限を過ぎたらtimeoutで終
 CLI利用者が通常のタイムアウト時に別途停止コマンドを実行する必要はない。
 この期限はOSの入出力や終了後の後始末までを厳密に打ち切る時間制限ではない。
 timeout経路の検証では、125終了に加えてQEMUと一時領域の残留がないことを確認する。
+
+## 出力合計の上限
+
+stdout、stderr、diagnosticsの合計蓄積量は1 MiBが上限である。
+frame単位の64 KiB制限とは別に、合計が上限を超えたframeを受け取った時点でrunを失敗させる。
+Exit後の`Diagnostic`も合計に数えるため、終了確定後の連打でhost memoryが伸びることはない。
+firmware由来のboot textは64 KiBの別上限で抑える。
+
+上限超過はhost errorであり、終了code 125に写る。
+ランタイムの失敗時には`RunOutcome`が返らないため、途中まで蓄積した出力は転送しない。
+出力上限経路の検証では、125終了と診断の一致に加えてQEMUと一時領域の残留がないことを確認する。
 
 ## 診断logの扱い
 
