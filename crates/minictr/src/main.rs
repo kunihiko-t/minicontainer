@@ -275,10 +275,19 @@ fn build_and_store(
 /// ELF入力をmetadata確認つきの上限付きで読む。本体を読む前に8 MiBを
 /// 超える入力を拒否し、metadata確認後に伸びた入力もsentinelで拒否する。
 fn read_elf(path: &Path) -> Result<Vec<u8>, BuildError> {
+    read_elf_with(path, &|path| File::open(path))
+}
+
+/// `read_elf`の本体。open境界だけを注入可能にし、metadata確認を先に
+/// 行う順序は変えない。
+fn read_elf_with(
+    path: &Path,
+    open: &dyn Fn(&Path) -> std::io::Result<File>,
+) -> Result<Vec<u8>, BuildError> {
     if std::fs::metadata(path).map_err(BuildError::ElfIo)?.len() > MAX_BUNDLE_LEN {
         return Err(BuildError::ElfTooLarge);
     }
-    let file = File::open(path).map_err(BuildError::ElfIo)?;
+    let file = open(path).map_err(BuildError::ElfIo)?;
     if file.metadata().map_err(BuildError::ElfIo)?.len() > MAX_BUNDLE_LEN {
         return Err(BuildError::ElfTooLarge);
     }
@@ -344,7 +353,7 @@ mod tests {
     use super::*;
     use minicontainer_bundle::{ImageSpec, build};
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::VecDeque,
         ffi::OsString,
         io,
@@ -923,6 +932,37 @@ mod tests {
             String::from_utf8_lossy(&stderr)
         );
         assert!(store.calls.borrow().is_empty());
+        std::fs::remove_file(&elf_path).unwrap();
+    }
+
+    // Catches removing the metadata pre-check: an ELF whose metadata length
+    // already exceeds the 8 MiB limit must be rejected before the open
+    // boundary runs. A sentinel-only read returns the same error, so this
+    // test observes the open boundary directly instead of the result alone.
+    #[test]
+    fn rejects_an_oversized_elf_before_opening_it() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let elf_path = std::env::temp_dir().join(format!(
+            "minictr-test-unopened-oversized-elf-{}-{id}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&elf_path)
+            .unwrap();
+        file.set_len(minicontainer_bundle::MAX_BUNDLE_LEN + 1)
+            .unwrap();
+        drop(file);
+        let opened = Cell::new(false);
+
+        let result = read_elf_with(&elf_path, &|_| {
+            opened.set(true);
+            Err(std::io::Error::other("open must not run"))
+        });
+
+        assert!(matches!(result, Err(BuildError::ElfTooLarge)));
+        assert!(!opened.get(), "oversized ELF must not reach open");
         std::fs::remove_file(&elf_path).unwrap();
     }
 
