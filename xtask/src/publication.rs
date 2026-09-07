@@ -30,12 +30,6 @@ pub enum ForbiddenKind {
     AwsAccessKey,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IdentityRole {
-    Author,
-    Committer,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct WorkflowPolicyError {
     line: usize,
@@ -90,10 +84,6 @@ pub enum PublicationError {
         line: usize,
         reference: String,
     },
-    NonPublicIdentity {
-        role: IdentityRole,
-        email: String,
-    },
 }
 
 impl PublicationError {
@@ -108,7 +98,7 @@ impl PublicationError {
             | Self::Workflow { path, .. }
             | Self::MutableAction { path, .. } => Some(path),
             Self::MissingReadmeText { .. } => Some(Path::new("README.md")),
-            Self::Git { .. } | Self::NonUtf8TrackedPath | Self::NonPublicIdentity { .. } => None,
+            Self::Git { .. } | Self::NonUtf8TrackedPath => None,
         }
     }
 }
@@ -183,11 +173,6 @@ impl fmt::Display for PublicationError {
                 "{}:{line}: action reference must be pinned to a 40-character commit SHA: {reference}",
                 path.display()
             ),
-            Self::NonPublicIdentity { role, email } => write!(
-                formatter,
-                "non-public {} email in HEAD history: {email}",
-                identity_role_name(*role)
-            ),
         }
     }
 }
@@ -199,7 +184,6 @@ pub fn check(root: &Path) -> Result<(), PublicationError> {
     check_readme(root)?;
     check_tracked_tree(root)?;
     check_workflow_policy(root)?;
-    check_head_identities(root)?;
     Ok(())
 }
 
@@ -1174,54 +1158,6 @@ fn check_tracked_tree(root: &Path) -> Result<(), PublicationError> {
     Ok(())
 }
 
-fn check_head_identities(root: &Path) -> Result<(), PublicationError> {
-    let command_args = ["log", "--format=%ae%x00%ce%x00", "HEAD"];
-    let output = git(root, command_args)?;
-    let contents = String::from_utf8(output.stdout).map_err(|_| {
-        invalid_git_output(
-            root,
-            &command_args,
-            "git log emitted non-UTF-8 identity data",
-        )
-    })?;
-    if contents.is_empty() {
-        return Err(invalid_git_output(
-            root,
-            &command_args,
-            "git log returned an empty HEAD history",
-        ));
-    }
-    for record in contents.lines() {
-        let Some(record) = record.strip_suffix('\0') else {
-            return Err(invalid_git_output(
-                root,
-                &command_args,
-                "git log emitted a malformed identity record",
-            ));
-        };
-        let identities = record.split('\0').collect::<Vec<_>>();
-        if identities.len() != 2 {
-            return Err(invalid_git_output(
-                root,
-                &command_args,
-                "git log emitted a malformed identity record",
-            ));
-        }
-        for (role, email) in [
-            (IdentityRole::Author, identities[0]),
-            (IdentityRole::Committer, identities[1]),
-        ] {
-            if !is_public_identity(email) {
-                return Err(PublicationError::NonPublicIdentity {
-                    role,
-                    email: email.to_owned(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 fn git<const N: usize>(
     root: &Path,
     command_args: [&str; N],
@@ -1248,23 +1184,11 @@ fn git<const N: usize>(
     }
 }
 
-fn invalid_git_output(root: &Path, command_args: &[&str], stderr: &str) -> PublicationError {
-    PublicationError::Git {
-        args: git_args(root, command_args),
-        status: None,
-        stderr: stderr.to_owned(),
-    }
-}
-
 fn git_args(root: &Path, command_args: &[&str]) -> Vec<String> {
     std::iter::once("-C".to_owned())
         .chain(std::iter::once(root.display().to_string()))
         .chain(command_args.iter().copied().map(str::to_owned))
         .collect()
-}
-
-fn is_public_identity(email: &str) -> bool {
-    email == "noreply@github.com" || email.ends_with("@users.noreply.github.com")
 }
 
 fn forbidden_needles() -> Vec<(String, ForbiddenKind)> {
@@ -1446,13 +1370,6 @@ fn forbidden_kind_name(kind: ForbiddenKind) -> &'static str {
     }
 }
 
-fn identity_role_name(role: IdentityRole) -> &'static str {
-    match role {
-        IdentityRole::Author => "author",
-        IdentityRole::Committer => "committer",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1463,6 +1380,12 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum IdentityRole {
+        Author,
+        Committer,
+    }
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2107,16 +2030,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_personal_author_or_committer_in_head_history() {
+    fn accepts_a_personal_author_or_committer_in_head_history() {
         for role in [IdentityRole::Author, IdentityRole::Committer] {
             let repo = TestRepo::public_fixture();
             repo.commit_with_one_personal_identity(role);
 
-            assert!(matches!(
-                check(repo.path()),
-                Err(PublicationError::NonPublicIdentity { role: actual, .. })
-                    if actual == role
-            ));
+            assert_eq!(check(repo.path()), Ok(()));
         }
     }
 
