@@ -78,9 +78,9 @@ fn operational_failure_prints_the_diagnostic_to_stderr_and_exits_1() {
 
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
-    assert!(stdout.contains("[1/15] cargo fmt --all -- --check"));
-    assert!(stdout.contains("phase 1/15 failed (elapsed:"));
-    assert!(stdout.contains("summary: FAILED at phase 1/15; 0 passed, 1 failed"));
+    assert!(stdout.contains("[1/16] cargo fmt --all -- --check"));
+    assert!(stdout.contains("phase 1/16 failed (elapsed:"));
+    assert!(stdout.contains("summary: FAILED at phase 1/16; 0 passed, 1 failed"));
     assert_eq!(
         String::from_utf8(output.stderr).expect("diagnostic is UTF-8"),
         "cargo fmt --all -- --check failed with status 7\n\

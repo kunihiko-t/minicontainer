@@ -29,6 +29,7 @@ enum Phase {
     RuntimeTests,
     MinictrTests,
     XtaskTests,
+    GuestExampleBuild,
     LockedBuild,
     EndToEnd,
 }
@@ -93,6 +94,19 @@ impl Phase {
             Self::RuntimeTests => Some(&["test", "-p", "minicontainer-runtime", "--locked"]),
             Self::MinictrTests => Some(&["test", "-p", "minictr", "--locked"]),
             Self::XtaskTests => Some(&["test", "-p", "xtask", "--locked"]),
+            Self::GuestExampleBuild => Some(&[
+                "build",
+                "--manifest-path",
+                "examples/guest-hello/Cargo.toml",
+                "--target",
+                "riscv64gc-unknown-none-elf",
+                "--release",
+                "--locked",
+                "--config",
+                "target.riscv64gc-unknown-none-elf.rustflags=[\"-C\", \"link-arg=-Tlinker.ld\"]",
+                "--config",
+                "build.target-dir=\"target/guest-hello\"",
+            ]),
             Self::LockedBuild => Some(&["build", "--workspace", "--locked"]),
             Self::EndToEnd => None,
         }
@@ -131,6 +145,7 @@ fn check_phases() -> Vec<Phase> {
         Phase::RuntimeTests,
         Phase::MinictrTests,
         Phase::XtaskTests,
+        Phase::GuestExampleBuild,
         Phase::LockedBuild,
         Phase::EndToEnd,
     ]
@@ -388,11 +403,12 @@ mod tests {
                 Phase::RuntimeTests,
                 Phase::MinictrTests,
                 Phase::XtaskTests,
+                Phase::GuestExampleBuild,
                 Phase::LockedBuild,
                 Phase::EndToEnd,
             ]
         );
-        assert_eq!(check_phases().len(), 15);
+        assert_eq!(check_phases().len(), 16);
     }
 
     #[test]
@@ -577,6 +593,22 @@ mod tests {
                 vec!["test", "-p", "minictr", "--locked"],
             ),
             (Phase::XtaskTests, vec!["test", "-p", "xtask", "--locked"]),
+            (
+                Phase::GuestExampleBuild,
+                vec![
+                    "build",
+                    "--manifest-path",
+                    "examples/guest-hello/Cargo.toml",
+                    "--target",
+                    "riscv64gc-unknown-none-elf",
+                    "--release",
+                    "--locked",
+                    "--config",
+                    "target.riscv64gc-unknown-none-elf.rustflags=[\"-C\", \"link-arg=-Tlinker.ld\"]",
+                    "--config",
+                    "build.target-dir=\"target/guest-hello\"",
+                ],
+            ),
             (Phase::LockedBuild, vec!["build", "--workspace", "--locked"]),
         ];
 

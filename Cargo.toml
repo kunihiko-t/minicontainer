@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/bundle", "crates/protocol", "crates/runtime", "crates/minictr", "xtask"]
+exclude = ["examples/guest-hello"]
 resolver = "2"
 
 [workspace.package]

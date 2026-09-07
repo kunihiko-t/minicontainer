@@ -1,0 +1,9 @@
+# このdirectory内から直接buildする場合の設定。gateは同じ内容を`--config`
+# で渡す自己完結commandを使う。成果物はどちらの呼び方でもリポジトリ直下
+# の`target/guest-hello/`へ置く (cwd基準の相対path)。
+[build]
+target = "riscv64gc-unknown-none-elf"
+target-dir = "../../target/guest-hello"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-C", "link-arg=-Tlinker.ld"]
