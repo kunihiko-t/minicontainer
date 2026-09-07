@@ -23,18 +23,16 @@ cargo xtask check
 ## Pull Requestの統合
 
 Pull RequestはCIとレビューの入口として使う。
-保守者はGitHubのmergeボタンと`gh pr merge`を使わない。
-server-side mergeではGitHubがcommitter identityを生成するため、このリポジトリが要求するnoreply identityを保証できない。
+検証済みのPull Requestは、GitHubのmerge操作または`gh pr merge`で統合できる。
+作者とcommitterのidentityはGit履歴として公開されるため、各contributorがGitHub公開プロフィールを含めて適切なidentityを選ぶ。
+公開条件の検査はGit履歴のメールアドレスを制限しない。
 
 統合前に`origin/main`をfetchし、Pull Requestのbaseが移動していないことを確認する。
-続いて、headの作者とcommitterがnoreply形式だけを使い、`cargo xtask check`とrequired checkが成功していることを確認する。
-検証済みheadはforce optionを付けず、`main`へfast-forward pushする。
+続いて、`cargo xtask check`とrequired checkが成功していることを確認する。
 
 ## Dependabotの更新
 
-DependabotのPull Requestは直接統合しない。
-Dependabotのcommitはnoreply形式のauthorとcommitterを使わないため、このリポジトリの統合条件を満たさない。
-保守者は現`main`の先端から同等の依存更新をやり直し、検証済みheadをfast-forward pushで統合した後、DependabotのPull Requestをsupersededとしてクローズする。
+DependabotのPull Requestも、通常のPull Requestと同じレビューと検証を通して統合する。
 
 ## ライセンス
 
