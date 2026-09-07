@@ -94,8 +94,8 @@ guestの終了codeは0から255の範囲でそのままprocess終了codeにな�
 使い方の誤りは終了code 2、store解決失敗とruntime失敗は終了code 125である。
 timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、診断は標準エラー出力へ出る。
 `image build`では、ELFの読み取り失敗、上限超過、bundle構築失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
-`image build`のparse失敗とstore解決失敗は使い方の誤りとして終了code 2になる。
-`image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore解決失敗は終了code 2になる。
+`image build`のparse失敗とstore pathの既定値解決失敗は使い方の誤りとして終了code 2になる。
+`image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
 
 ## 失敗の調べ方
 

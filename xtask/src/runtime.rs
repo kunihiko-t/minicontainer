@@ -717,41 +717,41 @@ fn wait_for_qemu_boot(
     loop {
         match spawned.child.try_wait() {
             Ok(Some(_)) => {
-                signal_process_group(spawned.pid, libc::SIGKILL);
-                let _ = spawned.child.kill();
-                let _ = spawned.child.wait();
-                join_reader(spawned.stdout_reader, &spawned.command_line).ok();
-                join_reader(spawned.stderr_reader, &spawned.command_line).ok();
-                return Err(E2EError::UnexpectedRun {
+                let error = E2EError::UnexpectedRun {
                     case: "interrupt pre-signal liveness",
                     expected: "a running minictr".to_owned(),
                     actual: "minictr exited before the interrupt".to_owned(),
-                });
+                };
+                terminate_spawned(spawned);
+                return Err(error);
             }
             Ok(None) => {}
             Err(error) => {
-                signal_process_group(spawned.pid, libc::SIGKILL);
-                let _ = spawned.child.kill();
-                let _ = spawned.child.wait();
-                return Err(E2EError::Command {
-                    command: spawned.command_line,
+                let failure = E2EError::Command {
+                    command: spawned.command_line.clone(),
                     message: error.to_string(),
-                });
+                };
+                terminate_spawned(spawned);
+                return Err(failure);
             }
         }
-        let booted = qemu_pids()?.iter().any(|pid| !qemu_before.contains(pid));
+        let current_qemu = match qemu_pids() {
+            Ok(pids) => pids,
+            Err(error) => {
+                terminate_spawned(spawned);
+                return Err(error);
+            }
+        };
+        let booted = current_qemu.iter().any(|pid| !qemu_before.contains(pid));
         if booted {
             return Ok(spawned);
         }
         if Instant::now() >= deadline {
-            signal_process_group(spawned.pid, libc::SIGKILL);
-            let _ = spawned.child.kill();
-            let _ = spawned.child.wait();
-            join_reader(spawned.stdout_reader, &spawned.command_line).ok();
-            join_reader(spawned.stderr_reader, &spawned.command_line).ok();
-            return Err(E2EError::TimedOut {
+            let error = E2EError::TimedOut {
                 command: format!("{} (waiting for QEMU boot)", spawned.command_line),
-            });
+            };
+            terminate_spawned(spawned);
+            return Err(error);
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -763,23 +763,21 @@ fn assert_minictr_running(mut spawned: SpawnedChild) -> Result<SpawnedChild, E2E
     match spawned.child.try_wait() {
         Ok(None) => Ok(spawned),
         Ok(Some(_)) => {
-            signal_process_group(spawned.pid, libc::SIGKILL);
-            let _ = spawned.child.kill();
-            let _ = spawned.child.wait();
-            Err(E2EError::UnexpectedRun {
+            let error = E2EError::UnexpectedRun {
                 case: "interrupt pre-signal liveness",
                 expected: "a running minictr".to_owned(),
                 actual: "minictr exited before the interrupt".to_owned(),
-            })
+            };
+            terminate_spawned(spawned);
+            Err(error)
         }
         Err(error) => {
-            signal_process_group(spawned.pid, libc::SIGKILL);
-            let _ = spawned.child.kill();
-            let _ = spawned.child.wait();
-            Err(E2EError::Command {
-                command: spawned.command_line,
+            let failure = E2EError::Command {
+                command: spawned.command_line.clone(),
                 message: error.to_string(),
-            })
+            };
+            terminate_spawned(spawned);
+            Err(failure)
         }
     }
 }
@@ -797,13 +795,23 @@ fn run_interrupt_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EEr
         HAPPY_PATH_TIMEOUT_MS,
         E2E_IMAGE,
     )?;
-    let spawned = wait_for_qemu_boot(spawned, &qemu_before)?;
-    thread::sleep(INTERRUPT_SETTLE);
-    let spawned = assert_minictr_running(spawned)?;
-    signal_process_group(spawned.pid, libc::SIGINT);
-    let completed = wait_for_exit(spawned, INTERRUPT_EXIT_TIMEOUT)?;
+    let outcome = (|| {
+        let spawned = wait_for_qemu_boot(spawned, &qemu_before)?;
+        thread::sleep(INTERRUPT_SETTLE);
+        let spawned = assert_minictr_running(spawned)?;
+        if let Err(error) = signal_process_group(spawned.pid, libc::SIGINT) {
+            let failure = E2EError::Command {
+                command: format!("send SIGINT to process group {}", spawned.pid),
+                message: error.to_string(),
+            };
+            terminate_spawned(spawned);
+            return Err(failure);
+        }
+        wait_for_exit(spawned, INTERRUPT_EXIT_TIMEOUT)
+    })();
     let elapsed = started.elapsed();
     let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
+    let completed = outcome?;
     let report = CaseReport {
         minictr_pid: completed.pid,
         qemu_before,
@@ -901,7 +909,7 @@ fn wait_for_exit(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    signal_process_group(spawned.pid, libc::SIGKILL);
+                    let _ = signal_process_group(spawned.pid, libc::SIGKILL);
                     let _ = spawned.child.kill();
                     let _ = spawned.child.wait();
                     join_reader(spawned.stdout_reader, &spawned.command_line).ok();
@@ -913,7 +921,7 @@ fn wait_for_exit(
                 thread::sleep(POLL_INTERVAL);
             }
             Err(error) => {
-                signal_process_group(spawned.pid, libc::SIGKILL);
+                let _ = signal_process_group(spawned.pid, libc::SIGKILL);
                 let _ = spawned.child.kill();
                 let _ = spawned.child.wait();
                 join_reader(spawned.stdout_reader, &spawned.command_line).ok();
@@ -1033,7 +1041,7 @@ fn run_with_timeout(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    signal_process_group(pid, libc::SIGKILL);
+                    let _ = signal_process_group(pid, libc::SIGKILL);
                     let _ = child.kill();
                     let _ = child.wait();
                     join_reader(stdout_reader, &command_line).ok();
@@ -1045,7 +1053,7 @@ fn run_with_timeout(
                 thread::sleep(POLL_INTERVAL);
             }
             Err(error) => {
-                signal_process_group(pid, libc::SIGKILL);
+                let _ = signal_process_group(pid, libc::SIGKILL);
                 let _ = child.kill();
                 let _ = child.wait();
                 join_reader(stdout_reader, &command_line).ok();
@@ -1066,12 +1074,26 @@ fn run_with_timeout(
 ///
 /// 外部の`kill` binaryは使わない。procpsの`kill`は`-pgid`形式をexit 0の
 /// まま黙って無視し、孫processを生かしたまま残す。`kill(2)`を直接呼ぶ。
-fn signal_process_group(pid: u32, signal: libc::c_int) {
+fn signal_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
     let target = -(pid as libc::pid_t);
     // SAFETY: `kill(2)`の第一引数が負のときはprocess groupを指定する。
-    // `pid`はspawn直後の子のPIDで`pid_t`に収まる。戻り値は既死groupの
-    // errorを含めて無視する。
-    let _ = unsafe { libc::kill(target, signal) };
+    // `pid`はspawn直後の子のPIDで`pid_t`に収まる。
+    let result = unsafe { libc::kill(target, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// 起動途中または待機失敗の子groupをbest effortで停止し、直接の子と
+/// reader threadを回収する。
+fn terminate_spawned(mut spawned: SpawnedChild) {
+    let _ = signal_process_group(spawned.pid, libc::SIGKILL);
+    let _ = spawned.child.kill();
+    let _ = spawned.child.wait();
+    join_reader(spawned.stdout_reader, &spawned.command_line).ok();
+    join_reader(spawned.stderr_reader, &spawned.command_line).ok();
 }
 
 fn read_all(mut stream: impl io::Read + Send + 'static) -> io::Result<Vec<u8>> {
@@ -1760,7 +1782,8 @@ mod tests {
         let spawned = spawn_in_own_group(&program, &helper_args(), None, &[(HELPER_ENV, "sleep")])
             .expect("the sleep helper must spawn");
         std::thread::sleep(Duration::from_millis(500));
-        signal_process_group(spawned.pid, libc::SIGINT);
+        signal_process_group(spawned.pid, libc::SIGINT)
+            .expect("SIGINT must reach the spawned process group");
         let completed =
             wait_for_exit(spawned, Duration::from_secs(10)).expect("SIGINT must stop the sleeper");
 

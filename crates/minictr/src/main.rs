@@ -26,12 +26,6 @@ pub const USAGE_EXIT: i32 = 2;
 pub const RUNTIME_EXIT: i32 = 125;
 
 fn main() {
-    // Ctrl-CはQEMUだけが受けて終了し、後始末はこのprocessが行う。起動直後に
-    // SIGINTを無視設定へ固定する（後始末前の被弾でpayload残留を残さない）。
-    // SAFETY: process起動直後のmain threadで一度だけ呼び、handlerは設けない。
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
-    }
     let code = real_main(
         std::env::args_os().skip(1),
         &RealEnv,
@@ -218,6 +212,8 @@ pub trait Runner {
 /// 実際のhost runtime。
 pub struct RealRunner;
 
+extern "C" fn ignore_sigint(_signal: libc::c_int) {}
+
 impl Runner for RealRunner {
     fn run(
         &self,
@@ -225,6 +221,17 @@ impl Runner for RealRunner {
         kernel: &Path,
         timeout: Duration,
     ) -> Result<RunOutcome, RuntimeError> {
+        // run中のCtrl-CはQEMUにも届く。host側はsignalだけを無視して生存し、
+        // runtimeの通常経路でQEMUをreapして一時payloadを削除する。捕捉する
+        // handlerはexec後にdefaultへ戻るため、QEMUへ無視設定を継承しない。
+        // SAFETY: 空のsignal handlerをmain threadから設定し、handler内では
+        // signal-safeでない処理を一切行わない。
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                ignore_sigint as *const () as libc::sighandler_t,
+            );
+        }
         let runtime = Runtime::new(SystemProcessBackend::new());
         runtime.run(RunRequest {
             bundle,
@@ -551,6 +558,34 @@ mod tests {
         }
     }
 
+    struct QueryStore {
+        bundle: Vec<u8>,
+        records: Vec<TagRecord>,
+    }
+
+    impl ImageStore for QueryStore {
+        fn resolve(&self, _store_root: &Path, _image: &str) -> Result<Vec<u8>, StoreError> {
+            Ok(self.bundle.clone())
+        }
+
+        fn import(&self, _store_root: &Path, _bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+            panic!("image query tests do not import bundles");
+        }
+
+        fn tag(
+            &self,
+            _store_root: &Path,
+            _name: &str,
+            _digest: [u8; 32],
+        ) -> Result<(), StoreError> {
+            panic!("image query tests do not tag bundles");
+        }
+
+        fn list_tags(&self, _store_root: &Path) -> Result<Vec<TagRecord>, StoreError> {
+            Ok(self.records.clone())
+        }
+    }
+
     struct RecordingStore {
         calls: RefCell<Vec<String>>,
         imported: RefCell<Vec<u8>>,
@@ -652,6 +687,26 @@ mod tests {
     impl Write for FailingWriter {
         fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
             Err(io::Error::other(self.message))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailAfterWriter {
+        remaining: usize,
+        message: &'static str,
+    }
+
+    impl Write for FailAfterWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other(self.message));
+            }
+            let written = bytes.len().min(self.remaining);
+            self.remaining -= written;
+            Ok(written)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -1267,6 +1322,155 @@ mod tests {
         assert!(stderr.is_empty());
         assert_eq!(stdout, b"TAG\tDIGEST\n");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches mapping a missing default store path differently between image queries.
+    #[test]
+    fn image_queries_map_missing_default_store_to_usage_error() {
+        for argv in [
+            vec![OsString::from("image"), OsString::from("list")],
+            vec![
+                OsString::from("image"),
+                OsString::from("inspect"),
+                OsString::from("hello"),
+            ],
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let code = real_main(argv, &UnusedEnv, &mut stdout, &mut stderr);
+
+            assert_eq!(code, USAGE_EXIT);
+            assert!(stdout.is_empty());
+            assert!(String::from_utf8_lossy(&stderr).contains("usage: minictr run"));
+        }
+    }
+
+    // Catches mapping store-opening failures to success or usage errors.
+    #[test]
+    fn image_queries_map_store_failures_to_host_error() {
+        for argv in [
+            vec![
+                OsString::from("image"),
+                OsString::from("list"),
+                OsString::from("--store"),
+                OsString::from("relative-store"),
+            ],
+            vec![
+                OsString::from("image"),
+                OsString::from("inspect"),
+                OsString::from("--store"),
+                OsString::from("relative-store"),
+                OsString::from("hello"),
+            ],
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let code = real_main(argv, &UnusedEnv, &mut stdout, &mut stderr);
+
+            assert_eq!(code, RUNTIME_EXIT);
+            assert!(stdout.is_empty());
+            assert!(String::from_utf8_lossy(&stderr).contains("minictr:"));
+        }
+    }
+
+    // Catches image query output write or flush failures being reported as success.
+    #[test]
+    fn image_queries_map_output_failures_to_host_error() {
+        let bundle = build(ImageSpec {
+            name: "hello",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let store = QueryStore {
+            bundle,
+            records: vec![TagRecord {
+                name: "hello".to_owned(),
+                digest: [0x5a; 32],
+            }],
+        };
+        let list = ResolvedList {
+            store: Path::new("/store").to_path_buf(),
+        };
+        let inspect = ResolvedInspect {
+            image: "hello".to_owned(),
+            store: Path::new("/store").to_path_buf(),
+        };
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            list_resolved(
+                &list,
+                &store,
+                &mut FailingWriter {
+                    message: "list write broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            list_resolved(
+                &list,
+                &store,
+                &mut FailAfterWriter {
+                    remaining: b"TAG\tDIGEST\n".len(),
+                    message: "list row write broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            list_resolved(
+                &list,
+                &store,
+                &mut FlushFailingWriter {
+                    buffered: Vec::new(),
+                    message: "list flush broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to flush stdout"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            inspect_resolved(
+                &inspect,
+                &store,
+                &mut FailingWriter {
+                    message: "inspect write broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            inspect_resolved(
+                &inspect,
+                &store,
+                &mut FlushFailingWriter {
+                    buffered: Vec::new(),
+                    message: "inspect flush broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to flush stdout"));
     }
 
     // Catches drifting inspect output from the stable five lines for tag, manifest, digest, args, and ELF bytes.

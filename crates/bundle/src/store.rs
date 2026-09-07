@@ -11,7 +11,7 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 const TEMP_CREATE_ATTEMPTS: usize = 128;
 const TAG_DIGEST_LEN: usize = 64;
 
-/// A tag name with the digest its tag file names.
+/// tag名と、そのtag fileが指すdigest。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagRecord {
     pub name: String,
