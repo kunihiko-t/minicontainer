@@ -2245,6 +2245,11 @@ mod tests {
             parse_build_output(b"other sha256:ab\n", "hello").is_err(),
             "another image tag must not parse"
         );
+        let upper = format!("hello sha256:{}\n", "AB".repeat(32));
+        assert!(
+            parse_build_output(upper.as_bytes(), "hello").is_err(),
+            "an uppercase digest must not parse"
+        );
     }
 
     // Catches a happy path that skips the public `image inspect` command.
