@@ -51,3 +51,4 @@ cargo build --manifest-path examples/guest-hello/Cargo.toml --target riscv64gc-u
 成果物は`target/guest-hello/riscv64gc-unknown-none-elf/release/guest-hello`である。
 exampleはworkspaceから独立したpackageであり、独自の`Cargo.lock`を追跡してGit dependencyを再現可能にする。
 `cargo xtask check`はworkspace buildの前に同じcommandでexampleをbuildするため、省略できない。
+E2Eのhappy pathはこのELFを公開CLIの`image build`、`image inspect`、`run`へ一続きで通す。

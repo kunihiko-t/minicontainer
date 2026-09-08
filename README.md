@@ -23,7 +23,7 @@ git clone https://github.com/kunihiko-t/minicontainer.git
 cd minicontainer
 ```
 
-利用者が用意した静的RISC-V 64 ELFを`image build`で登録し、`minictr run`で実行する。
+同梱の最小ゲスト例をビルドし、`image build`で登録して`minictr run`で実行する。
 以下は同じシェルで、MiniContainerのリポジトリ直下から順に実行する。
 作業用のminiOSとストアは一時ディレクトリーに作成するため、長期保存には別の保存先を指定する。
 
@@ -39,6 +39,13 @@ cargo xtask setup
 cargo build -p minictr --locked
 ```
 
+次に同梱ゲスト例を静的RISC-V 64 ELFへビルドする。
+
+```sh
+cargo build --manifest-path examples/guest-hello/Cargo.toml --target riscv64gc-unknown-none-elf --release --locked --config 'target.riscv64gc-unknown-none-elf.rustflags=["-C", "link-arg=-Tlinker.ld"]' --config 'build.target-dir="target/guest-hello"'
+GUEST="target/guest-hello/riscv64gc-unknown-none-elf/release/guest-hello"
+```
+
 ゲストカーネルはminiOSの固定リビジョンからビルドする。
 `$MINIOS`はminiOSのチェックアウト先であり、この時点では存在しないパスである。
 
@@ -51,36 +58,49 @@ cargo build --manifest-path "$MINIOS/Cargo.toml" --target-dir "$MINIOS/target" -
 ビルド成果物`$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel`が実行カーネルである。
 Guest ABIは`minios-abi-v0.1.1`に固定している。
 
-次に静的RISC-V 64 ELFを`image build`で`store`へ登録し、`myapp`タグを付ける。
+次にゲストELFを`image build`で`store`へ登録し、`hello`タグを付ける。
 `$STORE`は絶対パスで指定した保存先であり、`Store::new`が作成する。
-`./app.elf`の部分は、利用者が用意した静的RISC-V 64 ELFのパスに置き換える。
 8 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
 実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
 ELFの中身はhostでは検証せずguestのloaderが検証する。
 
 ```sh
-cargo run -p minictr --locked -- image build --store "$STORE" myapp ./app.elf
+cargo run -p minictr --locked -- image build --store "$STORE" hello "$GUEST"
 ```
 
 成功すると、タグとSHA-256 digestの一行だけが表示される。
 
 ```text
-myapp sha256:<64桁の小文字16進数>
+hello sha256:<64桁の小文字16進数>
+```
+
+登録内容は`image inspect`で確認する。
+
+```sh
+cargo run -p minictr --locked -- image inspect --store "$STORE" hello
+```
+
+```text
+tag: hello
+name: hello
+digest: sha256:<buildと同じ64桁の小文字16進数>
+args: 0
+elf-bytes: <ゲストELFのbyte数>
 ```
 
 最後に`minictr run`で実行する。
 
 ```sh
 exit_code=0
-cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" myapp || exit_code=$?
+cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" hello || exit_code=$?
 echo "exit=$exit_code"
 ```
 
 期待する結果は、ゲストの標準出力がそのまま表示され、`exit=`にゲストの終了コードが入ることである。
-たとえばゲストが標準出力へ`hello stdout`と書いて42で終わる場合、次のようになる。
+同梱ゲストは標準出力へ`hello from guest`、標準エラー出力へ`guest stderr`と書いて42で終わる。
 
 ```text
-hello stdout
+hello from guest
 exit=42
 ```
 
@@ -139,7 +159,7 @@ cargo xtask check
 ```
 
 `check`はrustfmt、Markdownリンク、公開対象ファイル、crateごとのClippyと単体テスト、lockfileを使ったworkspaceのビルド、実QEMU end-to-end検証を15段階で実行する。
-E2Eは固定リビジョンのminiOSカーネルをビルドし、`minictr run hello`の標準出力、標準エラー出力、終了コード42、QEMUの回収、一時ディレクトリーの後始末を確認する。
+E2Eは固定リビジョンのminiOSカーネルをビルドし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了コード42、QEMUの回収、一時ディレクトリーの後始末を確認する。
 タイムアウト、不正フレーム、出力上限、割り込みの失敗経路では、非0終了と残留物がないことも確認する。
 
 ## 教材

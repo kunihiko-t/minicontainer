@@ -50,6 +50,12 @@ pub const E2E_EXIT_CODE: i32 = 42;
 pub const E2E_STDOUT: &[u8] = b"hello stdout\n";
 /// hello guestの標準エラー出力。
 pub const E2E_STDERR: &[u8] = b"hello stderr\n";
+/// 同梱guest例のrelease ELF。GuestExampleBuild位相の成果物でroot基準。
+const GUEST_HELLO_ELF: &str = "target/guest-hello/riscv64gc-unknown-none-elf/release/guest-hello";
+/// 同梱guest例の標準出力。
+const GUEST_HELLO_STDOUT: &[u8] = b"hello from guest\n";
+/// 同梱guest例の標準エラー出力。
+const GUEST_HELLO_STDERR: &[u8] = b"guest stderr\n";
 
 const RISCV_TARGET: &str = "riscv64gc-unknown-none-elf";
 const KERNEL_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
@@ -87,6 +93,8 @@ pub enum E2EError {
     DirtyCheckout { directory: PathBuf, status: String },
     /// `minictr` binaryがworkspace build成果物に存在しない。
     MissingMinictr(PathBuf),
+    /// 同梱guest例のELFがguest build成果物に存在しない。
+    MissingGuestElf(PathBuf),
     /// guestの実行結果が期待と異なる。
     UnexpectedRun {
         case: &'static str,
@@ -146,6 +154,11 @@ impl fmt::Display for E2EError {
             Self::MissingMinictr(path) => write!(
                 formatter,
                 "minictr binary is missing at {}; run the workspace build phase first",
+                path.display()
+            ),
+            Self::MissingGuestElf(path) => write!(
+                formatter,
+                "guest example ELF is missing at {}; run the guest example build phase first",
                 path.display()
             ),
             Self::UnexpectedRun {
@@ -227,7 +240,7 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
     }
 
     log("e2e: happy path (`minictr run hello` returns stdout, stderr, exit 42)");
-    let happy = run_happy_path(&minictr, &kernel)?;
+    let happy = run_happy_path(&minictr, &kernel, workspace)?;
     log(&format!(
         "e2e: happy path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
         happy.minictr_pid,
@@ -279,24 +292,6 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
     ));
 
     Ok(transcript)
-}
-
-/// 決定的なhello MiniBundle bytesを作る (quick-start example向けに公開)。
-pub fn hello_bundle() -> Result<Vec<u8>, E2EError> {
-    hello_bundle_bytes(&hello_elf_bytes())
-}
-
-/// hello bundleを`store_root`へimportして`hello` tagを作る (quick-start向け)。
-pub fn import_hello_store(store_root: &Path) -> Result<[u8; 32], E2EError> {
-    let store = minicontainer_bundle::Store::new(store_root)
-        .map_err(|error| E2EError::Store(error.to_string()))?;
-    let digest = store
-        .import(&hello_bundle()?)
-        .map_err(|error| E2EError::Store(error.to_string()))?;
-    store
-        .tag(E2E_IMAGE, digest)
-        .map_err(|error| E2EError::Store(error.to_string()))?;
-    Ok(digest)
 }
 
 /// pin留めrevisionのminiOS kernelをbuildし、そのbinary pathを返す。
@@ -532,7 +527,16 @@ fn run_case(
     kernel: &Path,
     timeout_ms: &str,
 ) -> Result<CaseReport, E2EError> {
-    let store = prepare_store(elf)?;
+    run_case_in_store(minictr, prepare_store(elf)?, kernel, timeout_ms)
+}
+
+/// 用意済みの一時storeで`minictr run`を一回実行し、cleanupまで検証する。
+fn run_case_in_store(
+    minictr: &Path,
+    store: TempStore,
+    kernel: &Path,
+    timeout_ms: &str,
+) -> Result<CaseReport, E2EError> {
     let store_path = store.path.clone();
     let qemu_before = qemu_pids()?;
     let payload_before = payload_temp_leftovers();
@@ -591,8 +595,15 @@ fn check_case_leftovers(
     Ok(qemu_after)
 }
 
-fn run_happy_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
-    let report = run_case(minictr, &hello_elf_bytes(), kernel, HAPPY_PATH_TIMEOUT_MS)?;
+fn run_happy_path(minictr: &Path, kernel: &Path, workspace: &Path) -> Result<CaseReport, E2EError> {
+    let elf = workspace.join(GUEST_HELLO_ELF);
+    let elf_len = std::fs::metadata(&elf)
+        .map(|metadata| metadata.len())
+        .map_err(|_| E2EError::MissingGuestElf(elf.clone()))?;
+    let store = TempStore::empty();
+    let digest = run_image_build(minictr, &store.path, &elf)?;
+    run_image_inspect(minictr, &store.path, &digest, elf_len)?;
+    let report = run_case_in_store(minictr, store, kernel, HAPPY_PATH_TIMEOUT_MS)?;
 
     if report.status != Some(E2E_EXIT_CODE) {
         return Err(E2EError::UnexpectedRun {
@@ -601,21 +612,109 @@ fn run_happy_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError>
             actual: format!("status {:?}", report.status),
         });
     }
-    if report.stdout != E2E_STDOUT {
+    if report.stdout != GUEST_HELLO_STDOUT {
         return Err(E2EError::UnexpectedRun {
             case: "happy-path stdout",
-            expected: format!("{:?}", E2E_STDOUT),
+            expected: format!("{:?}", GUEST_HELLO_STDOUT),
             actual: format!("{:?}", report.stdout),
         });
     }
-    if report.stderr != E2E_STDERR {
+    if report.stderr != GUEST_HELLO_STDERR {
         return Err(E2EError::UnexpectedRun {
             case: "happy-path stderr",
-            expected: format!("{:?}", E2E_STDERR),
+            expected: format!("{:?}", GUEST_HELLO_STDERR),
             actual: format!("{:?}", report.stderr),
         });
     }
     Ok(report)
+}
+
+/// 公開`image build`で同梱guestを一時storeへ登録し、digestを返す。
+fn run_image_build(minictr: &Path, store: &Path, elf: &Path) -> Result<String, E2EError> {
+    let args = minictr_build_args(store, E2E_IMAGE, elf);
+    let stdout = run_checked(minictr, &args, None, &[], COMMAND_TIMEOUT)?;
+    parse_build_output(&stdout, E2E_IMAGE)
+}
+
+/// 公開`image inspect`の安定した5行をbuild結果と突き合わせる。
+fn run_image_inspect(
+    minictr: &Path,
+    store: &Path,
+    digest: &str,
+    elf_len: u64,
+) -> Result<(), E2EError> {
+    let args = minictr_inspect_args(store, E2E_IMAGE);
+    let stdout = run_checked(minictr, &args, None, &[], COMMAND_TIMEOUT)?;
+    check_inspect_output(&stdout, E2E_IMAGE, digest, elf_len)
+}
+
+fn minictr_build_args(store: &Path, image: &str, elf: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("image"),
+        OsString::from("build"),
+        OsString::from("--store"),
+        store.as_os_str().to_owned(),
+        OsString::from(image),
+        elf.as_os_str().to_owned(),
+    ]
+}
+
+fn minictr_inspect_args(store: &Path, image: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("image"),
+        OsString::from("inspect"),
+        OsString::from("--store"),
+        store.as_os_str().to_owned(),
+        OsString::from(image),
+    ]
+}
+
+/// `image build`の成功行から小文字16進64桁のdigestを抜き出す。
+fn parse_build_output(output: &[u8], image: &str) -> Result<String, E2EError> {
+    let unexpected = |actual: String| E2EError::UnexpectedRun {
+        case: "happy-path image build output",
+        expected: format!("{image} sha256:<64 lowercase hex digits>"),
+        actual,
+    };
+    let text = String::from_utf8_lossy(output);
+    let line = text
+        .strip_suffix('\n')
+        .ok_or_else(|| unexpected(format!("{text:?}")))?;
+    let (tag, digest) = line
+        .split_once(' ')
+        .ok_or_else(|| unexpected(format!("{line:?}")))?;
+    let digest = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| unexpected(format!("{line:?}")))?;
+    if tag != image
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(unexpected(format!("{line:?}")));
+    }
+    Ok(digest.to_owned())
+}
+
+/// `image inspect`の5行がbuild結果と一致することを確認する。
+fn check_inspect_output(
+    output: &[u8],
+    image: &str,
+    digest: &str,
+    elf_len: u64,
+) -> Result<(), E2EError> {
+    let expected = format!(
+        "tag: {image}\nname: {image}\ndigest: sha256:{digest}\nargs: 0\nelf-bytes: {elf_len}\n"
+    );
+    if output != expected.as_bytes() {
+        return Err(E2EError::UnexpectedRun {
+            case: "happy-path image inspect output",
+            expected: format!("{expected:?}"),
+            actual: format!("{:?}", String::from_utf8_lossy(output)),
+        });
+    }
+    Ok(())
 }
 
 fn run_timeout_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
@@ -1153,6 +1252,17 @@ struct TempStore {
 }
 
 impl TempStore {
+    /// 公開CLIがimportする空の一時store pathを予約する。directory自体は
+    /// `Store::new`が作り、`Drop`が消す。
+    fn empty() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "minictr-e2e-store-{}-{}",
+            std::process::id(),
+            next_temp_id()
+        ));
+        Self { path }
+    }
+
     fn with_bundle(bundle: &[u8]) -> Result<Self, E2EError> {
         let path = std::env::temp_dir().join(format!(
             "minictr-e2e-store-{}-{}",
@@ -2094,20 +2204,83 @@ mod tests {
         assert!(!path.exists(), "the scratch root must not survive the drop");
     }
 
-    // Catches a quick-start store that `minictr run` cannot resolve.
+    // Catches a happy path that prepares its store through the Store API
+    // instead of the public `image build` command.
     #[test]
-    fn hello_store_import_resolves_the_hello_tag() {
-        let directory = TempDir::create("minictr-e2e-store-").expect("a scratch directory");
+    fn happy_path_build_uses_public_image_build_command() {
+        let args = minictr_build_args(
+            Path::new("/tmp/store"),
+            "hello",
+            Path::new("/tmp/guest-hello"),
+        );
 
-        import_hello_store(directory.path()).expect("the hello store must build");
-
-        let resolved = minicontainer_bundle::Store::new(directory.path())
-            .expect("the store must open")
-            .resolve(E2E_IMAGE)
-            .expect("the hello tag must resolve");
         assert_eq!(
-            resolved,
-            hello_bundle().expect("the hello bundle must build")
+            args,
+            vec![
+                OsString::from("image"),
+                OsString::from("build"),
+                OsString::from("--store"),
+                OsString::from("/tmp/store"),
+                OsString::from("hello"),
+                OsString::from("/tmp/guest-hello"),
+            ]
+        );
+    }
+
+    // Catches accepting a malformed `image build` success line as a digest.
+    #[test]
+    fn happy_path_build_parses_the_digest_line() {
+        let digest = "ab".repeat(32);
+        let line = format!("hello sha256:{digest}\n");
+
+        assert_eq!(
+            parse_build_output(line.as_bytes(), "hello").expect("a valid line must parse"),
+            digest
+        );
+        assert!(
+            parse_build_output(b"hello sha256:xyz\n", "hello").is_err(),
+            "a short digest must not parse"
+        );
+        assert!(
+            parse_build_output(b"other sha256:ab\n", "hello").is_err(),
+            "another image tag must not parse"
+        );
+    }
+
+    // Catches a happy path that skips the public `image inspect` command.
+    #[test]
+    fn happy_path_inspect_uses_public_image_inspect_command() {
+        let args = minictr_inspect_args(Path::new("/tmp/store"), "hello");
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("image"),
+                OsString::from("inspect"),
+                OsString::from("--store"),
+                OsString::from("/tmp/store"),
+                OsString::from("hello"),
+            ]
+        );
+    }
+
+    // Catches accepting a drifted `image inspect` output as the happy image.
+    #[test]
+    fn happy_path_inspect_checks_five_stable_lines() {
+        let digest = "cd".repeat(32);
+        let output = format!(
+            "tag: hello\nname: hello\ndigest: sha256:{digest}\nargs: 0\nelf-bytes: 60456\n"
+        );
+
+        check_inspect_output(output.as_bytes(), "hello", &digest, 60456)
+            .expect("matching inspect output must pass");
+        assert!(
+            check_inspect_output(output.as_bytes(), "hello", &digest, 7).is_err(),
+            "a wrong ELF length must fail"
+        );
+        assert!(
+            check_inspect_output(b"tag: hello\n", "hello", &digest, 60456).is_err(),
+            "a truncated inspect output must fail"
         );
     }
 }

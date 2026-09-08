@@ -86,6 +86,7 @@ bundleとkernel pathと期限をruntimeへ渡し、guest outcomeを受け取る�
 二つのストリーム間で、ゲストが出力した順序は保存しない。
 書き込みやフラッシュに失敗したらホスト側の失敗として終わる。
 ランタイムがエラーを返した場合、途中まで蓄積したゲスト出力はCLIに返らない。
+E2Eのhappy pathは同梱ゲストを`image build`、`image inspect`、`run`へ一続きで通し、このflow全体を公開CLIで検証する。
 
 ## 終了code
 

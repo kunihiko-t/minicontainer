@@ -27,7 +27,7 @@ MiniContainerは検証済みbundleをboot payload予約領域へ渡し、QEMU子
 一つのcontainerにつき一つのQEMU仮想machineでRISC-V 64 applicationを実行できる。
 
 実QEMU end-to-end検証はrelease gateの最終段階として実行する。
-`minictr run hello`の標準出力、標準エラー出力、終了code 42、QEMU回収、一時directory cleanupを確認する。
+同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了code 42、QEMU回収、一時directory cleanupを確認する。
 timeout、malformed-frame、出力上限、割り込みの失敗経路では非0終了と残留の不在も確認する。
 
 ### 出力上限
