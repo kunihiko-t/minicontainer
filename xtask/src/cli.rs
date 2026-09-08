@@ -5,6 +5,8 @@ use std::{ffi::OsString, fmt};
 pub enum Command {
     /// Diagnoses the required development tools without changing the system.
     Setup,
+    /// Runs the ordered gate without the real-QEMU phase.
+    CheckHost,
     /// Runs the ordered release gate.
     Check,
 }
@@ -49,7 +51,7 @@ impl fmt::Display for CliError {
 
 /// Returns the complete public command syntax.
 pub fn help() -> &'static str {
-    "usage: cargo xtask <setup|check>"
+    "usage: cargo xtask <setup|check-host|check>"
 }
 
 /// Parses one supported command from UTF-8 arguments.
@@ -69,6 +71,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
 
     let parsed = match command.as_str() {
         "setup" => Command::Setup,
+        "check-host" => Command::CheckHost,
         "check" => Command::Check,
         unknown => return Err(CliError::UnknownCommand(unknown.to_owned())),
     };
@@ -88,9 +91,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_only_two_public_commands() {
+    fn parses_the_only_three_public_commands() {
         assert_eq!(parse(["setup"]), Ok(Command::Setup));
         assert_eq!(parse(["check"]), Ok(Command::Check));
+        assert_eq!(parse(["check-host"]), Ok(Command::CheckHost));
     }
 
     #[test]
@@ -104,11 +108,15 @@ mod tests {
             parse(["setup", "extra"]),
             Err(CliError::UnexpectedArgument("extra".to_owned()))
         );
+        assert_eq!(
+            parse(["check-host", "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
     }
 
     #[test]
     fn help_and_diagnostics_name_the_public_contract() {
-        assert_eq!(help(), "usage: cargo xtask <setup|check>");
+        assert_eq!(help(), "usage: cargo xtask <setup|check-host|check>");
         assert_eq!(
             CliError::MissingCommand.to_string(),
             "missing xtask command"

@@ -14,7 +14,7 @@ fn non_utf8_argument_prints_usage_and_exits_2() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).expect("diagnostic is UTF-8"),
-        "xtask argument is not valid UTF-8\n\nusage: cargo xtask <setup|check>\n"
+        "xtask argument is not valid UTF-8\n\nusage: cargo xtask <setup|check-host|check>\n"
     );
 }
 
@@ -26,6 +26,10 @@ fn utf8_cli_errors_print_usage_and_exit_2() {
         (Vec::<&str>::new(), "missing xtask command"),
         (vec!["run"], "unknown xtask command: run"),
         (vec!["check", "extra"], "unexpected xtask argument: extra"),
+        (
+            vec!["check-host", "extra"],
+            "unexpected xtask argument: extra",
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .args(arguments)
@@ -36,7 +40,7 @@ fn utf8_cli_errors_print_usage_and_exit_2() {
         assert!(output.stdout.is_empty());
         assert_eq!(
             String::from_utf8(output.stderr).expect("diagnostic is UTF-8"),
-            format!("{diagnostic}\n\nusage: cargo xtask <setup|check>\n")
+            format!("{diagnostic}\n\nusage: cargo xtask <setup|check-host|check>\n")
         );
     }
 }

@@ -13,8 +13,8 @@ system call番号と呼び出し規約もGuest ABIに定義済みであり、run
 
 MiniBundleはcanonicalなbundleを構築してparseし、digestとmanifestを検証してcontent-addressed storeへimport、tag、resolveできる。
 UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
-`cargo xtask setup`は開発環境を変更せずに診断し、`cargo xtask check`は15段階の検査を実行する。
-Ubuntu 24.04のCIはsetupと同じcheckを実行する。
+`cargo xtask setup`は開発環境を変更せずに診断し、`cargo xtask check`は16段階の検査を実行する。
+Ubuntu 24.04のCIはsetupと同じcheck、Apple SiliconのmacOS CIはQEMUを除く15段階のcheck-hostを実行する。
 
 ### QEMU上でのゲスト実行
 
@@ -41,7 +41,7 @@ E2Eの出力上限経路では、連打guestによる125終了、診断の一致
 ガイド全12章の本文を用意している。
 第1章から第11章は現在の実装、第12章は未実装のOCI対応を検討するための資料である。
 第10章はhost error、guest failure、protocol破損の三分類と終了code、timeoutの二層強制、診断logの扱いを説明する。
-第11章は`setup`と15段階の`check`、公開条件の検査、CIとの同一性を説明する。
+第11章は`setup`と16段階の`check`と15段階の`check-host`、公開条件の検査、CIとの同一性を説明する。
 第1章から第4章は境界、環境、ELFとGuest ABI、MiniBundleを、第12章はOCI imageとの差と拡張順の計画を扱う。
 
 ## 拡張候補

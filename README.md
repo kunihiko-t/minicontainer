@@ -6,7 +6,7 @@ MiniContainerは、miniOSをゲストカーネルとして使い、RISC-V 64ア�
 ## 対応環境
 
 主要な開発環境はApple Silicon搭載macOSである。
-継続検証の対象はUbuntu 24.04である。
+継続検証はUbuntu 24.04とApple Silicon搭載macOSである。
 Windowsは対象外である。
 
 必要なツールはRust 1.98.0、`riscv64gc-unknown-none-elf`ターゲット、QEMU 8.2.0以上、Gitである。
@@ -151,14 +151,17 @@ OCI互換、ネットワーク、永続ボリューム、Linuxアプリケーシ
 
 ## 検証
 
-公開前検証の入口は次の二つである。
+公開前検証の入口は次の三つである。
 
 ```sh
 cargo xtask setup
+cargo xtask check-host
 cargo xtask check
 ```
 
-`check`はrustfmt、Markdownリンク、公開対象ファイル、crateごとのClippyと単体テスト、lockfileを使ったworkspaceのビルド、実QEMU end-to-end検証を15段階で実行する。
+`check`はrustfmt、Markdownリンク、公開対象ファイル、crateごとのClippyと単体テスト、同梱ゲストのビルド、lockfileを使ったworkspaceのビルド、実QEMU end-to-end検証を16段階で実行する。
+`check-host`は実QEMU検証を除く15段階を実行する。
+CIはUbuntu 24.04で`setup`と`check`、Apple SiliconのmacOSで`check-host`を実行する。
 E2Eは固定リビジョンのminiOSカーネルをビルドし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了コード42、QEMUの回収、一時ディレクトリーの後始末を確認する。
 タイムアウト、不正フレーム、出力上限、割り込みの失敗経路では、非0終了と残留物がないことも確認する。
 

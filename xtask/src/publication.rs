@@ -2061,6 +2061,29 @@ mod tests {
     }
 
     #[test]
+    fn workflow_parser_collects_step_actions_across_jobs() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let workflow = format!(
+            "jobs:\n  check-ubuntu:\n    steps:\n      - uses: owner/first@{sha}\n      - uses: owner/second@{sha}\n  check-macos:\n    steps:\n      - uses: owner/third@{sha}\n      - uses: owner/fourth@{sha}\n"
+        );
+
+        let references = workflow_action_references(&workflow).unwrap();
+        let values: Vec<String> = references
+            .iter()
+            .map(|reference| reference.value.clone())
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                format!("owner/first@{sha}"),
+                format!("owner/second@{sha}"),
+                format!("owner/third@{sha}"),
+                format!("owner/fourth@{sha}"),
+            ]
+        );
+    }
+
+    #[test]
     fn final_review_workflow_rejects_mutable_actions_in_yaml_files() {
         let repo = TestRepo::public_fixture();
         repo.write(

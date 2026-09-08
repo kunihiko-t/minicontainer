@@ -355,13 +355,26 @@ fn execute_phase(workspace: &Path, phase: Phase) -> Result<String, XtaskError> {
     Ok(String::new())
 }
 
+fn check_host_phases() -> Vec<Phase> {
+    check_phases()
+        .into_iter()
+        .filter(|phase| *phase != Phase::EndToEnd)
+        .collect()
+}
+
 fn run_check(workspace: &Path) -> Result<(), XtaskError> {
+    run_gate(workspace, &check_phases())
+}
+
+fn run_check_host(workspace: &Path) -> Result<(), XtaskError> {
+    run_gate(workspace, &check_host_phases())
+}
+
+fn run_gate(workspace: &Path, phases: &[Phase]) -> Result<(), XtaskError> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    run_phases(&check_phases(), &mut output, |phase| {
-        execute_phase(workspace, phase)
-    })
-    .map_err(phase_run_error)
+    run_phases(phases, &mut output, |phase| execute_phase(workspace, phase))
+        .map_err(phase_run_error)
 }
 
 fn phase_run_error(error: PhaseRunError<XtaskError>) -> XtaskError {
@@ -375,6 +388,7 @@ fn phase_run_error(error: PhaseRunError<XtaskError>) -> XtaskError {
 pub fn run(command: Command) -> Result<(), XtaskError> {
     match command {
         Command::Setup => tools::check_setup(),
+        Command::CheckHost => run_check_host(&workspace_root()),
         Command::Check => run_check(&workspace_root()),
     }
 }
@@ -409,6 +423,19 @@ mod tests {
             ]
         );
         assert_eq!(check_phases().len(), 16);
+    }
+
+    #[test]
+    fn check_host_runs_every_phase_except_real_qemu_in_order() {
+        let expected: Vec<Phase> = check_phases()
+            .into_iter()
+            .filter(|phase| *phase != Phase::EndToEnd)
+            .collect();
+
+        assert_eq!(check_host_phases(), expected);
+        assert_eq!(check_host_phases().len(), 15);
+        assert!(check_host_phases().contains(&Phase::GuestExampleBuild));
+        assert!(!check_host_phases().contains(&Phase::EndToEnd));
     }
 
     #[test]
