@@ -184,6 +184,7 @@ pub fn check(root: &Path) -> Result<(), PublicationError> {
     check_readme(root)?;
     check_tracked_tree(root)?;
     check_workflow_policy(root)?;
+    check_release_policy(root)?;
     Ok(())
 }
 
@@ -239,6 +240,130 @@ fn tracked_workflows(root: &Path) -> Result<Vec<PathBuf>, PublicationError> {
         })
         .filter_map(Result::transpose)
         .collect()
+}
+
+/// Release tag that owns archive builds.
+const RELEASE_TAG: &str = "v0.1.0";
+/// miniOS kernel revision packed into release archives.
+const RELEASE_KERNEL_REV: &str = "9be99255a59d58d19db25b835af0e28a8d2a4036";
+/// Release archive name prefix shared by the tarball and its checksum.
+const RELEASE_ARCHIVE_PREFIX: &str = "minicontainer-v0.1.0-";
+
+/// Enforces the release workflow contract when `release.yml` is tracked.
+fn check_release_policy(root: &Path) -> Result<(), PublicationError> {
+    let workflows = tracked_workflows(root)?;
+    let release = workflows
+        .iter()
+        .find(|path| path.file_stem().is_some_and(|stem| stem == "release"));
+    let Some(path) = release else {
+        return Ok(());
+    };
+    let contents = fs::read_to_string(root.join(path)).map_err(|error| PublicationError::Read {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+    check_release_trigger(path, &contents)?;
+    check_release_permissions(path, &contents)?;
+    if !contents.contains(RELEASE_KERNEL_REV) {
+        return Err(PublicationError::Workflow {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "release workflow must build the pinned kernel revision",
+        });
+    }
+    if !contents.contains(RELEASE_ARCHIVE_PREFIX) {
+        return Err(PublicationError::Workflow {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "release workflow must pack versioned release archives",
+        });
+    }
+    Ok(())
+}
+
+/// Requires a tag-push-only trigger for the release version.
+fn check_release_trigger(path: &Path, contents: &str) -> Result<(), PublicationError> {
+    let violation = |line: usize| PublicationError::Workflow {
+        path: path.to_path_buf(),
+        line,
+        message: "release workflow must trigger on the release tag push only",
+    };
+    let mut on_line = None;
+    let mut block: Vec<(usize, &str)> = Vec::new();
+    for (index, raw) in contents.lines().enumerate() {
+        let line = index + 1;
+        let trimmed = raw.trim();
+        let indent = raw.len() - raw.trim_start().len();
+        if on_line.is_none() {
+            if indent == 0 && (trimmed == "on:" || trimmed.starts_with("on: ")) {
+                on_line = Some(line);
+                if let Some(rest) = trimmed.strip_prefix("on:").map(str::trim)
+                    && !rest.is_empty()
+                {
+                    block.push((line, rest));
+                }
+            }
+            continue;
+        }
+        if indent == 0 {
+            break;
+        }
+        block.push((line, trimmed));
+    }
+    let Some(on_line) = on_line else {
+        return Err(violation(1));
+    };
+    for (line, text) in &block {
+        if text.starts_with("branches:")
+            || text.starts_with("workflow_dispatch")
+            || text.starts_with("schedule:")
+            || text.starts_with("pull_request")
+        {
+            return Err(violation(*line));
+        }
+    }
+    let has_tags = block
+        .iter()
+        .any(|(_, text)| *text == "tags:" || text.starts_with("tags: "));
+    let has_tag = block
+        .iter()
+        .any(|(_, text)| text.starts_with("- ") && text.contains(RELEASE_TAG));
+    if !has_tags || !has_tag {
+        return Err(violation(on_line));
+    }
+    Ok(())
+}
+
+/// Requires read-only contents permission without any write grant.
+fn check_release_permissions(path: &Path, contents: &str) -> Result<(), PublicationError> {
+    let mut permissions_line = 1;
+    let mut has_read = false;
+    for (index, raw) in contents.lines().enumerate() {
+        let line = index + 1;
+        let trimmed = raw.trim();
+        if trimmed == "permissions:" {
+            permissions_line = line;
+        }
+        if trimmed.starts_with("contents:") {
+            if trimmed == "contents: read" {
+                has_read = true;
+            } else if trimmed.starts_with("contents: write") {
+                return Err(PublicationError::Workflow {
+                    path: path.to_path_buf(),
+                    line,
+                    message: "release workflow must not grant write permission",
+                });
+            }
+        }
+    }
+    if !has_read {
+        return Err(PublicationError::Workflow {
+            path: path.to_path_buf(),
+            line: permissions_line,
+            message: "release workflow must declare contents: read",
+        });
+    }
+    Ok(())
 }
 
 fn check_dependabot(root: &Path) -> Result<(), PublicationError> {
@@ -2081,6 +2206,107 @@ mod tests {
                 format!("owner/fourth@{sha}"),
             ]
         );
+    }
+
+    fn release_fixture(trigger: &str, permissions: &str, body: &str) -> String {
+        format!("name: release\non:\n{trigger}permissions:\n{permissions}jobs:\n  build:\n{body}")
+    }
+
+    fn valid_release_trigger() -> String {
+        "  push:\n    tags:\n      - v0.1.0\n".to_owned()
+    }
+
+    fn valid_release_body() -> String {
+        format!(
+            "    steps:\n      - run: git checkout {rev}\n      - run: tar minicontainer-v0.1.0-x\n",
+            rev = RELEASE_KERNEL_REV
+        )
+    }
+
+    fn release_repo(trigger: &str, permissions: &str, body: &str) -> TestRepo {
+        let repo = TestRepo::public_fixture();
+        repo.write(
+            ".github/workflows/release.yml",
+            &release_fixture(trigger, permissions, body),
+        );
+        repo.add_all();
+        repo.commit_noreply();
+        repo
+    }
+
+    #[test]
+    fn release_policy_pins_the_kernel_revision_to_the_e2e_fixture() {
+        assert_eq!(
+            RELEASE_KERNEL_REV,
+            crate::runtime::MINIOS_KERNEL_REV,
+            "the release kernel must match the E2E kernel"
+        );
+    }
+
+    #[test]
+    fn release_policy_accepts_a_tag_only_v010_trigger() {
+        let repo = release_repo(
+            &valid_release_trigger(),
+            "  contents: read\n",
+            &valid_release_body(),
+        );
+
+        check_release_policy(repo.path()).expect("a valid release workflow must pass");
+    }
+
+    #[test]
+    fn release_policy_rejects_non_tag_triggers() {
+        for trigger in [
+            "  push:\n    branches:\n      - main\n",
+            "  workflow_dispatch:\n",
+            "  schedule:\n    - cron: '0 0 * * *'\n",
+            "  pull_request:\n",
+            "  push:\n    tags:\n      - v0.2.0\n",
+            "  push:\n",
+        ] {
+            let repo = release_repo(trigger, "  contents: read\n", &valid_release_body());
+
+            assert!(
+                check_release_policy(repo.path()).is_err(),
+                "trigger must be rejected: {trigger:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_policy_requires_read_only_contents_permission() {
+        for permissions in ["  contents: write\n", "  issues: write\n"] {
+            let repo = release_repo(&valid_release_trigger(), permissions, &valid_release_body());
+
+            assert!(
+                check_release_policy(repo.path()).is_err(),
+                "permissions must be rejected: {permissions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_policy_requires_the_pinned_kernel_and_archive_version() {
+        let body = valid_release_body();
+        let wrong_rev = body.replace(RELEASE_KERNEL_REV, &"0".repeat(40));
+        let wrong_archive = body.replace("minicontainer-v0.1.0-", "minicontainer-v0.2.0-");
+        for body in [wrong_rev.as_str(), wrong_archive.as_str()] {
+            let repo = release_repo(&valid_release_trigger(), "  contents: read\n", body);
+
+            assert!(
+                check_release_policy(repo.path()).is_err(),
+                "body must be rejected: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_policy_ignores_a_missing_release_workflow() {
+        let repo = TestRepo::public_fixture();
+        repo.add_all();
+        repo.commit_noreply();
+
+        check_release_policy(repo.path()).expect("a missing release workflow must pass");
     }
 
     #[test]

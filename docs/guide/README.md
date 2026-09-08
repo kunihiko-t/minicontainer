@@ -37,3 +37,4 @@
 
 設計上の責務と到達点は[MiniContainerアーキテクチャ](../design/architecture.md)を参照する。
 安全性の前提と保証しない範囲は[脅威モデル](../reference/threat-model.md)を参照する。
+配布物の構築と確認は[v0.1.0配布手順](../reference/releasing.md)を参照する。

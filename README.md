@@ -165,6 +165,13 @@ CIはUbuntu 24.04で`setup`と`check`、Apple SiliconのmacOSで`check-host`を�
 E2Eは固定リビジョンのminiOSカーネルをビルドし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了コード42、QEMUの回収、一時ディレクトリーの後始末を確認する。
 タイムアウト、不正フレーム、出力上限、割り込みの失敗経路では、非0終了と残留物がないことも確認する。
 
+## 配布物
+
+`v0.1.0`タグのpushで、`minicontainer-v0.1.0-aarch64-apple-darwin.tar.gz`と`minicontainer-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`を構築する。
+archiveは`bin/minictr`、固定revisionのminiOS kernel、ライセンス、導入手順を含む。
+展開後は`bin/minictr run --kernel share/minicontainer/minios-kernel`の形で実行する。
+詳細は[v0.1.0配布手順](docs/reference/releasing.md)を参照する。
+
 ## 教材
 
 設計の全体像は[アーキテクチャ](docs/design/architecture.md)に記載している。

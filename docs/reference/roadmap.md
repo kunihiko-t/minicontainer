@@ -36,6 +36,11 @@ stdout、stderr、diagnosticsの合計蓄積量に1 MiBの上限を設け、超�
 失敗時は蓄積済みの出力を転送しない。
 E2Eの出力上限経路では、連打guestによる125終了、診断の一致、QEMU回収、一時directory cleanupを確認する。
 
+### 配布
+
+`v0.1.0`タグのpushでmacOS arm64用とLinux x86_64用の配布アーカイブを構築し、`minictr`、固定revisionのminiOS kernel、ライセンス、導入手順を含める。
+手順は[v0.1.0配布手順](releasing.md)を参照する。
+
 ### 学習ガイド
 
 ガイド全12章の本文を用意している。
