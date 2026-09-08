@@ -18,6 +18,7 @@ QEMUとminiOSは信頼する計算基盤である。
 ゲストの分離、ELF loaderの検証、user pointerの検査、system callの実行はminiOSに依存する。
 ホスト側のdecoderとstore検証は破損検出のための層であり、ゲスト側の再検証を省略する根拠にはならない。
 QEMUまたはminiOSの脆弱性はこのモデルの前提を崩す。
+配布アーカイブ内のkernel binaryも固定revisionからbuildした同じminiOSであり、信頼前提は変わらない。
 
 ## 仮想マシン境界
 

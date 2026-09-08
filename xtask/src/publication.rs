@@ -15,9 +15,10 @@ const REQUIRED_PUBLICATION_FILES: [&str; 8] = [
     "docs/reference/threat-model.md",
 ];
 
-const REQUIRED_README_TEXT: [&str; 2] = [
+const REQUIRED_README_TEXT: [&str; 3] = [
     "MIT OR Apache-2.0",
     "本番用のセキュリティー境界ではありません",
+    "学習用マイクロVMランタイム",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1541,7 +1542,7 @@ mod tests {
                 repo.write(
                     path,
                     if path == "README.md" {
-                        "MIT OR Apache-2.0\n本番用のセキュリティー境界ではありません\n"
+                        "MIT OR Apache-2.0\n本番用のセキュリティー境界ではありません\n学習用マイクロVMランタイム\n"
                     } else {
                         "fixture\n"
                     },
@@ -1721,12 +1722,16 @@ mod tests {
     fn requires_exact_readme_license_and_security_text() {
         for (contents, missing) in [
             (
-                "本番用のセキュリティー境界ではありません\n",
+                "本番用のセキュリティー境界ではありません\n学習用マイクロVMランタイム\n",
                 "MIT OR Apache-2.0",
             ),
             (
-                "MIT OR Apache-2.0\n",
+                "MIT OR Apache-2.0\n学習用マイクロVMランタイム\n",
                 "本番用のセキュリティー境界ではありません",
+            ),
+            (
+                "MIT OR Apache-2.0\n本番用のセキュリティー境界ではありません\n",
+                "学習用マイクロVMランタイム",
             ),
         ] {
             let repo = TestRepo::public_fixture();

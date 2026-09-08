@@ -12,6 +12,7 @@ MiniContainerは固定したminiOS Guest ABI (`minios-abi-v0.1.1`) を依存と�
 system call番号と呼び出し規約もGuest ABIに定義済みであり、runtimeは`write`と`exit`の結果をUART control frameで受け取る。
 
 MiniBundleはcanonicalなbundleを構築してparseし、digestとmanifestを検証してcontent-addressed storeへimport、tag、resolveできる。
+同梱の最小ゲスト例はsourceから静的RISC-V 64 ELFへbuildでき、E2Eのhappy pathとquick startの入力になる。
 UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
 `cargo xtask setup`は開発環境を変更せずに診断し、`cargo xtask check`は16段階の検査を実行する。
 Ubuntu 24.04のCIはsetupと同じcheck、Apple SiliconのmacOS CIはQEMUを除く15段階のcheck-hostを実行する。
@@ -39,7 +40,7 @@ E2Eの出力上限経路では、連打guestによる125終了、診断の一致
 ### 配布
 
 `v0.1.0`タグのpushでmacOS arm64用とLinux x86_64用の配布アーカイブを構築し、`minictr`、固定revisionのminiOS kernel、ライセンス、導入手順を含める。
-手順は[v0.1.0配布手順](releasing.md)を参照する。
+手順は[v0.1.0配布手順](releasing.md)、機能と制約の一覧は[v0.1.0 release notes](v0.1.0-release-notes.md)を参照する。
 
 ### 学習ガイド
 

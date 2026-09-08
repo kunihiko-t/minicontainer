@@ -9,11 +9,13 @@ Rust 1.98.0、RISC-V target、QEMU、Gitを用意する。
 
 ```sh
 cargo xtask setup
+cargo xtask check-host
 cargo xtask check
 ```
 
 `setup`はRust、RISC-V target、QEMU、Gitのversionを変更せずに診断する。
-`check`は依存関係を解決するすべてのCargo phaseを`--locked`で実行し、15段階の検査を最初の失敗で停止する。
+`check`は依存関係を解決するすべてのCargo phaseを`--locked`で実行し、16段階の検査を最初の失敗で停止する。
+`check-host`は実QEMUの最終段階を除く15段階を実行する。
 
 ## コメントと言語
 

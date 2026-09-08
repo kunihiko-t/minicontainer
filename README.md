@@ -1,7 +1,8 @@
 # MiniContainer
 
-MiniContainerは、miniOSをゲストカーネルとして使い、RISC-V 64アプリケーションをQEMU仮想マシンで実行する小さなコンテナランタイムである。
-仕組みを追える学習用実装を軸に、信頼できるコードを使った個人開発、デモ、OS教材、ランタイム実験で実際に動かせることを目標にしている。
+MiniContainerは、miniOSをゲストカーネルとして使い、一つのRISC-V 64アプリケーションを一つのQEMU仮想マシンで実行する学習用マイクロVMランタイムである。
+仕組みを追える実装を軸に、信頼できる静的RISC-V 64ゲストをローカルで動かす個人開発、デモ、OS教材、ランタイム実験に使う。
+DockerやOCI、Linuxコンテナとの互換性はない。
 
 ## 対応環境
 
@@ -113,6 +114,7 @@ exit=42
 ## 現在の機能と制限
 
 `minictr`が実装するコマンドは`run`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
+構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
@@ -125,17 +127,8 @@ usage: minictr image inspect [--store PATH] IMAGE
 `--version`は`minictr 0.1.0`を標準出力へ出して0で終わる。
 
 `image build`は静的RISC-V 64 ELFからMiniBundleを構築し、指定したタグでローカルストアへ登録する。
-`--arg`は繰り返し指定でき、順にmanifestのゲスト引数になる。
 成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
-`--store`の省略時解決は`run`と同じである。
-8 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
-実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
-
-`image list`は`TAG`と`DIGEST`のheaderに続き、タグ名のbyte順でタグと`sha256:<digest>`をTAB区切りで出す。
-空のstoreではheaderだけを出す。
-`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
-`digest`は解決したbundle headerの値であり、`args`は件数だけを表示する。
-どちらの`--store`省略時解決も`run`と同じである。
+`image list`はタグの一覧、`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
 
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。
@@ -143,7 +136,7 @@ usage: minictr image inspect [--store PATH] IMAGE
 MiniBundleの構築と検証、SHA-256ダイジェスト、manifestの制限、content-addressed storeへの取り込み、タグ付け、解決、一覧ができる。
 UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
 QEMUバックエンドは固定した引数で起動し、通常の成功経路とエラー経路で子プロセスの回収と一時領域の削除を試みる。
-後始末の失敗もエラーとして返す。ホストの停止や`SIGKILL`による強制終了では、後始末を実行できない場合がある。
+後始末の失敗もエラーとして返す。ホストの停止や`SIGKILL`、`SIGTERM`による強制終了では、後始末を実行できない場合がある。
 ゲスト出力はメモリーに蓄積し、実行完了後に表示する。stdout、stderr、診断の合計は1 MiBが上限であり、超過はホスト側の失敗として扱う。対話入力とリアルタイムの出力表示には対応していない。
 
 OCI互換、ネットワーク、永続ボリューム、Linuxアプリケーション互換、マルチテナント分離は現在の機能ではない。

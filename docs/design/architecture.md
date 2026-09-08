@@ -41,7 +41,7 @@ OSの入出力や後始末を含む、呼び出し全体の厳密な終了時刻
 
 ## 対象環境
 
-主要な開発環境はApple Silicon搭載macOS、継続検証環境はUbuntu 24.04である。
+主要な開発環境はApple Silicon搭載macOS、継続検証環境はUbuntu 24.04とApple Silicon搭載macOSである。
 Windowsは対象外である。
 
 ## 保証しない範囲
