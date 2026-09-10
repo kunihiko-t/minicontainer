@@ -50,10 +50,78 @@ E2Eの出力上限経路では、連打guestによる125終了、診断の一致
 第11章は`setup`と16段階の`check`と15段階の`check-host`、公開条件の検査、CIとの同一性を説明する。
 第1章から第4章は境界、環境、ELFとGuest ABI、MiniBundleを、第12章はOCI imageとの差と拡張順の計画を扱う。
 
-## 拡張候補
+## 開発マイルストーン
 
-OCI対応は将来の拡張候補であり、採用する保存形式と実装順は未決定である。
-[第12章](../guide/12-oci-image-spec.md)では、配布形式への対応とLinuxアプリケーションの実行互換を区別している。
-ゲストのネットワーク機能と本番用途の分離は、現在の保証範囲に含まれない。
+以降の開発は、ローカル操作、イメージ配布、実行制御、互換性の順に進める。
+各マイルストーンのIssueはGitHubで管理し、このページには機能の境界と依存順を残す。
+期日は品質を下げる根拠にならないため、検証可能な完了条件を優先し、現時点では設定しない。
 
+### v0.2.0 Local Workflow
+
+v0.2.0では、既存のMiniBundleとQEMU実行方式を変えず、日常的なローカル操作を整える。
+
+1. `minictr doctor`でQEMU、kernel、store、必要なtoolを診断する。
+2. MiniBundleをfileからstoreへimportする。
+3. storeのMiniBundleをfileへexportする。
+4. blobを残したままtagだけを削除する`image remove`を追加する。
+5. 未参照blobを確認してから削除する`image prune`を追加する。
+6. 配布archiveの展開、導入、実行をCIのsmoke testで確認する。
+
+`image remove`と`image prune`を分ける理由は、tagの削除とcontent-addressed blobの削除では回復可能性が異なるためである。
+`image prune`は候補表示とdry-runを先に実装し、参照中のblobを削除しない検査をrelease gateへ追加する。
+
+### v0.3.0 OCI Distribution
+
+v0.3.0では、Linux application互換を追加せず、イメージの保存形式と配布だけをOCIへ接続する。
+
+1. MiniBundleとOCI Image Layoutの対応、digest、media type、architectureの扱いを設計する。
+2. storeのイメージをOCI Image Layoutへexportする。
+3. OCI Image LayoutからMiniBundleを構築してstoreへimportする。
+4. OCI registryからdigest指定で匿名pullする。
+5. ORASまたはSkopeoとの相互運用をfixtureとE2Eで確認する。
+
+OCI形式で配布できても、Docker向けLinux applicationをminiOSで実行できるわけではない。
+[第12章](../guide/12-oci-image-spec.md)で説明する二つの互換性を分けたまま実装する。
+
+### v0.4.0 Runtime Control
+
+v0.4.0では、一回の同期実行だけを扱うCLIから、実行中のguestを観測して制御できるランタイムへ進める。
+
+1. stdoutとstderrを上限付きで逐次表示する。
+2. 疑似TTYを使わないstdin転送を追加する。
+3. SIGINTとSIGTERMの転送、QEMU回収、一時領域の後始末を一つの契約へ揃える。
+4. QEMUのmemory量とvCPU数を公開CLIから指定できるようにする。
+5. 実行instanceの状態形式と`minictr ps`を設計する。
+6. 状態形式を利用して`run --detach`と`minictr stop`を追加する。
+
+逐次出力は現在の合計1 MiB上限を無効にせず、表示済みbyteを含む総量の扱いを先に決める。
+detached実行は所有者不明のQEMUを残さない状態形式と回収手順が決まってから実装する。
+
+### v1.0.0 Stable Learning Runtime
+
+v1.0.0では、学習用マイクロVMランタイムとして利用者が更新時の影響を判断できる公開契約を固定する。
+
+1. MiniBundle formatとGuest ABIの互換性、廃止、移行方針を定める。
+2. bundle parserとUART protocol decoderへfuzz testを追加する。
+3. 長時間実行、繰り返し起動、割り込み時のcleanupをstress testで確認する。
+4. release artifactへ検証可能なprovenanceを付与する。
+5. CLI、公開Rust API、脅威モデル、release gateを一括して監査する。
+
+v1.0.0はDocker互換や本番向けマルチテナント分離の宣言ではない。
+安定化する対象は、文書で公開したMiniBundle、Guest ABI、CLI、終了code、cleanupの契約である。
+
+## マイルストーン間の依存関係
+
+v0.2.0のimportとexportは、v0.3.0のOCI変換が利用するローカル入出力の境界になる。
+v0.4.0のinstance状態とdetached実行は、既存のprocess lifecycleとcleanupを維持できることを前提にする。
+v1.0.0の互換性方針は、それ以前の実装経験から安定させる契約を選ぶため、v0.2.0からv0.4.0より後に確定する。
+
+各Issueの実装では、依存Issueを本文へ明記し、focused test、crate gate、`cargo xtask check-host`、必要な実QEMU E2Eを完了条件に含める。
+
+## 将来候補
+
+miniOS側の設計と実装を伴うnetwork、永続volume、Linux application互換は、上記マイルストーンへ含めない。
+これらを開始するときは、MiniContainerだけで完結する変更とGuest ABIやkernelの変更を別Issueへ分ける。
+
+未信頼codeを扱うマルチテナント用途とguest escape防止の保証も、現在の延長として宣言しない。
 制約と保証しない範囲は[脅威モデル](threat-model.md)を参照する。
