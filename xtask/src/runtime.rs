@@ -2012,30 +2012,54 @@ mod tests {
         );
     }
 
+    // Catches test fixtures inheriting a developer's init.defaultBranch,
+    // which makes the harness behave differently across hosts.
+    #[test]
+    fn fixture_repository_uses_an_explicit_main_branch() {
+        let directory = TempDir::create("minictr-e2e-git-").expect("a scratch directory");
+        init_fixture_repository(directory.path());
+
+        let output = git_output(directory.path(), &["branch", "--show-current"])
+            .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "main");
+    }
+
+    // Catches fixture Git failures losing the command, status, or stderr
+    // needed to diagnose a host-specific test failure.
+    #[test]
+    fn git_fixture_failure_preserves_its_diagnostics() {
+        let directory = TempDir::create("minictr-e2e-git-").expect("a scratch directory");
+        let diagnostic = git_output(directory.path(), &["rev-parse", "HEAD"])
+            .expect_err("rev-parse outside a repository must fail");
+
+        assert!(diagnostic.contains("git [\"rev-parse\", \"HEAD\"] failed with status"));
+        assert!(diagnostic.contains("stdout:\n"));
+        let (_, stderr) = diagnostic
+            .split_once("stderr:\n")
+            .expect("diagnostic must label stderr");
+        assert!(!stderr.trim().is_empty(), "Git must explain the failure");
+    }
+
     // Catches building the E2E kernel from a dirty checkout, where local
     // modifications would silently replace the pinned source.
     #[test]
     fn dirty_checkout_is_reported() {
         let directory = TempDir::create("minictr-e2e-git-").expect("a scratch directory");
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(directory.path())
-                .status()
-                .expect("git must run");
-            assert!(status.success(), "git {args:?} must succeed");
-        };
-        git(&["init"]);
-        git(&[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=test",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "init",
-        ]);
+        init_fixture_repository(directory.path());
+        git(
+            directory.path(),
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
 
         verify_clean_checkout(directory.path()).expect("a clean checkout must pass");
 
@@ -2050,16 +2074,36 @@ mod tests {
     }
 
     fn git(current_dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
+        git_output(current_dir, args).unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
+    }
+
+    fn git_output(current_dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+        let output = std::process::Command::new("git")
             .args(args)
             .current_dir(current_dir)
-            .status()
-            .expect("git must run");
-        assert!(status.success(), "git {args:?} must succeed");
+            .output()
+            .map_err(|error| format!("could not run git {args:?}: {error}"))?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        Err(format!(
+            "git {args:?} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ))
+    }
+
+    fn init_fixture_repository(directory: &Path) {
+        git(directory, &["init", "--quiet"]);
+        git(directory, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 
     fn commit_fixture(directory: &Path, message: &str) -> String {
-        git(directory, &["init"]);
+        init_fixture_repository(directory);
         git(
             directory,
             &[
@@ -2068,6 +2112,7 @@ mod tests {
                 "-c",
                 "user.name=test",
                 "commit",
+                "--quiet",
                 "--allow-empty",
                 "-m",
                 message,
@@ -2077,12 +2122,8 @@ mod tests {
     }
 
     fn git_head(directory: &Path) -> String {
-        let output = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(directory)
-            .output()
-            .expect("git must run");
-        assert!(output.status.success(), "rev-parse must succeed");
+        let output = git_output(directory, &["rev-parse", "HEAD"])
+            .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
