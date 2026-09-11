@@ -55,57 +55,58 @@ E2Eの出力上限経路では、連打guestによる125終了、診断の一致
 以降の開発は、ローカル操作、イメージ配布、実行制御、互換性の順に進める。
 各マイルストーンのIssueはGitHubで管理し、このページには機能の境界と依存順を残す。
 期日は品質を下げる根拠にならないため、検証可能な完了条件を優先し、現時点では設定しない。
+[GitHub Roadmap Issue](https://github.com/kunihiko-t/minicontainer/issues/31)では、全マイルストーンの進捗を一覧できる。
 
-### v0.2.0 Local Workflow
+### [v0.2.0 Local Workflow](https://github.com/kunihiko-t/minicontainer/milestone/1)
 
 v0.2.0では、既存のMiniBundleとQEMU実行方式を変えず、日常的なローカル操作を整える。
 
-1. `minictr doctor`でQEMU、kernel、store、必要なtoolを診断する。
-2. MiniBundleをfileからstoreへimportする。
-3. storeのMiniBundleをfileへexportする。
-4. blobを残したままtagだけを削除する`image remove`を追加する。
-5. 未参照blobを確認してから削除する`image prune`を追加する。
-6. 配布archiveの展開、導入、実行をCIのsmoke testで確認する。
+1. [`feat(cli): add minictr doctor environment diagnostics`](https://github.com/kunihiko-t/minicontainer/issues/9)：`minictr doctor`でQEMU、kernel、store、必要なtoolを診断する。
+2. [`feat(bundle): import MiniBundle files into the local store`](https://github.com/kunihiko-t/minicontainer/issues/10)：MiniBundleをfileからstoreへimportする。
+3. [`feat(bundle): export stored images as MiniBundle files`](https://github.com/kunihiko-t/minicontainer/issues/11)：storeのMiniBundleをfileへexportする。
+4. [`feat(store): remove tags without deleting blobs`](https://github.com/kunihiko-t/minicontainer/issues/12)：blobを残したままtagだけを削除する`image remove`を追加する。
+5. [`feat(store): prune unreferenced blobs safely`](https://github.com/kunihiko-t/minicontainer/issues/13)：未参照blobを確認してから削除する`image prune`を追加する。
+6. [`ci: smoke-test release archive installation and execution`](https://github.com/kunihiko-t/minicontainer/issues/14)：配布archiveの展開、導入、実行をCIのsmoke testで確認する。
 
 `image remove`と`image prune`を分ける理由は、tagの削除とcontent-addressed blobの削除では回復可能性が異なるためである。
 `image prune`は候補表示とdry-runを先に実装し、参照中のblobを削除しない検査をrelease gateへ追加する。
 
-### v0.3.0 OCI Distribution
+### [v0.3.0 OCI Distribution](https://github.com/kunihiko-t/minicontainer/milestone/2)
 
 v0.3.0では、Linux application互換を追加せず、イメージの保存形式と配布だけをOCIへ接続する。
 
-1. MiniBundleとOCI Image Layoutの対応、digest、media type、architectureの扱いを設計する。
-2. storeのイメージをOCI Image Layoutへexportする。
-3. OCI Image LayoutからMiniBundleを構築してstoreへimportする。
-4. OCI registryからdigest指定で匿名pullする。
-5. ORASまたはSkopeoとの相互運用をfixtureとE2Eで確認する。
+1. [`docs(oci): define the MiniBundle and OCI Image Layout mapping`](https://github.com/kunihiko-t/minicontainer/issues/15)：MiniBundleとOCI Image Layoutの対応、digest、media type、architectureの扱いを設計する。
+2. [`feat(oci): export stored images as OCI Image Layout`](https://github.com/kunihiko-t/minicontainer/issues/16)：storeのイメージをOCI Image Layoutへexportする。
+3. [`feat(oci): import OCI Image Layout into the MiniBundle store`](https://github.com/kunihiko-t/minicontainer/issues/17)：OCI Image LayoutからMiniBundleを構築してstoreへimportする。
+4. [`feat(registry): pull anonymous images by digest`](https://github.com/kunihiko-t/minicontainer/issues/18)：OCI registryからdigest指定で匿名pullする。
+5. [`test(oci): verify ORAS and Skopeo interoperability`](https://github.com/kunihiko-t/minicontainer/issues/19)：ORASまたはSkopeoとの相互運用をfixtureとE2Eで確認する。
 
 OCI形式で配布できても、Docker向けLinux applicationをminiOSで実行できるわけではない。
 [第12章](../guide/12-oci-image-spec.md)で説明する二つの互換性を分けたまま実装する。
 
-### v0.4.0 Runtime Control
+### [v0.4.0 Runtime Control](https://github.com/kunihiko-t/minicontainer/milestone/3)
 
 v0.4.0では、一回の同期実行だけを扱うCLIから、実行中のguestを観測して制御できるランタイムへ進める。
 
-1. stdoutとstderrを上限付きで逐次表示する。
-2. 疑似TTYを使わないstdin転送を追加する。
-3. SIGINTとSIGTERMの転送、QEMU回収、一時領域の後始末を一つの契約へ揃える。
-4. QEMUのmemory量とvCPU数を公開CLIから指定できるようにする。
-5. 実行instanceの状態形式と`minictr ps`を設計する。
-6. 状態形式を利用して`run --detach`と`minictr stop`を追加する。
+1. [`feat(runtime): stream bounded stdout and stderr incrementally`](https://github.com/kunihiko-t/minicontainer/issues/20)：stdoutとstderrを上限付きで逐次表示する。
+2. [`feat(runtime): forward non-TTY stdin to the guest`](https://github.com/kunihiko-t/minicontainer/issues/21)：疑似TTYを使わないstdin転送を追加する。
+3. [`feat(runtime): unify signal forwarding and cleanup`](https://github.com/kunihiko-t/minicontainer/issues/22)：SIGINTとSIGTERMの転送、QEMU回収、一時領域の後始末を一つの契約へ揃える。
+4. [`feat(cli): configure QEMU memory and vCPU limits`](https://github.com/kunihiko-t/minicontainer/issues/23)：QEMUのmemory量とvCPU数を公開CLIから指定できるようにする。
+5. [`feat(runtime): persist instance state and add minictr ps`](https://github.com/kunihiko-t/minicontainer/issues/24)：実行instanceの状態形式と`minictr ps`を設計する。
+6. [`feat(runtime): add detached run and minictr stop`](https://github.com/kunihiko-t/minicontainer/issues/25)：状態形式を利用して`run --detach`と`minictr stop`を追加する。
 
 逐次出力は現在の合計1 MiB上限を無効にせず、表示済みbyteを含む総量の扱いを先に決める。
 detached実行は所有者不明のQEMUを残さない状態形式と回収手順が決まってから実装する。
 
-### v1.0.0 Stable Learning Runtime
+### [v1.0.0 Stable Learning Runtime](https://github.com/kunihiko-t/minicontainer/milestone/4)
 
 v1.0.0では、学習用マイクロVMランタイムとして利用者が更新時の影響を判断できる公開契約を固定する。
 
-1. MiniBundle formatとGuest ABIの互換性、廃止、移行方針を定める。
-2. bundle parserとUART protocol decoderへfuzz testを追加する。
-3. 長時間実行、繰り返し起動、割り込み時のcleanupをstress testで確認する。
-4. release artifactへ検証可能なprovenanceを付与する。
-5. CLI、公開Rust API、脅威モデル、release gateを一括して監査する。
+1. [`docs: define compatibility, deprecation, and migration policies`](https://github.com/kunihiko-t/minicontainer/issues/26)：MiniBundle formatとGuest ABIの互換性、廃止、移行方針を定める。
+2. [`test: fuzz MiniBundle and UART protocol parsers`](https://github.com/kunihiko-t/minicontainer/issues/27)：bundle parserとUART protocol decoderへfuzz testを追加する。
+3. [`test: stress long-running, repeated, and interrupted cleanup`](https://github.com/kunihiko-t/minicontainer/issues/28)：長時間実行、繰り返し起動、割り込み時のcleanupをstress testで確認する。
+4. [`ci: attach verifiable provenance to release artifacts`](https://github.com/kunihiko-t/minicontainer/issues/29)：release artifactへ検証可能なprovenanceを付与する。
+5. [`audit: finalize the public CLI, API, threat model, and release gates`](https://github.com/kunihiko-t/minicontainer/issues/30)：CLI、公開Rust API、脅威モデル、release gateを一括して監査する。
 
 v1.0.0はDocker互換や本番向けマルチテナント分離の宣言ではない。
 安定化する対象は、文書で公開したMiniBundle、Guest ABI、CLI、終了code、cleanupの契約である。
