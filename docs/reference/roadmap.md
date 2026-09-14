@@ -34,8 +34,8 @@ timeout、malformed-frame、出力上限、割り込みの失敗経路では非0
 ### 出力上限
 
 stdout、stderr、diagnosticsの合計蓄積量に1 MiBの上限を設け、超過は型付きerror（host error）としてrunを失敗させる。
-失敗時は蓄積済みの出力を転送しない。
-E2Eの出力上限経路では、連打guestによる125終了、診断の一致、QEMU回収、一時directory cleanupを確認する。
+上限は表示済みbyteも含めた合計であり、超過時は`RunOutcome`を返さない。
+E2Eの出力上限経路では、連打guestによる125終了、診断の一致、転送量の上限内、QEMU回収、一時directory cleanupを確認する。
 
 ### 配布
 

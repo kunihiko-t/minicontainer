@@ -187,7 +187,7 @@ MiniBundleの構築と検証、SHA-256ダイジェスト、manifestの制限、c
 UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
 QEMUバックエンドは固定した引数で起動し、通常の成功経路とエラー経路で子プロセスの回収と一時領域の削除を試みる。
 後始末の失敗もエラーとして返す。ホストの停止や`SIGKILL`、`SIGTERM`による強制終了では、後始末を実行できない場合がある。
-ゲスト出力はメモリーに蓄積し、実行完了後に表示する。stdout、stderr、診断の合計は1 MiBが上限であり、超過はホスト側の失敗として扱う。対話入力とリアルタイムの出力表示には対応していない。
+ゲスト出力はdecodeされ次第、標準出力と標準エラー出力へ区別して逐次表示する。stdout、stderr、診断の合計は表示済みも含めて1 MiBが上限であり、超過はホスト側の失敗として扱う。対話入力には対応していない。
 
 OCI互換はMiniBundle用artifactの配布形式（export、import、匿名pull）だけであり、Docker runtime互換とLinuxアプリケーション実行互換ではない。
 ネットワークはregistry pullのHTTPS clientだけであり、ゲストへの提供、永続ボリューム、マルチテナント分離は現在の機能ではない。

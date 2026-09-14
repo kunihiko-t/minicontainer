@@ -20,6 +20,17 @@ loopの先頭では毎回時計を見る。
 backendが期限過ぎの出力を返し続けても、全体の期限でrunはtimeoutする。
 この検査と`next_event`側の検査の二層で、出力量にかかわらず期限が効く。
 
+## 逐次転送
+
+`Runtime::run_with_sink`は、decode済み`SessionEvent`を`sink`へguest frameの順序どおり渡しながらrunする。
+stdoutとstderrのchunkは区別を保ったまま終了前に届くため、長い処理の進行を観測できる。
+転送しても`Session`の蓄積は変わらないため、1 MiB上限は表示済みbyteを含めた合計で効く。
+
+`sink.push`は同期呼び出しであり、遅いconsumerはevent loopへbackpressureをかける。
+ただし全体の期限は延びない。停滞から復帰したloopは先頭の時計検査でtimeoutし、通常の後始末でQEMUを回収する。
+consumerが`Err`を返したらrunは`RuntimeError::Consumer`で中断するが、QEMUの回収とpayload削除は行う。
+`Runtime::run`は転送しない旧来の振る舞いであり、出力は`RunOutcome`にだけ集まる。
+
 ## 終了とcleanup
 
 主結果が決まったら、`terminate_and_reap`を呼び、子プロセスの停止と回収を試みる。
@@ -37,7 +48,8 @@ backendが期限過ぎの出力を返し続けても、全体の期限でrunはt
 - bundle不正: QEMU起動前の拒否。
 - QEMU起動失敗: spawn error。
 - timeout: 全体の期限切れ。
-- 出力上限超過: stdout、stderr、diagnosticsの合計が1 MiBを超えた場合のhost拒否。
+- 出力上限超過: stdout、stderr、diagnosticsの合計が1 MiBを超えた場合のhost拒否。表示済みbyteも合計に含める。
+- consumer失敗: 逐次転送先の書き出し失敗。QEMU回収とpayload削除は行う。
 - guest failure: `GuestError` frame。
 - protocol破損: 不正header、truncated frame、payload上限超過。
 - applicationの非0終了: guestの終了codeをそのまま返す。

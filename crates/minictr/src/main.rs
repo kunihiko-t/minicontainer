@@ -5,7 +5,7 @@ mod cli;
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -14,7 +14,9 @@ use std::{
 use minicontainer_bundle::{
     ImageSpec, MAX_BUNDLE_LEN, Store, TagRecord, build, format_digest, parse, parse_digest,
 };
-use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, SystemProcessBackend};
+use minicontainer_runtime::{
+    OutputSink, RunOutcome, RunRequest, Runtime, RuntimeError, SessionEvent, SystemProcessBackend,
+};
 
 use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
@@ -408,13 +410,48 @@ impl From<minicontainer_bundle::BundleError> for ExportError {
 
 /// guest実行の境界。testではQEMUなしの偽装で差し替える。
 pub trait Runner {
-    /// bundleをQEMU上で実行してguest outcomeを返す。
+    /// bundleをQEMU上で実行し、guest出力を書き出しながらoutcomeを返す。
+    ///
+    /// guestのstdout chunkは`stdout`へ、stderr chunkは`stderr`へ、runの終了を
+    /// 待たず書き出す。書き出し失敗はrunを中断する型付きerrorとして返す。
     fn run(
         &self,
         bundle: &[u8],
         kernel: &Path,
         timeout: Duration,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError>;
+}
+
+/// guest出力をhostの標準入出力へ逐次転送するsink。
+struct CliSink<'a> {
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+}
+
+impl<'a> CliSink<'a> {
+    fn new(stdout: &'a mut dyn Write, stderr: &'a mut dyn Write) -> Self {
+        Self { stdout, stderr }
+    }
+}
+
+impl OutputSink for CliSink<'_> {
+    fn push(&mut self, event: &SessionEvent) -> io::Result<()> {
+        // pipe越しでも進行が見えるよう、chunkごとにflushする。診断と
+        // handshake・終了通知は表示せず、終了codeの写像は`execute`が行う。
+        match event {
+            SessionEvent::Stdout(bytes) => {
+                self.stdout.write_all(bytes)?;
+                self.stdout.flush()
+            }
+            SessionEvent::Stderr(bytes) => {
+                self.stderr.write_all(bytes)?;
+                self.stderr.flush()
+            }
+            SessionEvent::Ready | SessionEvent::Diagnostic(_) | SessionEvent::Exit(_) => Ok(()),
+        }
+    }
 }
 
 /// 実際のhost runtime。
@@ -428,6 +465,8 @@ impl Runner for RealRunner {
         bundle: &[u8],
         kernel: &Path,
         timeout: Duration,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError> {
         // run中のCtrl-CはQEMUにも届く。host側はsignalだけを無視して生存し、
         // runtimeの通常経路でQEMUをreapして一時payloadを削除する。捕捉する
@@ -441,11 +480,14 @@ impl Runner for RealRunner {
             );
         }
         let runtime = Runtime::new(SystemProcessBackend::new());
-        runtime.run(RunRequest {
-            bundle,
-            kernel,
-            deadline: timeout,
-        })
+        runtime.run_with_sink(
+            RunRequest {
+                bundle,
+                kernel,
+                deadline: timeout,
+            },
+            &mut CliSink::new(stdout, stderr),
+        )
     }
 }
 
@@ -1322,21 +1364,15 @@ pub fn execute(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let outcome = match runner.run(bundle, kernel, timeout) {
+    // Guest bytes are already streamed to stdout and stderr while the run
+    // is in progress; only the exit code mapping and the final flush remain.
+    let outcome = match runner.run(bundle, kernel, timeout, stdout, stderr) {
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = writeln!(stderr, "minictr: {error}");
             return RUNTIME_EXIT;
         }
     };
-    if let Err(error) = stdout.write_all(&outcome.stdout) {
-        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
-        return RUNTIME_EXIT;
-    }
-    if let Err(error) = stderr.write_all(&outcome.stderr) {
-        let _ = writeln!(stderr, "minictr: failed to write stderr: {error}");
-        return RUNTIME_EXIT;
-    }
     // `main` ends with `process::exit`, which skips destructors, so buffered
     // standard streams must be flushed explicitly before reporting success.
     if let Err(error) = stdout.flush() {
@@ -1414,8 +1450,20 @@ mod tests {
             _bundle: &[u8],
             _kernel: &Path,
             _timeout: Duration,
+            stdout: &mut dyn Write,
+            stderr: &mut dyn Write,
         ) -> Result<RunOutcome, RuntimeError> {
-            self.results.borrow_mut().pop_front().expect("one run")
+            let outcome = self.results.borrow_mut().pop_front().expect("one run")?;
+            // Simulates the streaming RealRunner: guest bytes reach the host
+            // writers during the run, and a broken pipe aborts it as a
+            // consumer failure.
+            stdout
+                .write_all(&outcome.stdout)
+                .map_err(RuntimeError::Consumer)?;
+            stderr
+                .write_all(&outcome.stderr)
+                .map_err(RuntimeError::Consumer)?;
+            Ok(outcome)
         }
     }
 
@@ -1779,7 +1827,11 @@ mod tests {
         );
 
         assert_eq!(code, RUNTIME_EXIT);
-        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("output consumer failed"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
     }
 
     // Catches ignoring a broken host stderr pipe and exiting zero.
@@ -1853,6 +1905,86 @@ mod tests {
 
         assert_eq!(code, RUNTIME_EXIT);
         assert_eq!(stdout, b"");
+    }
+
+    /// Exposes written bytes only through an explicit flush, like a piped
+    /// standard stream observed from the reader side.
+    struct FlushGatedWriter {
+        buffered: Vec<u8>,
+        visible: Vec<u8>,
+    }
+
+    impl FlushGatedWriter {
+        fn new() -> Self {
+            Self {
+                buffered: Vec::new(),
+                visible: Vec::new(),
+            }
+        }
+
+        fn visible(&self) -> &[u8] {
+            &self.visible
+        }
+    }
+
+    impl Write for FlushGatedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffered.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.visible
+                .extend_from_slice(std::mem::take(&mut self.buffered).as_slice());
+            Ok(())
+        }
+    }
+
+    // Catches routing guest bytes to the wrong host stream: stdout chunks go
+    // to stdout, stderr chunks to stderr, and protocol events are ignored.
+    #[test]
+    fn cli_sink_forwards_each_chunk_to_its_own_stream() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        {
+            let mut sink = CliSink::new(&mut stdout, &mut stderr);
+            sink.push(&SessionEvent::Ready).unwrap();
+            sink.push(&SessionEvent::Stdout(b"out\n".to_vec())).unwrap();
+            sink.push(&SessionEvent::Diagnostic(b"diag".to_vec()))
+                .unwrap();
+            sink.push(&SessionEvent::Stderr(b"err\n".to_vec())).unwrap();
+            sink.push(&SessionEvent::Exit(0)).unwrap();
+        }
+
+        assert_eq!(stdout, b"out\n");
+        assert_eq!(stderr, b"err\n");
+    }
+
+    // Catches holding a chunk past the guest's next frame when piped: each
+    // chunk is flushed before push returns, so progress stays observable.
+    #[test]
+    fn cli_sink_flushes_each_chunk_before_push_returns() {
+        let mut stdout = FlushGatedWriter::new();
+        let mut stderr = Vec::new();
+        {
+            let mut sink = CliSink::new(&mut stdout, &mut stderr);
+            sink.push(&SessionEvent::Stdout(b"no newline yet".to_vec()))
+                .unwrap();
+            assert_eq!(stdout.visible(), b"no newline yet");
+        }
+    }
+
+    // Catches swallowing a broken pipe mid-run: the write error propagates so
+    // the runtime aborts with a typed consumer failure.
+    #[test]
+    fn cli_sink_propagates_a_mid_run_write_failure() {
+        let mut stdout = FailingWriter {
+            message: "pipe gone",
+        };
+        let mut stderr = Vec::new();
+        let mut sink = CliSink::new(&mut stdout, &mut stderr);
+
+        assert!(sink.push(&SessionEvent::Stdout(b"out".to_vec())).is_err());
     }
 
     // Catches reporting a store failure as usage or as a guest exit.
