@@ -1,7 +1,8 @@
-# v0.1.0配布手順
+# 配布手順
 
-`v0.1.0`タグのpushを契機に、macOS arm64用とLinux x86_64用の配布アーカイブを構築する。
-配布物はworkflow artifactとして保存し、GitHub Releaseの作成、署名、notarizationは行わない。
+`v*`タグのpushを契機に、macOS arm64用とLinux x86_64用の配布アーカイブを構築し、GitHub Releaseへ添付する。
+各アーカイブとchecksumには、GitHub artifact attestationによる署名済みprovenanceを付ける。
+notarizationは行わない。
 
 ## tag前の検証
 
@@ -15,20 +16,21 @@ cargo xtask check
 
 Ubuntu CIの`check`とmacOS CIの`check-host`も同じcommitで成功させる。
 Ubuntu CIは配布archiveのsmokeも実行するため、その成功も確認する。
-tag、Cargo package version、archive名のversionは`0.1.0`で一致させる。
+tag、Cargo package version、archive名のversionは一致させる。
 
 ## 配布内容
 
 matrixは`macos-15`と`ubuntu-24.04`であり、成果物名のtargetは`aarch64-apple-darwin`と`x86_64-unknown-linux-gnu`である。
-archiveは`cargo xtask dist`がbuildする。各jobは次の二つのfileをuploadする。
+`<version>`はtag名 (`v0.2.0`など) そのままである。
+archiveは`cargo xtask dist`が`--version`へtag名を渡してbuildする。各jobは次の二つのfileを作り、tagのReleaseへassetとして添付する。
 
-- `minicontainer-0.1.0-<target>.tar.gz`
-- `minicontainer-0.1.0-<target>.tar.gz.sha256`
+- `minicontainer-<version>-<target>.tar.gz`
+- `minicontainer-<version>-<target>.tar.gz.sha256`
 
 archiveを展開すると次の配置になる。
 
 ```text
-minicontainer-0.1.0-<target>/
+minicontainer-<version>-<target>/
   minictr
   kernel/minios.bin
   LICENSE-MIT
@@ -43,25 +45,41 @@ minicontainer-0.1.0-<target>/
 `MANIFEST.txt`はarchive version、target、各fileのmodeとSHA-256を記録する。
 `SHA256SUMS`は`sha256sum -c`形式でpayloadと`MANIFEST.txt`を検査できる。
 
-archive versionは既定でxtaskのCargo package versionになる。
-公開gateはxtaskと`minictr`のversion一致、release workflowの`cargo xtask dist`使用、Cargo versionに対応するarchive名のuploadを検査する。
+公開gateはxtaskと`minictr`のversion一致、release workflowの`cargo xtask dist`使用とtagからのversion受け渡し、attestationとasset添付の設定を検査する。
 `dist`は`tar`や`sha256sum`を使わずRust toolchainだけでarchiveを組み立て、完成品を読み戻して検証してから成功を報告する。
 
-## checksumの確認
+## workflow権限
+
+workflow全体の既定権限は`contents: read`であり、書き込みはjobごとに最小限だけ付与する。
+`build-archives`はprovenance生成のため`attestations: write`と`id-token: write`だけを持ち、`publish-release`はRelease作成のため`contents: write`だけを持つ。
+triggerはtag pushのみであり、forkやpull requestからrelease権限を得る経路はない。
+使うactionはfull commit SHAでpinし、公開前検証のworkflow policy testがtrigger、権限、pin、attestation設定を検査する。
+
+## checksumとprovenanceの確認
 
 checksum fileは`<hash>  <file名>`の一行である。
 Linuxでは`sha256sum`、macOSでは`shasum`で確認する。
 
 ```sh
-sha256sum -c minicontainer-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-shasum -a 256 -c minicontainer-0.1.0-aarch64-apple-darwin.tar.gz.sha256
+sha256sum -c 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256'
+shasum -a 256 -c 'minicontainer-<version>-aarch64-apple-darwin.tar.gz.sha256'
 ```
 
 展開後はarchive内の`SHA256SUMS`でも内容を検査できる。
 
 ```sh
-(cd minicontainer-0.1.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS)
+(cd minicontainer-<version>-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS)
 ```
+
+次に、artifactがこのrepositoryのrelease workflowから生成されたことを、GitHub CLIで検証する。
+
+```sh
+gh attestation verify 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz' --owner kunihiko-t
+gh attestation verify 'minicontainer-<version>-aarch64-apple-darwin.tar.gz' --owner kunihiko-t
+```
+
+checksumはfileの完全性だけを示し、生成元の証明にはならない。
+配布物の出所を確認する場合は、必ずattestationの検証まで行う。
 
 ## 導入と実行
 
@@ -79,8 +97,7 @@ archiveには同梱ゲスト例のsourceを含まないため、利用者が用�
 
 ## 未対応事項
 
-- GitHub Releaseの作成と配布物の添付は行わない。
-- 署名、notarization、Homebrew formulaは用意しない。
+- 署名、notarization、Homebrew formulaは用意しない。配布物の真正性はattestationで確認する。
 - Windows用とLinux arm64用のarchiveは作らない。
 - 配布archive自体の再現可能build (bit一致) は保証しない。
 - archiveにREADMEや導入手順書は含まない。導入手順はこの文書が正である。

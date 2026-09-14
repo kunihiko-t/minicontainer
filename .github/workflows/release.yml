@@ -3,13 +3,16 @@ name: release
 on:
   push:
     tags:
-      - v0.1.0
+      - 'v*'
 
 permissions:
   contents: read
 
 jobs:
   build-archives:
+    permissions:
+      attestations: write
+      id-token: write
     strategy:
       matrix:
         include:
@@ -34,14 +37,51 @@ jobs:
           git -C minios checkout --detach 9be99255a59d58d19db25b835af0e28a8d2a4036
           cargo build --manifest-path minios/Cargo.toml --target-dir minios/target -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --release --locked
       - name: Build distribution archive
-        run: cargo xtask dist --target ${{ matrix.target }} --minictr target/release/minictr --kernel minios/target/riscv64gc-unknown-none-elf/release/minios-kernel --output dist
+        run: cargo xtask dist --target ${{ matrix.target }} --minictr target/release/minictr --kernel minios/target/riscv64gc-unknown-none-elf/release/minios-kernel --version ${{ github.ref_name }} --output dist
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/minicontainer-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            dist/minicontainer-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
       - name: Upload archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: dist/minicontainer-0.1.0-${{ matrix.target }}.tar.gz
+          name: minicontainer-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/minicontainer-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
           archive: false
       - name: Upload checksum
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: dist/minicontainer-0.1.0-${{ matrix.target }}.tar.gz.sha256
+          name: minicontainer-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/minicontainer-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
           archive: false
+
+  publish-release:
+    needs: build-archives
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          VERSION="${{ github.ref_name }}"
+          NOTES="$(mktemp)"
+          cat > "$NOTES" <<EOF
+          MiniContainer $VERSION distribution archives.
+
+          Built from commit ${{ github.sha }} by the release workflow.
+          Verify the checksum, then the build provenance:
+
+              sha256sum -c 'minicontainer-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256'
+              gh attestation verify 'minicontainer-$VERSION-x86_64-unknown-linux-gnu.tar.gz' --owner kunihiko-t
+          EOF
+          gh release create "$VERSION" --title "MiniContainer $VERSION" --notes-file "$NOTES" \
+            dist/*/*.tar.gz dist/*/*.tar.gz.sha256

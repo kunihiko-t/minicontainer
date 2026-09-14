@@ -217,10 +217,17 @@ E2Eは固定リビジョンのminiOSカーネルをビルドし、同梱ゲス�
 
 ## 配布物
 
-`v0.1.0`タグのpushで、`minicontainer-0.1.0-aarch64-apple-darwin.tar.gz`と`minicontainer-0.1.0-x86_64-unknown-linux-gnu.tar.gz`を`cargo xtask dist`で構築する。
+`v*`タグのpushで、`minicontainer-<version>-aarch64-apple-darwin.tar.gz`と`minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz`を`cargo xtask dist`で構築し、tagのGitHub Releaseへ添付する。
 archiveは`minictr`、固定revisionのminiOS kernel、ライセンス、`MANIFEST.txt`、`SHA256SUMS`を含む。
 展開後は`minictr run --kernel kernel/minios.bin`の形で実行する。
-詳細は[v0.1.0配布手順](docs/reference/releasing.md)を参照する。
+詳細は[配布手順](docs/reference/releasing.md)を参照する。
+
+導入前に、checksumとbuild provenanceを確認する。
+
+```sh
+sha256sum -c 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256'
+gh attestation verify 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz' --owner kunihiko-t
+```
 
 ## 教材
 
