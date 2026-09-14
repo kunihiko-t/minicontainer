@@ -40,6 +40,28 @@ jobs:
           fi
           grep -q "store: fail" /tmp/doctor-smoke/fail.txt
           test ! -e /tmp/doctor-smoke/missing
+      - name: Smoke-test release archive
+        run: |
+          set -eu
+          cargo build -p minictr --release --locked
+          git clone https://github.com/kunihiko-t/minios.git /tmp/release-smoke/minios
+          git -C /tmp/release-smoke/minios checkout --detach 9be99255a59d58d19db25b835af0e28a8d2a4036
+          cargo build --manifest-path /tmp/release-smoke/minios/Cargo.toml --target-dir /tmp/release-smoke/minios/target -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --release --locked
+          cargo xtask dist --target x86_64-unknown-linux-gnu --minictr target/release/minictr --kernel /tmp/release-smoke/minios/target/riscv64gc-unknown-none-elf/release/minios-kernel --output /tmp/release-smoke/dist
+          (cd /tmp/release-smoke/dist && sha256sum -c ./*.sha256)
+          mkdir -p /tmp/release-smoke/extract
+          tar xzf /tmp/release-smoke/dist/*.tar.gz -C /tmp/release-smoke/extract
+          SMOKE_DIR=$(echo /tmp/release-smoke/extract/minicontainer-*-x86_64-unknown-linux-gnu)
+          (cd "$SMOKE_DIR" && sha256sum -c SHA256SUMS)
+          test -x "$SMOKE_DIR/minictr"
+          "$SMOKE_DIR/minictr" --version | grep -q "minictr 0.1.0"
+          "$SMOKE_DIR/minictr" image build --store /tmp/release-smoke/store hello target/guest-hello/riscv64gc-unknown-none-elf/release/guest-hello
+          set +e
+          "$SMOKE_DIR/minictr" run --store /tmp/release-smoke/store --kernel "$SMOKE_DIR/kernel/minios.bin" hello > /tmp/release-smoke/guest.txt 2> /tmp/release-smoke/guest.err
+          status=$?
+          set -e
+          test "$status" -eq 42
+          grep -q "hello from guest" /tmp/release-smoke/guest.txt
   check-macos:
     runs-on: macos-15
     steps:

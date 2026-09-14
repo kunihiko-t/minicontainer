@@ -55,6 +55,17 @@ guest stderrのbytes自体にも`minictr:`は付かない。
 - `store: fail ... is not a directory`はstore pathの指定誤りである。directoryを`--store`で渡す。
 - `cannot stat`はpath自体を読めない。権限とpathの綴りを確認する。
 
+## distの失敗と対処
+
+`cargo xtask dist`は入力の読み取り、archiveの組み立て、完成品の読み戻し検証の順に進み、失敗は終了code 1で標準エラー出力の一行に出る。
+
+- `dist input minictr not found`と`dist input kernel not found`は入力fileの不在である。`--minictr`と`--kernel`のpathを確認する。
+- `dist input license not found`はworkspace直下の`LICENSE-MIT`か`LICENSE-APACHE`の不在である。配布には両方が必須のため、削除せず復元する。
+- `dist input ... is not a regular file`はdirectoryやdeviceの指定である。通常fileを渡す。
+- `dist version is invalid`と`dist target is invalid`は`--version`と`--target`の綴りである。ASCIIの英数字と`.+_-`だけを使い、空や`.`や`..`を避ける。
+- `dist archive verification failed`は完成品の自己検証の失敗である。`dist`内部の不具合を示すため、入力ではなく実装を疑う。
+- `minictr version ... must match the xtask version`は公開gateのversion不一致である。`crates/minictr/Cargo.toml`と`xtask/Cargo.toml`のversionを揃える。
+
 ## timeoutの二層強制
 
 全体の期限は`--timeout-ms`で与え、既定値は5000である。
