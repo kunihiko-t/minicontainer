@@ -27,6 +27,19 @@ jobs:
           cache-bin: false
       - run: cargo xtask setup
       - run: cargo xtask check
+      - name: Smoke-test minictr doctor
+        run: |
+          set -eu
+          mkdir -p /tmp/doctor-smoke/store
+          printf 'KERNEL' > /tmp/doctor-smoke/kernel
+          ./target/debug/minictr doctor --store /tmp/doctor-smoke/store --kernel /tmp/doctor-smoke/kernel > /tmp/doctor-smoke/report.txt
+          grep -q "summary: passed 3/3 checks" /tmp/doctor-smoke/report.txt
+          if ./target/debug/minictr doctor --store /tmp/doctor-smoke/missing --kernel /tmp/doctor-smoke/missing > /tmp/doctor-smoke/fail.txt 2>&1; then
+            echo "doctor must exit 1 for missing paths"
+            exit 1
+          fi
+          grep -q "store: fail" /tmp/doctor-smoke/fail.txt
+          test ! -e /tmp/doctor-smoke/missing
   check-macos:
     runs-on: macos-15
     steps:
@@ -43,3 +56,15 @@ jobs:
         with:
           cache-bin: false
       - run: cargo xtask check-host
+      - name: Smoke-test minictr doctor failures
+        run: |
+          set -eu
+          mkdir -p /tmp/doctor-smoke/store
+          printf 'KERNEL' > /tmp/doctor-smoke/kernel
+          if ./target/debug/minictr doctor --store /tmp/doctor-smoke/missing --kernel /tmp/doctor-smoke/kernel > /tmp/doctor-smoke/fail.txt 2>&1; then
+            echo "doctor must exit 1 for a missing store"
+            exit 1
+          fi
+          grep -q "store: fail" /tmp/doctor-smoke/fail.txt
+          grep -q "kernel: ok" /tmp/doctor-smoke/fail.txt
+          test ! -e /tmp/doctor-smoke/missing

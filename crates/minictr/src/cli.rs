@@ -20,6 +20,8 @@ pub enum Command {
     Version,
     /// MiniBundleを一つのQEMU仮想machineで実行する。
     Run(RunArgs),
+    /// host環境を実行前に診断する。
+    Doctor(DoctorArgs),
     /// imageのbuildなどstore内容を操作する。
     Image(ImageCommand),
 }
@@ -75,6 +77,24 @@ pub struct RunArgs {
     pub kernel: Option<PathBuf>,
     /// UART control eventを待つ全体の期限。
     pub timeout: Duration,
+}
+
+/// `doctor` commandの型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorArgs {
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
+    /// `--kernel`の指定値。`None`なら環境とHOMEから解決する。
+    pub kernel: Option<PathBuf>,
+}
+
+/// `doctor`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDoctor {
+    /// bundle storeのroot。
+    pub store: PathBuf,
+    /// miniOS kernelのpath。
+    pub kernel: PathBuf,
 }
 
 /// `run`に必要な不変入力を解決した結果。
@@ -195,7 +215,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
+    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
 }
 
 /// OS引数からcommandをparseする。
@@ -207,6 +227,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         "help" | "--help" => return parse_bare_command(arguments, Command::Help),
         "--version" => return parse_bare_command(arguments, Command::Version),
         "run" => {}
+        "doctor" => return parse_doctor(arguments),
         "image" => {
             let subcommand = arguments.next().ok_or(CliError::MissingCommand)?;
             let subcommand = subcommand
@@ -446,6 +467,54 @@ fn parse_image_inspect(arguments: impl IntoIterator<Item = OsString>) -> Result<
     })))
 }
 
+/// `doctor`の引数をparseする。`--store`と`--kernel`だけを取り、
+/// positionalは取らない。
+fn parse_doctor(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut store: Option<PathBuf> = None;
+    let mut kernel: Option<PathBuf> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                "--kernel" => {
+                    if kernel.is_some() {
+                        return Err(CliError::DuplicateOption("--kernel"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--kernel"))?,
+                    };
+                    kernel = Some(PathBuf::from(value));
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        return Err(CliError::UnexpectedArgument(text));
+    }
+
+    Ok(Command::Doctor(DoctorArgs { store, kernel }))
+}
+
 /// 引数を取らないcommandを確定する。後続のtokenは、optionの形でも
 /// 受け付けず、打ち間違いとして型付きerrorにする。
 fn parse_bare_command(
@@ -523,6 +592,26 @@ pub fn resolve(args: &RunArgs, env: &dyn Environ) -> Result<ResolvedRun, CliErro
         kernel,
         timeout: args.timeout,
     })
+}
+
+/// parse済み`doctor`引数と環境から診断対象pathを解決する。
+/// `run`と同じ優先順位で解決し、環境は変更しない。
+pub fn resolve_doctor(args: &DoctorArgs, env: &dyn Environ) -> Result<ResolvedDoctor, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    let kernel = match &args.kernel {
+        Some(path) => path.clone(),
+        None => match env.kernel_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_kernel_path(env)?,
+        },
+    };
+    Ok(ResolvedDoctor { store, kernel })
 }
 
 /// parse済み`image build`引数と環境からstore pathを解決する。
@@ -943,7 +1032,137 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
+            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
+        );
+    }
+
+    // Catches rejecting a bare `doctor`: both paths resolve later from
+    // options, environment, or HOME.
+    #[test]
+    fn parses_doctor_with_defaults() {
+        assert_eq!(
+            parse(["doctor"]),
+            Ok(Command::Doctor(DoctorArgs {
+                store: None,
+                kernel: None,
+            }))
+        );
+    }
+
+    // Catches rejecting a valid doctor option order or `--opt=value` form.
+    #[test]
+    fn parses_doctor_options_in_any_order() {
+        let expected = Command::Doctor(DoctorArgs {
+            store: Some(PathBuf::from("/cli/store")),
+            kernel: Some(PathBuf::from("/cli/kernel")),
+        });
+
+        assert_eq!(
+            parse(["doctor", "--store", "/cli/store", "--kernel", "/cli/kernel"]),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            parse(["doctor", "--kernel=/cli/kernel", "--store=/cli/store"]),
+            Ok(expected)
+        );
+    }
+
+    // Catches accepting malformed doctor options or positionals.
+    #[test]
+    fn rejects_invalid_doctor_arguments() {
+        assert_eq!(
+            parse(["doctor", "--store", "/a", "--store", "/b"]),
+            Err(CliError::DuplicateOption("--store"))
+        );
+        assert_eq!(
+            parse(["doctor", "--kernel", "/a", "--kernel", "/b"]),
+            Err(CliError::DuplicateOption("--kernel"))
+        );
+        assert_eq!(
+            parse(["doctor", "--store"]),
+            Err(CliError::MissingValue("--store"))
+        );
+        assert_eq!(
+            parse(["doctor", "--kernel"]),
+            Err(CliError::MissingValue("--kernel"))
+        );
+        assert_eq!(
+            parse(["doctor", "--timeout-ms", "5"]),
+            Err(CliError::UnknownOption("--timeout-ms".to_owned()))
+        );
+        assert_eq!(
+            parse(["doctor", "hello"]),
+            Err(CliError::UnexpectedArgument("hello".to_owned()))
+        );
+    }
+
+    // Catches decoding doctor path values: option values stay opaque OS
+    // paths while option names must remain UTF-8.
+    #[test]
+    fn keeps_non_utf8_doctor_paths_as_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0xff]);
+        assert_eq!(
+            parse_os([
+                OsString::from("doctor"),
+                OsString::from("--store"),
+                raw.clone(),
+                OsString::from("--kernel"),
+                raw.clone(),
+            ]),
+            Ok(Command::Doctor(DoctorArgs {
+                store: Some(PathBuf::from(raw.clone())),
+                kernel: Some(PathBuf::from(raw)),
+            }))
+        );
+    }
+
+    // Catches resolving doctor paths out of order: explicit options win
+    // over the environment, which wins over the HOME defaults.
+    #[test]
+    fn resolves_doctor_paths_like_run() {
+        let explicit = DoctorArgs {
+            store: Some(PathBuf::from("/cli/store")),
+            kernel: Some(PathBuf::from("/cli/kernel")),
+        };
+        let env = FakeEnv {
+            store: Some(OsString::from("/env/store")),
+            kernel: Some(OsString::from("/env/kernel")),
+            home: Some(OsString::from("/home/test")),
+        };
+        let resolved = resolve_doctor(&explicit, &env).unwrap();
+        assert_eq!(resolved.store, PathBuf::from("/cli/store"));
+        assert_eq!(resolved.kernel, PathBuf::from("/cli/kernel"));
+
+        let implied = DoctorArgs {
+            store: None,
+            kernel: None,
+        };
+        let resolved = resolve_doctor(&implied, &env).unwrap();
+        assert_eq!(resolved.store, PathBuf::from("/env/store"));
+        assert_eq!(resolved.kernel, PathBuf::from("/env/kernel"));
+
+        let home_only = FakeEnv {
+            store: None,
+            kernel: None,
+            home: Some(OsString::from("/home/test")),
+        };
+        let resolved = resolve_doctor(&implied, &home_only).unwrap();
+        assert_eq!(resolved.store, PathBuf::from("/home/test/.minicontainer"));
+        assert_eq!(
+            resolved.kernel,
+            PathBuf::from("/home/test/.minicontainer/minios-kernel")
+        );
+
+        let homeless = FakeEnv {
+            store: None,
+            kernel: None,
+            home: None,
+        };
+        assert_eq!(
+            resolve_doctor(&implied, &homeless),
+            Err(CliError::MissingHome)
         );
     }
 

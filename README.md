@@ -89,6 +89,22 @@ args: 0
 elf-bytes: <ゲストELFのbyte数>
 ```
 
+実行前に`doctor`で環境を確認する。`run`と同じ`--store`と`--kernel`を渡す。
+
+```sh
+cargo run -p minictr --locked -- doctor --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel"
+```
+
+```text
+qemu: ok qemu-system-riscv64 <8.2.0以上>
+kernel: ok <kernelのpath> (<byte数> bytes)
+store: ok <storeのpath>
+summary: passed 3/3 checks
+```
+
+全検査の成功で終了コード0、一つでも失敗したら`fail`行をすべて出して終了コード1になる。
+診断は環境を変更しない。失敗行の`fix:`に従って直してから実行する。
+
 最後に`minictr run`で実行する。
 
 ```sh
@@ -113,11 +129,12 @@ exit=42
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
 構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
+usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
@@ -129,6 +146,7 @@ usage: minictr image inspect [--store PATH] IMAGE
 `image build`は静的RISC-V 64 ELFからMiniBundleを構築し、指定したタグでローカルストアへ登録する。
 成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
 `image list`はタグの一覧、`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
+`doctor`はQEMUのversion、kernel file、store rootを診断し、各検査の`ok`または`fail`と`summary`の4行を標準出力へ出す。全検査の成功で終了コード0、一つでも失敗したら終了コード1になり、診断自体は環境を変更しない。
 
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。
