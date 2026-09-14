@@ -5,7 +5,7 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
@@ -15,6 +15,7 @@ usage: minictr image import [--store PATH] IMAGE FILE
 usage: minictr image export [--store PATH] IMAGE --output PATH
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
+usage: minictr image remove [--store PATH] IMAGE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -38,13 +39,14 @@ FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う�
 `--output`の値は`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
+`image remove`もIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
 `doctor`はpositionalを取らず、`--store`と`--kernel`だけを一度ずつ指定できる。
 
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
-`image build`、`image import`、`image export`、`image list`、`image inspect`のstore解決も同じ順序を使う。
+`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`のstore解決も同じ順序を使う。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
 
 ## imageの登録
@@ -136,6 +138,19 @@ summary: passed 3/3 checks
 非UTF-8のpathは置換文字で表示し、改行を含むpathはescapeして一行を保つ。
 失敗行の読み方は第10章を参照する。
 
+## imageの削除
+
+`image remove`は、指定したtagだけを削除し、blobと他のtagを保持する。
+成功すると次のようにtagと結果の一行だけを標準出力へ出す。
+
+```text
+myapp removed
+```
+
+存在しないtagは型付きerrorで失敗する。tag fileの内容は検証せず、壊れたtagも削除できる。
+tag名の文法検査、symlinkと非fileの拒否、store外への到達検査を経てからunlinkするため、store外のpathへは到達しない。
+blobの削除は対象外であり、未参照blobの掃除は`image prune`で行う。
+
 ## 実行と入出力
 
 解決したimage tagはcontent-addressed storeから検証済みbundle bytesとして取り出す。
@@ -161,6 +176,7 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、
 `image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
 `doctor`は全検査の成功で終了code 0、一つでも失敗したら終了code 1になる。
 `doctor`のparse失敗と既定値解決失敗は終了code 2、出力失敗は終了code 125になる。
+`image remove`では、tag不在とstore失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
 
 ## 失敗の調べ方
 

@@ -39,6 +39,8 @@ pub enum ImageCommand {
     List(ImageListArgs),
     /// 一つのtagのmanifestを確認する。
     Inspect(ImageInspectArgs),
+    /// 一つのtagだけを削除する。
+    Remove(ImageRemoveArgs),
 }
 
 /// `image build`の型付き引数。
@@ -87,6 +89,15 @@ pub struct ImageListArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInspectArgs {
     /// store内で解決するimage tag。
+    pub image: String,
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
+}
+
+/// `image remove`の型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRemoveArgs {
+    /// store内で削除するimage tag。
     pub image: String,
     /// `--store`の指定値。`None`なら環境とHOMEから解決する。
     pub store: Option<PathBuf>,
@@ -187,6 +198,15 @@ pub struct ResolvedInspect {
     pub store: PathBuf,
 }
 
+/// `image remove`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRemove {
+    /// store内で削除するimage tag。
+    pub image: String,
+    /// bundle storeのroot。
+    pub store: PathBuf,
+}
+
 /// command parseまたは既定path解決が失敗した理由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -210,6 +230,8 @@ pub enum CliError {
     MissingOutput,
     /// `image inspect`にimageが与えられなかった。
     MissingInspectImage,
+    /// `image remove`にimageが与えられなかった。
+    MissingRemoveImage,
     /// 余分なpositional引数。
     UnexpectedArgument(String),
     /// 対応していないoption。
@@ -251,6 +273,9 @@ impl fmt::Display for CliError {
             Self::MissingInspectImage => {
                 formatter.write_str("missing image for `minictr image inspect`")
             }
+            Self::MissingRemoveImage => {
+                formatter.write_str("missing image for `minictr image remove`")
+            }
             Self::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected minictr argument: {argument}")
             }
@@ -279,7 +304,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
+    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE"
 }
 
 /// OS引数からcommandをparseする。
@@ -303,6 +328,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
                 "export" => return parse_image_export(arguments),
                 "list" => return parse_image_list(arguments),
                 "inspect" => return parse_image_inspect(arguments),
+                "remove" => return parse_image_remove(arguments),
                 unknown => return Err(CliError::UnknownCommand(unknown.to_owned())),
             }
         }
@@ -701,6 +727,53 @@ fn parse_doctor(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
     Ok(Command::Doctor(DoctorArgs { store, kernel }))
 }
 
+/// `image remove`の引数をparseする。`inspect`と同じくIMAGEを一つ取り、
+/// `--store`を前後どこに置いてもよい。
+fn parse_image_remove(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut image: Option<String> = None;
+    let mut store: Option<PathBuf> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        if image.is_some() {
+            return Err(CliError::UnexpectedArgument(text));
+        }
+        image = Some(text);
+    }
+
+    let Some(image) = image else {
+        return Err(CliError::MissingRemoveImage);
+    };
+    Ok(Command::Image(ImageCommand::Remove(ImageRemoveArgs {
+        image,
+        store,
+    })))
+}
+
 /// 引数を取らないcommandを確定する。後続のtokenは、optionの形でも
 /// 受け付けず、打ち間違いとして型付きerrorにする。
 fn parse_bare_command(
@@ -880,6 +953,24 @@ pub fn resolve_inspect(
         },
     };
     Ok(ResolvedInspect {
+        image: args.image.clone(),
+        store,
+    })
+}
+
+/// parse済み`image remove`引数と環境からstore pathを解決する。
+pub fn resolve_remove(
+    args: &ImageRemoveArgs,
+    env: &dyn Environ,
+) -> Result<ResolvedRemove, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedRemove {
         image: args.image.clone(),
         store,
     })
@@ -1256,7 +1347,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
+            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE"
         );
     }
 
@@ -2121,5 +2212,111 @@ mod tests {
         };
         assert_eq!(resolve_list(&list, &env), Err(CliError::MissingHome));
         assert_eq!(resolve_inspect(&inspect, &env), Err(CliError::MissingHome));
+    }
+
+    // Catches drifting from the remove acceptance syntax: `image remove`
+    // takes an image tag and an optional store.
+    #[test]
+    fn parses_image_remove_with_defaults() {
+        assert_eq!(
+            parse(["image", "remove", "hello"]),
+            Ok(Command::Image(ImageCommand::Remove(ImageRemoveArgs {
+                image: "hello".into(),
+                store: None,
+            })))
+        );
+        assert_eq!(
+            parse(["image", "remove", "--store", "/data/store", "hello"]),
+            Ok(Command::Image(ImageCommand::Remove(ImageRemoveArgs {
+                image: "hello".into(),
+                store: Some(PathBuf::from("/data/store")),
+            })))
+        );
+    }
+
+    // Catches accepting malformed remove options or positionals.
+    #[test]
+    fn rejects_invalid_image_remove_arguments() {
+        assert_eq!(
+            parse(["image", "remove"]),
+            Err(CliError::MissingRemoveImage)
+        );
+        assert_eq!(
+            parse(["image", "remove", "hello", "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+        assert_eq!(
+            parse(["image", "remove", "--store", "/a", "--store", "/b", "hello"]),
+            Err(CliError::DuplicateOption("--store"))
+        );
+        assert_eq!(
+            parse(["image", "remove", "--store"]),
+            Err(CliError::MissingValue("--store"))
+        );
+        assert_eq!(
+            parse(["image", "remove", "hello", "--output", "./a.mcb"]),
+            Err(CliError::UnknownOption("--output".to_owned()))
+        );
+    }
+
+    // Catches decoding the IMAGE tag: it must remain UTF-8 like every
+    // other tag positional.
+    #[test]
+    fn rejects_non_utf8_remove_images() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0xff]);
+        assert_eq!(
+            parse_os([
+                OsString::from("image"),
+                OsString::from("remove"),
+                raw.clone()
+            ]),
+            Err(CliError::NonUtf8Argument(raw))
+        );
+    }
+
+    // Catches resolving the remove store out of order: an explicit CLI
+    // path wins over the environment, which wins over HOME.
+    #[test]
+    fn resolves_remove_store_from_the_documented_environment() {
+        let args = ImageRemoveArgs {
+            image: "hello".into(),
+            store: None,
+        };
+        let resolved = resolve_remove(&args, &home_env()).unwrap();
+        assert_eq!(
+            resolved,
+            ResolvedRemove {
+                image: "hello".into(),
+                store: PathBuf::from("/home/test/.minicontainer"),
+            }
+        );
+
+        let env = FakeEnv {
+            store: Some(OsString::from("/env/store")),
+            kernel: None,
+            home: Some(OsString::from("/home/test")),
+        };
+        assert_eq!(
+            resolve_remove(&args, &env).unwrap().store,
+            PathBuf::from("/env/store")
+        );
+
+        let explicit = ImageRemoveArgs {
+            image: "hello".into(),
+            store: Some(PathBuf::from("/cli/store")),
+        };
+        assert_eq!(
+            resolve_remove(&explicit, &env).unwrap().store,
+            PathBuf::from("/cli/store")
+        );
+
+        let env = FakeEnv {
+            store: None,
+            kernel: None,
+            home: None,
+        };
+        assert_eq!(resolve_remove(&args, &env), Err(CliError::MissingHome));
     }
 }

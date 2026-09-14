@@ -138,7 +138,7 @@ exit=42
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`help`、`--version`である。
 構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
@@ -149,6 +149,7 @@ usage: minictr image import [--store PATH] IMAGE FILE
 usage: minictr image export [--store PATH] IMAGE --output PATH
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
+usage: minictr image remove [--store PATH] IMAGE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -160,6 +161,7 @@ usage: minictr image inspect [--store PATH] IMAGE
 `image export`はタグまたは`sha256:`付きdigestで解決したbundleを検証して`--output`へ書き出す。出力先の上書きはしない。
 `image list`はタグの一覧、`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
 `doctor`はQEMUのversion、kernel file、store rootを診断し、各検査の`ok`または`fail`と`summary`の4行を標準出力へ出す。全検査の成功で終了コード0、一つでも失敗したら終了コード1になり、診断自体は環境を変更しない。
+`image remove`は指定タグだけを削除して`IMAGE removed`と出し、blobと他のタグは保持する。存在しないタグは型付きエラーで失敗する。
 
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。

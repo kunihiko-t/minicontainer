@@ -39,6 +39,9 @@ digestは破損検出とcontent addressingに使い、署名や配布元の認�
 `list_tags`はtag名のbyte順で`TagRecord`を返し、imageの有無は確認しない。
 非UTF-8名、symlink、壊れたdigestなどの不正entryはskipせず型付きerrorで返す。
 tag名はmanifestのname文法に従い、単一path成分でない名前は別途拒否する。
+`remove_tag`はtag fileだけをunlinkし、blobには触れない。存在しないtagは型付きerrorで報告する。
+削除前にtag名の文法、symlinkと非fileの有無、canonicalize後のstore内到達を確認し、store外のpathへは到達しない。
+tag fileの内容は検証しないため、壊れた内容のtagも削除できる。
 
 bundle全体の上限8 MiBは`minicontainer_bundle::MAX_BUNDLE_LEN`として公開し、`minictr image build`のELF読み取りと`minictr image import`のfile読み取りも同じ上限を使う。
 配布されたbundle fileは`image import`で取り込む。検証してからstoreへ書き込むため、不正なfileではstoreを変更しない。取り込みでmanifestのnameは書き換えず、store側のtagだけを付ける。

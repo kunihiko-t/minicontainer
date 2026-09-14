@@ -18,8 +18,9 @@ use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, Syste
 
 use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
-    ResolvedImport, ResolvedInspect, ResolvedList, ResolvedRun, VERSION, help, parse_os, resolve,
-    resolve_build, resolve_doctor, resolve_export, resolve_import, resolve_inspect, resolve_list,
+    ResolvedImport, ResolvedInspect, ResolvedList, ResolvedRemove, ResolvedRun, VERSION, help,
+    parse_os, resolve, resolve_build, resolve_doctor, resolve_export, resolve_import,
+    resolve_inspect, resolve_list, resolve_remove,
 };
 
 /// usage errorのprocess終了code。
@@ -141,6 +142,17 @@ pub fn real_main(
                 };
                 inspect_resolved(&resolved, &RealStore, stdout, stderr)
             }
+            ImageCommand::Remove(args) => {
+                let resolved = match resolve_remove(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                remove_resolved(&resolved, &RealStore, stdout, stderr)
+            }
         },
     }
 }
@@ -157,6 +169,8 @@ pub trait ImageStore {
     fn tag(&self, store_root: &Path, name: &str, digest: [u8; 32]) -> Result<(), StoreError>;
     /// 登録済みtagをbyte順で返す。
     fn list_tags(&self, store_root: &Path) -> Result<Vec<TagRecord>, StoreError>;
+    /// 一つのtagだけを削除する。blobは保持する。
+    fn remove_tag(&self, store_root: &Path, name: &str) -> Result<(), StoreError>;
 }
 
 /// bundle store失敗の公開分類。
@@ -201,6 +215,11 @@ impl ImageStore for RealStore {
     fn list_tags(&self, store_root: &Path) -> Result<Vec<TagRecord>, StoreError> {
         let store = Store::new(store_root).map_err(StoreError::Store)?;
         store.list_tags().map_err(StoreError::Store)
+    }
+
+    fn remove_tag(&self, store_root: &Path, name: &str) -> Result<(), StoreError> {
+        let store = Store::new(store_root).map_err(StoreError::Store)?;
+        store.remove_tag(name).map_err(StoreError::Store)
     }
 }
 
@@ -801,6 +820,28 @@ pub fn doctor_resolved(
     if passed == total { 0 } else { DOCTOR_EXIT }
 }
 
+/// 解決済み`image remove`を実行し、process終了codeを返す。
+pub fn remove_resolved(
+    resolved: &ResolvedRemove,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    if let Err(error) = store.remove_tag(&resolved.store, &resolved.image) {
+        let _ = writeln!(stderr, "{error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = writeln!(stdout, "{image} removed", image = resolved.image) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
 /// ELFのmetadata確認、上限付きread、bundle構築、import、tagを順に行う。
 /// ELFの中身は検証せずminiOSのloaderへ委ねる。tag失敗後に残る未参照
 /// blobは消さない。同じbytesは再利用でき、rollbackのほうがstore操作を
@@ -1137,6 +1178,10 @@ mod tests {
         fn list_tags(&self, _store_root: &Path) -> Result<Vec<TagRecord>, StoreError> {
             panic!("run tests do not list tags");
         }
+
+        fn remove_tag(&self, _store_root: &Path, _name: &str) -> Result<(), StoreError> {
+            panic!("run tests do not remove tags");
+        }
     }
 
     struct QueryStore {
@@ -1172,6 +1217,10 @@ mod tests {
 
         fn list_tags(&self, _store_root: &Path) -> Result<Vec<TagRecord>, StoreError> {
             Ok(self.records.clone())
+        }
+
+        fn remove_tag(&self, _store_root: &Path, _name: &str) -> Result<(), StoreError> {
+            panic!("image query tests do not remove tags");
         }
     }
 
@@ -1237,6 +1286,10 @@ mod tests {
 
         fn list_tags(&self, _store_root: &Path) -> Result<Vec<TagRecord>, StoreError> {
             panic!("image build tests do not list tags");
+        }
+
+        fn remove_tag(&self, _store_root: &Path, _name: &str) -> Result<(), StoreError> {
+            panic!("image build tests do not remove tags");
         }
     }
 
@@ -1531,6 +1584,10 @@ mod tests {
 
             fn list_tags(&self, _root: &Path) -> Result<Vec<TagRecord>, StoreError> {
                 panic!("run tests do not list tags");
+            }
+
+            fn remove_tag(&self, _root: &Path, _name: &str) -> Result<(), StoreError> {
+                panic!("run tests do not remove tags");
             }
         }
 
@@ -3428,6 +3485,211 @@ mod tests {
             })
             .count();
         assert_eq!(turds, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn resolved_remove(image: &str, store: &Path) -> ResolvedRemove {
+        ResolvedRemove {
+            image: image.to_owned(),
+            store: store.to_path_buf(),
+        }
+    }
+
+    fn temp_remove_root(prefix: &str) -> std::path::PathBuf {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("minictr-test-{prefix}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn remove_fixture(root: &Path) {
+        let store = Store::new(root).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        store.tag("first", digest).unwrap();
+        store.tag("second", digest).unwrap();
+    }
+
+    // Catches wiring `image remove` to anything but tag deletion and a
+    // stable success line.
+    #[test]
+    fn image_remove_deletes_one_tag_through_the_public_cli() {
+        let root = temp_remove_root("remove-cli");
+        remove_fixture(&root);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("remove"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("first"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"first removed\n");
+        assert!(stderr.is_empty());
+        let store = Store::new(&root).unwrap();
+        assert!(store.resolve("first").is_err());
+        assert!(store.resolve("second").is_ok());
+        assert_eq!(
+            std::fs::read_dir(root.join("images/sha256"))
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches reporting a missing tag as success or as a bare I/O error.
+    #[test]
+    fn image_remove_reports_a_missing_tag() {
+        let root = temp_remove_root("remove-missing");
+        remove_fixture(&root);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("remove"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("absent"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("tag `absent` does not exist"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches deleting through a symlinked tag entry.
+    #[cfg(unix)]
+    #[test]
+    fn image_remove_refuses_a_symlinked_tag() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_remove_root("remove-symlink");
+        let outside = temp_remove_root("remove-symlink-outside");
+        remove_fixture(&root);
+        let link = root.join("tags/first");
+        std::fs::remove_file(&link).unwrap();
+        let target = outside.join("precious");
+        std::fs::write(&target, b"precious").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = remove_resolved(
+            &resolved_remove("first", &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr)
+                .contains("store path is a symlink or leaves the store root"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"precious");
+        assert!(link.is_symlink());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    // Catches reporting success when the tags directory cannot be changed.
+    #[cfg(unix)]
+    #[test]
+    fn image_remove_reports_a_read_only_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_remove_root("remove-readonly");
+        remove_fixture(&root);
+        let tags = root.join("tags");
+        let mut permissions = std::fs::metadata(&tags).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&tags, permissions).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = remove_resolved(
+            &resolved_remove("first", &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        let mut permissions = std::fs::metadata(&tags).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tags, permissions).unwrap();
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+        assert!(Store::new(&root).unwrap().resolve("first").is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches ignoring a broken stdout pipe or flush and exiting zero.
+    #[test]
+    fn maps_remove_output_failures_to_host_errors() {
+        let root = temp_remove_root("remove-output-fail");
+        remove_fixture(&root);
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            remove_resolved(
+                &resolved_remove("first", &root),
+                &RealStore,
+                &mut FailingWriter {
+                    message: "remove write broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            remove_resolved(
+                &resolved_remove("second", &root),
+                &RealStore,
+                &mut FlushFailingWriter {
+                    buffered: Vec::new(),
+                    message: "remove flush broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to flush stdout"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

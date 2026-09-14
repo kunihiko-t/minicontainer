@@ -60,6 +60,8 @@ pub enum StoreError {
     InvalidTagDigest,
     /// A tag file exceeds the exact lowercase SHA-256 digest length.
     TagTooLarge,
+    /// A tag does not exist.
+    TagNotFound(String),
     /// The bundle stored under a digest path has a different digest.
     DigestPathMismatch,
     /// A bundle failed construction or validation.
@@ -93,6 +95,7 @@ impl fmt::Display for StoreError {
                 formatter.write_str("tag does not contain a lowercase SHA-256 digest")
             }
             Self::TagTooLarge => formatter.write_str("tag exceeds the SHA-256 digest length"),
+            Self::TagNotFound(name) => write!(formatter, "tag `{name}` does not exist"),
             Self::DigestPathMismatch => {
                 formatter.write_str("image content digest does not match its store path")
             }
