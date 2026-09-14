@@ -4,7 +4,7 @@
 
 ## 章の一覧
 
-第1章から第11章は現在の実装を説明し、第12章は将来のOCI対応を検討するための資料である。
+第1章から第11章は現在の実装を説明し、第12章はOCI対応の形式資料である。
 まず実行結果を確認したい場合は、[クイックスタート](../../README.md#クイックスタート)から始める。
 
 1. **[コンテナ、仮想マシン、microVMの違い](01-container-vm-microvm.md)**：ホストとゲストの責務を分け、MiniContainerが採用する仮想マシン境界を説明できるようにする。
@@ -18,10 +18,10 @@
 9. **[`minictr run`を完成させる](09-minictr-run.md)**：imageの解決からQEMUの終了までを一つのCLI flowとして実行できるようにする。
 10. **[失敗、timeout、診断log](10-failure-diagnostics.md)**：host error、guest failure、protocol破損を区別して調査できるようにする。
 11. **[テストハーネスと公開gate](11-test-harness-gate.md)**：書式、文書、Clippy、単体試験、buildを同じcommandから順に検証できるようにする。
-12. **[OCI Image Specificationへ進む](12-oci-image-spec.md)**：現在の単一file形式とOCI imageの差を整理し、次の拡張順を計画できるようにする。
+12. **[OCI Image Specificationへ進む](12-oci-image-spec.md)**：MiniBundleとOCI Image Layoutの対応を理解し、export、import、registry pullの拡張順を計画できるようにする。
 
 第5章から第9章までがQEMUとguest実行の経路に対応する。
-第1章から第11章までの本文が現在のコードに対応し、第12章は次の拡張方向を扱う。
+第1章から第11章までの本文が現在のコードに対応し、第12章は[対応文書](../reference/minibundle-oci-mapping.md)と共に次の拡張の形式を定める。
 
 ## 実装を読むときの入口
 

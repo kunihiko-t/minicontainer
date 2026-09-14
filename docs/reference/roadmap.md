@@ -45,10 +45,10 @@ E2Eの出力上限経路では、連打guestによる125終了、診断の一致
 ### 学習ガイド
 
 ガイド全12章の本文を用意している。
-第1章から第11章は現在の実装、第12章は未実装のOCI対応を検討するための資料である。
+第1章から第11章は現在の実装、第12章はOCI対応の形式資料である。
 第10章はhost error、guest failure、protocol破損の三分類と終了code、timeoutの二層強制、診断logの扱いを説明する。
 第11章は`setup`と16段階の`check`と15段階の`check-host`、公開条件の検査、CIとの同一性を説明する。
-第1章から第4章は境界、環境、ELFとGuest ABI、MiniBundleを、第12章はOCI imageとの差と拡張順の計画を扱う。
+第1章から第4章は境界、環境、ELFとGuest ABI、MiniBundleを、第12章はMiniBundleとOCI Image Layoutの対応と拡張順の計画を扱う。
 
 ## 開発マイルストーン
 
@@ -75,14 +75,14 @@ v0.2.0では、既存のMiniBundleとQEMU実行方式を変えず、日常的な
 
 v0.3.0では、Linux application互換を追加せず、イメージの保存形式と配布だけをOCIへ接続する。
 
-1. [`docs(oci): define the MiniBundle and OCI Image Layout mapping`](https://github.com/kunihiko-t/minicontainer/issues/15)：MiniBundleとOCI Image Layoutの対応、digest、media type、architectureの扱いを設計する。
+1. [`docs(oci): define the MiniBundle and OCI Image Layout mapping`](https://github.com/kunihiko-t/minicontainer/issues/15)：MiniBundleとOCI Image Layoutの対応、digest、media type、architectureの扱いを[対応文書](minibundle-oci-mapping.md)として定める。
 2. [`feat(oci): export stored images as OCI Image Layout`](https://github.com/kunihiko-t/minicontainer/issues/16)：storeのイメージをOCI Image Layoutへexportする。
 3. [`feat(oci): import OCI Image Layout into the MiniBundle store`](https://github.com/kunihiko-t/minicontainer/issues/17)：OCI Image LayoutからMiniBundleを構築してstoreへimportする。
 4. [`feat(registry): pull anonymous images by digest`](https://github.com/kunihiko-t/minicontainer/issues/18)：OCI registryからdigest指定で匿名pullする。
 5. [`test(oci): verify ORAS and Skopeo interoperability`](https://github.com/kunihiko-t/minicontainer/issues/19)：ORASまたはSkopeoとの相互運用をfixtureとE2Eで確認する。
 
 OCI形式で配布できても、Docker向けLinux applicationをminiOSで実行できるわけではない。
-[第12章](../guide/12-oci-image-spec.md)で説明する二つの互換性を分けたまま実装する。
+[第12章](../guide/12-oci-image-spec.md)と[対応文書](minibundle-oci-mapping.md)で分けた二つの互換性を維持したまま実装する。
 
 ### [v0.4.0 Runtime Control](https://github.com/kunihiko-t/minicontainer/milestone/3)
 
