@@ -8,7 +8,7 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 `minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 
 ```text
-usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
+usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image import [--store PATH] IMAGE FILE
@@ -30,6 +30,14 @@ usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 `--`で始まり`=`を含む値も分割しない。
 同じoptionの重複は、`--timeout-ms`を含めて型付きerrorになる。
 `--timeout-ms`の既定値は5000であり、0と非数値は拒否する。
+`--memory`はMiB単位の整数で、128から8192の範囲だけを受け付ける。
+128はpayload予約窓がRAMに載る下限であり、既定値と一致する。
+`--cpus`は1から8の整数だけを受け付ける。
+どちらも省略時は128 MiBと1 vCPUのままである。
+接尾辞 (`256M`など)、非数値、範囲外、u32に収まらない値は使い方の誤りになる。
+同じoptionの重複も、`--timeout-ms`と同様に型付きerrorになる。
+QEMUへ渡すのは検証済みの数値だけであり、引数注入の面はない。
+resource範囲の根拠は[第6章](06-qemu-backend.md)を参照する。
 command名、option名、image名はUTF-8でなければならず、storeとkernelの値だけが非UTF-8 byteを透過的に扱う。
 
 `image build`の`--store`も一度だけ指定でき、重複は型付きerrorになる。

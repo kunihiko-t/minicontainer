@@ -6,7 +6,7 @@ mod process;
 mod session;
 mod temp;
 
-pub use command::QemuCommand;
+pub use command::{QemuCommand, QemuResources};
 pub use error::{CleanupFailure, RuntimeError};
 pub use process::{
     ProcessBackend, ProcessControl, ProcessError, ProcessEvent, ProcessStatus, SystemProcessBackend,
@@ -28,6 +28,8 @@ pub struct RunRequest<'a> {
     pub kernel: &'a Path,
     /// UART control eventを待つ全体の期限。
     pub deadline: Duration,
+    /// QEMUへ渡すguest resource量。
+    pub resources: QemuResources,
 }
 
 /// decode済みguest eventをrunの終了前に受け取る転送先。
@@ -85,7 +87,7 @@ impl<B: ProcessBackend> Runtime<B> {
             .ok_or(RuntimeError::InvalidDeadline)?;
         minicontainer_bundle::parse(request.bundle).map_err(RuntimeError::Bundle)?;
         let payload = PayloadTemp::create(request.bundle)?;
-        let command = match QemuCommand::new(request.kernel, payload.path()) {
+        let command = match QemuCommand::new(request.kernel, payload.path(), request.resources) {
             Ok(command) => command,
             Err(error) => return finish_without_child(Err(error), &payload),
         };
@@ -189,7 +191,8 @@ mod tests {
 
     use super::{
         CleanupFailure, OutputSink, ProcessBackend, ProcessControl, ProcessError, ProcessEvent,
-        ProcessStatus, QemuCommand, RunRequest, Runtime, RuntimeError, SessionError, SessionEvent,
+        ProcessStatus, QemuCommand, QemuResources, RunRequest, Runtime, RuntimeError, SessionError,
+        SessionEvent,
     };
 
     // Catches skipping any part of the happy-path lifecycle: only a validated
@@ -213,6 +216,7 @@ mod tests {
                 bundle: &valid_bundle(),
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(1),
+                resources: QemuResources::DEFAULT,
             })
             .unwrap();
 
@@ -270,6 +274,7 @@ mod tests {
                         bundle: &valid_bundle(),
                         kernel: "/kernel".as_ref(),
                         deadline: Duration::from_secs(1),
+                        resources: QemuResources::DEFAULT,
                     })
                     .is_err(),
                 "{name} must fail"
@@ -308,6 +313,7 @@ mod tests {
                     bundle: b"not a bundle",
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
+                    resources: QemuResources::DEFAULT,
                 })
                 .is_err()
         );
@@ -324,6 +330,7 @@ mod tests {
                     bundle: &valid_bundle(),
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
+                    resources: QemuResources::DEFAULT,
                 })
                 .is_err()
         );
@@ -367,6 +374,7 @@ mod tests {
                 bundle: &valid_bundle(),
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_millis(100),
+                resources: QemuResources::DEFAULT,
             })
             .unwrap_err();
 
@@ -393,6 +401,7 @@ mod tests {
                 bundle: &valid_bundle(),
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::MAX,
+                resources: QemuResources::DEFAULT,
             })
             .unwrap_err();
 
@@ -430,6 +439,7 @@ mod tests {
                 bundle: &valid_bundle(),
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(1),
+                resources: QemuResources::DEFAULT,
             })
             .unwrap_err();
 
@@ -476,6 +486,7 @@ mod tests {
                     bundle: &valid_bundle(),
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
+                    resources: QemuResources::DEFAULT,
                 },
                 &mut sink,
             )
@@ -527,6 +538,7 @@ mod tests {
                     bundle: &valid_bundle(),
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
+                    resources: QemuResources::DEFAULT,
                 },
                 &mut sink,
             )
@@ -569,6 +581,7 @@ mod tests {
                     bundle: &valid_bundle(),
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
+                    resources: QemuResources::DEFAULT,
                 },
                 &mut sink,
             )
@@ -615,6 +628,7 @@ mod tests {
                     bundle: &valid_bundle(),
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_millis(50),
+                    resources: QemuResources::DEFAULT,
                 },
                 &mut sink,
             )
@@ -664,6 +678,7 @@ mod tests {
                     bundle: &valid_bundle(),
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(5),
+                    resources: QemuResources::DEFAULT,
                 },
                 &mut sink,
             )

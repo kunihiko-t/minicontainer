@@ -5,6 +5,8 @@
 
 use std::{ffi::OsString, fmt, path::PathBuf, time::Duration};
 
+use minicontainer_runtime::QemuResources;
+
 /// `--timeout-ms`を省略したときの待ち時間。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -166,6 +168,10 @@ pub struct RunArgs {
     pub kernel: Option<PathBuf>,
     /// UART control eventを待つ全体の期限。
     pub timeout: Duration,
+    /// guest memory量 (MiB)。
+    pub memory_mib: u32,
+    /// guest vCPU数。
+    pub cpus: u32,
 }
 
 /// `doctor` commandの型付き引数。
@@ -197,6 +203,10 @@ pub struct ResolvedRun {
     pub kernel: PathBuf,
     /// UART control eventを待つ全体の期限。
     pub timeout: Duration,
+    /// guest memory量 (MiB)。
+    pub memory_mib: u32,
+    /// guest vCPU数。
+    pub cpus: u32,
 }
 
 /// `image build`に必要な不変入力を解決した結果。
@@ -354,6 +364,14 @@ pub enum CliError {
     InvalidTimeout(String),
     /// `--timeout-ms`が0である。
     ZeroTimeout,
+    /// `--memory`が整数として読めない。
+    InvalidMemory(String),
+    /// `--memory`が公開範囲の外にある。
+    MemoryOutOfRange(u32),
+    /// `--cpus`が整数として読めない。
+    InvalidCpus(String),
+    /// `--cpus`が公開範囲の外にある。
+    CpusOutOfRange(u32),
     /// command、option名、imageをUTF-8として読めない。
     NonUtf8Argument(OsString),
     /// HOMEがなく既定pathを作れない。
@@ -427,6 +445,24 @@ impl fmt::Display for CliError {
                 write!(formatter, "invalid minictr timeout: {value}")
             }
             Self::ZeroTimeout => formatter.write_str("minictr timeout must not be zero"),
+            Self::InvalidMemory(value) => {
+                write!(formatter, "invalid minictr memory: {value}")
+            }
+            Self::MemoryOutOfRange(value) => write!(
+                formatter,
+                "minictr memory must be {}-{} MiB, got {value}",
+                QemuResources::MIN_MEMORY_MIB,
+                QemuResources::MAX_MEMORY_MIB
+            ),
+            Self::InvalidCpus(value) => {
+                write!(formatter, "invalid minictr cpus: {value}")
+            }
+            Self::CpusOutOfRange(value) => write!(
+                formatter,
+                "minictr cpus must be {}-{}, got {value}",
+                QemuResources::MIN_CPUS,
+                QemuResources::MAX_CPUS
+            ),
             Self::NonUtf8Argument(_) => formatter.write_str("minictr argument is not valid UTF-8"),
             Self::MissingHome => {
                 formatter.write_str("cannot resolve the default minictr path without HOME")
@@ -439,7 +475,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
 }
 
 /// OS引数からcommandをparseする。
@@ -478,6 +514,8 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
     let mut store: Option<PathBuf> = None;
     let mut kernel: Option<PathBuf> = None;
     let mut timeout: Option<Duration> = None;
+    let mut memory_mib: Option<u32> = None;
+    let mut cpus: Option<u32> = None;
 
     // `--opt=value`はoption位置のtokenだけを分割する。`--store`や`--kernel`が
     // 消費した値はOS pathとして不透明に扱い、`--`で始まり`=`を含むpathを
@@ -523,6 +561,28 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
                     let value = value.into_string().map_err(CliError::NonUtf8Argument)?;
                     timeout = Some(parse_timeout(&value)?);
                 }
+                "--memory" => {
+                    if memory_mib.is_some() {
+                        return Err(CliError::DuplicateOption("--memory"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--memory"))?,
+                    };
+                    let value = value.into_string().map_err(CliError::NonUtf8Argument)?;
+                    memory_mib = Some(parse_memory(&value)?);
+                }
+                "--cpus" => {
+                    if cpus.is_some() {
+                        return Err(CliError::DuplicateOption("--cpus"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--cpus"))?,
+                    };
+                    let value = value.into_string().map_err(CliError::NonUtf8Argument)?;
+                    cpus = Some(parse_cpus(&value)?);
+                }
                 unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
             }
             continue;
@@ -543,6 +603,8 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         store,
         kernel,
         timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
+        memory_mib: memory_mib.unwrap_or(QemuResources::DEFAULT_MEMORY_MIB),
+        cpus: cpus.unwrap_or(QemuResources::DEFAULT_CPUS),
     }))
 }
 
@@ -1184,6 +1246,26 @@ fn parse_timeout(value: &str) -> Result<Duration, CliError> {
     Ok(Duration::from_millis(millis))
 }
 
+fn parse_memory(value: &str) -> Result<u32, CliError> {
+    let memory_mib: u32 = value
+        .parse()
+        .map_err(|_| CliError::InvalidMemory(value.to_owned()))?;
+    if !(QemuResources::MIN_MEMORY_MIB..=QemuResources::MAX_MEMORY_MIB).contains(&memory_mib) {
+        return Err(CliError::MemoryOutOfRange(memory_mib));
+    }
+    Ok(memory_mib)
+}
+
+fn parse_cpus(value: &str) -> Result<u32, CliError> {
+    let cpus: u32 = value
+        .parse()
+        .map_err(|_| CliError::InvalidCpus(value.to_owned()))?;
+    if !(QemuResources::MIN_CPUS..=QemuResources::MAX_CPUS).contains(&cpus) {
+        return Err(CliError::CpusOutOfRange(cpus));
+    }
+    Ok(cpus)
+}
+
 /// 実行時環境から既定pathを読む境界。testでは偽装できる。
 pub trait Environ {
     /// `MINICTR_STORE`の値。
@@ -1232,6 +1314,8 @@ pub fn resolve(args: &RunArgs, env: &dyn Environ) -> Result<ResolvedRun, CliErro
         store,
         kernel,
         timeout: args.timeout,
+        memory_mib: args.memory_mib,
+        cpus: args.cpus,
     })
 }
 
@@ -1497,6 +1581,8 @@ mod tests {
                 store: None,
                 kernel: None,
                 timeout: Duration::from_secs(5),
+                memory_mib: 128,
+                cpus: 1,
             }))
         );
     }
@@ -1520,6 +1606,8 @@ mod tests {
                 store: Some(PathBuf::from("/data/store")),
                 kernel: Some(PathBuf::from("/data/kernel")),
                 timeout: Duration::from_millis(250),
+                memory_mib: 128,
+                cpus: 1,
             }))
         );
     }
@@ -1534,6 +1622,8 @@ mod tests {
                 store: Some(PathBuf::from("/data/store")),
                 kernel: None,
                 timeout: Duration::from_millis(750),
+                memory_mib: 128,
+                cpus: 1,
             }))
         );
     }
@@ -1631,6 +1721,8 @@ mod tests {
                 store: None,
                 kernel: Some(PathBuf::from("--foo=bar")),
                 timeout: Duration::from_secs(5),
+                memory_mib: 128,
+                cpus: 1,
             }))
         );
         assert_eq!(
@@ -1640,6 +1732,8 @@ mod tests {
                 store: Some(PathBuf::from("--foo=bar")),
                 kernel: None,
                 timeout: Duration::from_secs(5),
+                memory_mib: 128,
+                cpus: 1,
             }))
         );
         assert_eq!(
@@ -1664,6 +1758,143 @@ mod tests {
             parse(["run", "--timeout-ms"]),
             Err(CliError::MissingValue("--timeout-ms"))
         );
+    }
+
+    // Catches drifting the documented resource defaults: omitting both
+    // options keeps 128 MiB and 1 vCPU.
+    #[test]
+    fn run_resource_defaults_keep_128mib_and_one_cpu() {
+        assert_eq!(
+            parse(["run", "hello"]),
+            Ok(Command::Run(RunArgs {
+                image: "hello".into(),
+                store: None,
+                kernel: None,
+                timeout: Duration::from_secs(5),
+                memory_mib: 128,
+                cpus: 1,
+            }))
+        );
+    }
+
+    // Catches misreading configured resource values or their spellings.
+    #[test]
+    fn parses_run_memory_and_cpus_in_every_spelling() {
+        for arguments in [
+            vec!["run", "--memory", "256", "--cpus", "2", "hello"],
+            vec!["run", "--memory=256", "--cpus=2", "hello"],
+            vec!["run", "hello", "--cpus", "2", "--memory", "256"],
+        ] {
+            assert_eq!(
+                parse(arguments),
+                Ok(Command::Run(RunArgs {
+                    image: "hello".into(),
+                    store: None,
+                    kernel: None,
+                    timeout: Duration::from_secs(5),
+                    memory_mib: 256,
+                    cpus: 2,
+                }))
+            );
+        }
+    }
+
+    // Catches accepting a memory size below the reserved-window floor or
+    // above the public cap, while the exact boundaries stay valid.
+    #[test]
+    fn rejects_memory_outside_128_to_8192_mib() {
+        assert!(matches!(
+            parse(["run", "--memory", "128", "hello"]),
+            Ok(Command::Run(_))
+        ));
+        assert!(matches!(
+            parse(["run", "--memory", "8192", "hello"]),
+            Ok(Command::Run(_))
+        ));
+        assert_eq!(
+            parse(["run", "--memory", "127", "hello"]),
+            Err(CliError::MemoryOutOfRange(127))
+        );
+        assert_eq!(
+            parse(["run", "--memory", "8193", "hello"]),
+            Err(CliError::MemoryOutOfRange(8193))
+        );
+        assert_eq!(
+            parse(["run", "--memory", "0", "hello"]),
+            Err(CliError::MemoryOutOfRange(0))
+        );
+    }
+
+    // Catches accepting a vCPU count outside 1-8 while the exact boundaries
+    // stay valid.
+    #[test]
+    fn rejects_cpus_outside_1_to_8() {
+        assert!(matches!(
+            parse(["run", "--cpus", "1", "hello"]),
+            Ok(Command::Run(_))
+        ));
+        assert!(matches!(
+            parse(["run", "--cpus", "8", "hello"]),
+            Ok(Command::Run(_))
+        ));
+        assert_eq!(
+            parse(["run", "--cpus", "0", "hello"]),
+            Err(CliError::CpusOutOfRange(0))
+        );
+        assert_eq!(
+            parse(["run", "--cpus", "9", "hello"]),
+            Err(CliError::CpusOutOfRange(9))
+        );
+    }
+
+    // Catches misreading a non-numeric, suffixed, or overflowing resource
+    // value as valid: only bare integers reach the range check.
+    #[test]
+    fn rejects_non_numeric_and_overflowing_resource_values() {
+        assert_eq!(
+            parse(["run", "--memory", "fast", "hello"]),
+            Err(CliError::InvalidMemory("fast".to_owned()))
+        );
+        assert_eq!(
+            parse(["run", "--memory", "256M", "hello"]),
+            Err(CliError::InvalidMemory("256M".to_owned()))
+        );
+        assert_eq!(
+            parse(["run", "--memory", "99999999999999999999999", "hello"]),
+            Err(CliError::InvalidMemory(
+                "99999999999999999999999".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse(["run", "--cpus", "many", "hello"]),
+            Err(CliError::InvalidCpus("many".to_owned()))
+        );
+        assert_eq!(
+            parse(["run", "--cpus", "99999999999999999999999", "hello"]),
+            Err(CliError::InvalidCpus("99999999999999999999999".to_owned()))
+        );
+    }
+
+    // Catches silently preferring the last of two resource options, which can
+    // replace a small limit with a much larger one.
+    #[test]
+    fn rejects_duplicate_resource_options_in_every_spelling() {
+        for arguments in [
+            vec!["run", "--memory", "128", "--memory", "256", "hello"],
+            vec!["run", "--memory=128", "--memory=256", "hello"],
+            vec!["run", "--memory", "128", "--memory=256", "hello"],
+            vec!["run", "--memory=128", "--memory", "256", "hello"],
+        ] {
+            assert_eq!(parse(arguments), Err(CliError::DuplicateOption("--memory")));
+        }
+        for arguments in [
+            vec!["run", "--cpus", "1", "--cpus", "2", "hello"],
+            vec!["run", "--cpus=1", "--cpus=2", "hello"],
+            vec!["run", "--cpus", "1", "--cpus=2", "hello"],
+            vec!["run", "--cpus=1", "--cpus", "2", "hello"],
+        ] {
+            assert_eq!(parse(arguments), Err(CliError::DuplicateOption("--cpus")));
+        }
     }
 
     // Catches dropping a value-taking option at the end of argv.
@@ -1742,6 +1973,8 @@ mod tests {
             store: None,
             kernel: None,
             timeout: Duration::from_secs(5),
+            memory_mib: 128,
+            cpus: 1,
         };
         let resolved = resolve(&args, &home_env()).unwrap();
         assert_eq!(resolved.store, PathBuf::from("/home/test/.minicontainer"));
@@ -1768,6 +2001,8 @@ mod tests {
             store: None,
             kernel: None,
             timeout: Duration::from_secs(5),
+            memory_mib: 128,
+            cpus: 1,
         };
         let env = FakeEnv {
             store: None,
@@ -1785,6 +2020,8 @@ mod tests {
             store: Some(PathBuf::from("/cli/store")),
             kernel: Some(PathBuf::from("/cli/kernel")),
             timeout: Duration::from_secs(5),
+            memory_mib: 128,
+            cpus: 1,
         };
         let env = FakeEnv {
             store: Some(OsString::from("/env/store")),
@@ -1801,7 +2038,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
         );
     }
 
