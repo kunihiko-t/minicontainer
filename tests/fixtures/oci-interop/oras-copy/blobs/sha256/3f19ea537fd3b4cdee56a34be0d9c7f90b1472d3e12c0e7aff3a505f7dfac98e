@@ -1,0 +1,1 @@
+{"architecture":"riscv64","os":"minios","config":{"Entrypoint":["hello"],"Cmd":[]},"rootfs":{"type":"layers","diff_ids":["sha256:6c710671215c4929fa600956d236ae82df1f3a9f05f0b125c3fb0feed9096136"]}}

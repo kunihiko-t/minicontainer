@@ -74,6 +74,7 @@ Git履歴の作者とcommitterのメールアドレスは公開プロフィー�
 
 Ubuntu 24.04のCIは、`cargo xtask setup`に続けて`cargo xtask check`を実行する。
 `check`の後、Ubuntu CIは配布archiveのsmokeを実行する。`cargo xtask dist`でarchiveを組み立て、checksumの検査と展開を経て、展開した`minictr`で同梱ゲストを起動して`hello from guest`と終了code 42を確認する。
+`check`の後、Ubuntu CIはOCI相互運用の検証を実行する。fixtureのchecksum検査、ORASとSkopeoの導入、fixtureのimport、再exportの一致、実行可能guestの外部tool複写とimportと実行を確認する。
 Apple SiliconのmacOS CIはQEMUを導入せず、`cargo xtask check-host`を実行する。
 同じ検査を共有するが、OS、QEMUのバージョン、権限、ネットワークなどの差によって結果は変わり得る。
 ローカルでの成功に加え、対象コミットのCI結果も確認する。
