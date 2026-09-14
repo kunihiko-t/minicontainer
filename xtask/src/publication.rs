@@ -268,12 +268,20 @@ fn tracked_workflows(root: &Path) -> Result<Vec<PathBuf>, PublicationError> {
         .collect()
 }
 
-/// Release tag that owns archive builds.
-const RELEASE_TAG: &str = "v0.1.0";
+/// Release tag pattern that owns archive builds. Every `v*` tag release
+/// gets provenance; a single pinned tag would silently skip future releases.
+const RELEASE_TAG_PATTERN: &str = "v*";
 /// miniOS kernel revision packed into release archives.
 const RELEASE_KERNEL_REV: &str = "9be99255a59d58d19db25b835af0e28a8d2a4036";
 /// Command that owns release archive builds.
 const DIST_COMMAND: &str = "cargo xtask dist";
+/// Release archive name stem shared by the tarball and its checksum. The
+/// version comes from the tag (`github.ref_name`), never from a literal.
+const RELEASE_ARCHIVE_STEM: &str = "minicontainer-";
+/// Provenance action that must attest the release archives.
+const RELEASE_ATTEST_ACTION: &str = "attest-build-provenance@";
+/// Release asset linkage command that must publish the archives.
+const RELEASE_PUBLISH_COMMAND: &str = "gh release create";
 
 /// Enforces the release workflow contract when `release.yml` is tracked.
 fn check_release_policy(root: &Path) -> Result<(), PublicationError> {
@@ -297,14 +305,41 @@ fn check_release_policy(root: &Path) -> Result<(), PublicationError> {
             message: "release workflow must build the pinned kernel revision",
         });
     }
+    if !contents.contains(RELEASE_ARCHIVE_STEM) || !contents.contains("github.ref_name") {
+        return Err(PublicationError::Workflow {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "release workflow must pack tag-versioned release archives",
+        });
+    }
+    if !contents.contains(RELEASE_ATTEST_ACTION) {
+        return Err(PublicationError::Workflow {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "release workflow must attest the archives with signed provenance",
+        });
+    }
+    if !contents.contains("subject-path:") {
+        return Err(PublicationError::Workflow {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "release attestation must declare its artifact subjects",
+        });
+    }
+    if !contents.contains(RELEASE_PUBLISH_COMMAND) {
+        return Err(PublicationError::Workflow {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "release workflow must publish the archives as release assets",
+        });
+    }
     Ok(())
 }
 
 /// Requires the release workflow to build its archives with
-/// `cargo xtask dist` for the Cargo package version, and the CI workflow to
-/// smoke-test that same archive build. The expected archive prefix derives
-/// from the manifests so a version bump forces the workflow update in the
-/// same change.
+/// `cargo xtask dist` for the tag version, and the CI workflow to
+/// smoke-test that same archive build. The manifests must agree on one
+/// package version; the tag names the release archives.
 fn check_dist_policy(root: &Path) -> Result<(), PublicationError> {
     let xtask = package_version(root, Path::new("xtask/Cargo.toml"))?;
     let minictr = package_version(root, Path::new("crates/minictr/Cargo.toml"))?;
@@ -315,7 +350,6 @@ fn check_dist_policy(root: &Path) -> Result<(), PublicationError> {
             minictr,
         });
     }
-    let expected_prefix = format!("minicontainer-{xtask}-");
     let workflows = tracked_workflows(root)?;
     if let Some(path) = workflows
         .iter()
@@ -333,11 +367,11 @@ fn check_dist_policy(root: &Path) -> Result<(), PublicationError> {
                 message: "release workflow must build archives with cargo xtask dist",
             });
         }
-        if !contents.contains(&expected_prefix) {
+        if !contents.contains("--version") || !contents.contains("github.ref_name") {
             return Err(PublicationError::Workflow {
                 path: path.to_path_buf(),
                 line: 1,
-                message: "release workflow must upload archives for the Cargo package version",
+                message: "release archives must take their version from the release tag",
             });
         }
     }
@@ -408,12 +442,12 @@ fn package_version(root: &Path, manifest: &Path) -> Result<String, PublicationEr
     })
 }
 
-/// Requires a tag-push-only trigger for the release version.
+/// Requires a tag-push-only trigger covering every release tag.
 fn check_release_trigger(path: &Path, contents: &str) -> Result<(), PublicationError> {
     let violation = |line: usize| PublicationError::Workflow {
         path: path.to_path_buf(),
         line,
-        message: "release workflow must trigger on the release tag push only",
+        message: "release workflow must trigger on every release tag push only",
     };
     let mut on_line = None;
     let mut block: Vec<(usize, &str)> = Vec::new();
@@ -452,43 +486,92 @@ fn check_release_trigger(path: &Path, contents: &str) -> Result<(), PublicationE
     let has_tags = block
         .iter()
         .any(|(_, text)| *text == "tags:" || text.starts_with("tags: "));
-    let has_tag = block
-        .iter()
-        .any(|(_, text)| text.starts_with("- ") && text.contains(RELEASE_TAG));
+    let has_tag = block.iter().any(|(_, text)| {
+        text.strip_prefix("- ")
+            .map(|pattern| {
+                pattern
+                    .trim()
+                    .trim_matches(|char| char == '\'' || char == '"')
+                    == RELEASE_TAG_PATTERN
+            })
+            .unwrap_or(false)
+    });
     if !has_tags || !has_tag {
         return Err(violation(on_line));
     }
     Ok(())
 }
 
-/// Requires read-only contents permission without any write grant.
+/// Requires a read-only top level with write grants scoped to provenance jobs.
+///
+/// The top-level `permissions:` block must declare `contents: read` and no
+/// write. Job-level blocks may additionally grant the three writes the
+/// provenance flow needs (`contents` for the release upload, `attestations`
+/// and `id-token` for the attestation); any other write grant is rejected.
 fn check_release_permissions(path: &Path, contents: &str) -> Result<(), PublicationError> {
-    let mut permissions_line = 1;
-    let mut has_read = false;
+    let violation = |line: usize, message: &'static str| PublicationError::Workflow {
+        path: path.to_path_buf(),
+        line,
+        message,
+    };
+    let mut top_permissions_line = 1;
+    let mut has_top_read = false;
+    let mut block_indent: Option<usize> = None;
+    let mut block_top_level = false;
+
     for (index, raw) in contents.lines().enumerate() {
         let line = index + 1;
         let trimmed = raw.trim();
-        if trimmed == "permissions:" {
-            permissions_line = line;
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
         }
-        if trimmed.starts_with("contents:") {
-            if trimmed == "contents: read" {
-                has_read = true;
-            } else if trimmed.starts_with("contents: write") {
-                return Err(PublicationError::Workflow {
-                    path: path.to_path_buf(),
+        let indent = raw.len() - raw.trim_start().len();
+        if let Some(entry) = block_indent
+            && indent <= entry
+        {
+            block_indent = None;
+        }
+        if trimmed == "permissions:" {
+            block_indent = Some(indent);
+            block_top_level = indent == 0;
+            if block_top_level {
+                top_permissions_line = line;
+            }
+            continue;
+        }
+        if block_indent.is_none() {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if value.trim() != "write" {
+            if block_top_level && key.trim() == "contents" && value.trim() == "read" {
+                has_top_read = true;
+            }
+            continue;
+        }
+        if block_top_level {
+            return Err(violation(
+                line,
+                "release workflow must not grant write permission at the top level",
+            ));
+        }
+        match key.trim() {
+            "contents" | "attestations" | "id-token" => {}
+            _ => {
+                return Err(violation(
                     line,
-                    message: "release workflow must not grant write permission",
-                });
+                    "release job writes are limited to contents, attestations, and id-token",
+                ));
             }
         }
     }
-    if !has_read {
-        return Err(PublicationError::Workflow {
-            path: path.to_path_buf(),
-            line: permissions_line,
-            message: "release workflow must declare contents: read",
-        });
+    if !has_top_read {
+        return Err(violation(
+            top_permissions_line,
+            "release workflow must declare contents: read",
+        ));
     }
     Ok(())
 }
@@ -2352,12 +2435,12 @@ mod tests {
     }
 
     fn valid_release_trigger() -> String {
-        "  push:\n    tags:\n      - v0.1.0\n".to_owned()
+        "  push:\n    tags:\n      - 'v*'\n".to_owned()
     }
 
     fn valid_release_body() -> String {
         format!(
-            "    steps:\n      - run: git checkout {rev}\n      - run: cargo xtask dist --target t\n      - run: upload minicontainer-0.1.0-x\n",
+            "    permissions:\n      attestations: write\n      id-token: write\n      contents: write\n    steps:\n      - run: git checkout {rev}\n      - run: cargo xtask dist --target t --version ${{github.ref_name}}\n      - run: upload minicontainer-${{github.ref_name}}-x\n      - uses: actions/attest-build-provenance@sha\n        with:\n          subject-path: dist.tar.gz\n      - run: gh release create vX dist.tar.gz\n",
             rev = RELEASE_KERNEL_REV
         )
     }
@@ -2423,7 +2506,7 @@ mod tests {
     }
 
     #[test]
-    fn release_policy_accepts_a_tag_only_v010_trigger() {
+    fn release_policy_accepts_a_vstar_trigger_with_scoped_writes() {
         let repo = release_repo(
             &valid_release_trigger(),
             "  contents: read\n",
@@ -2440,7 +2523,8 @@ mod tests {
             "  workflow_dispatch:\n",
             "  schedule:\n    - cron: '0 0 * * *'\n",
             "  pull_request:\n",
-            "  push:\n    tags:\n      - v0.2.0\n",
+            "  push:\n    tags:\n      - v0.1.0\n",
+            "  push:\n    tags:\n      - main\n",
             "  push:\n",
         ] {
             let repo = release_repo(trigger, "  contents: read\n", &valid_release_body());
@@ -2453,7 +2537,7 @@ mod tests {
     }
 
     #[test]
-    fn release_policy_requires_read_only_contents_permission() {
+    fn release_policy_requires_read_only_top_level_permission() {
         for permissions in ["  contents: write\n", "  issues: write\n"] {
             let repo = release_repo(&valid_release_trigger(), permissions, &valid_release_body());
 
@@ -2465,14 +2549,53 @@ mod tests {
     }
 
     #[test]
-    fn release_policy_requires_the_pinned_kernel() {
-        let body = valid_release_body().replace(RELEASE_KERNEL_REV, &"0".repeat(40));
-        let repo = release_repo(&valid_release_trigger(), "  contents: read\n", &body);
+    fn release_policy_rejects_job_writes_outside_the_provenance_scope() {
+        for write in ["actions: write", "packages: write", "issues: write"] {
+            let body = valid_release_body()
+                .replace("      contents: write\n", &format!("      {write}\n"));
+            let repo = release_repo(&valid_release_trigger(), "  contents: read\n", &body);
 
-        assert!(
-            check_release_policy(repo.path()).is_err(),
-            "a wrong kernel revision must be rejected"
-        );
+            assert!(
+                check_release_policy(repo.path()).is_err(),
+                "job write must be rejected: {write:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_policy_requires_the_pinned_kernel_and_parameterized_archives() {
+        let body = valid_release_body();
+        let wrong_rev = body.replace(RELEASE_KERNEL_REV, &"0".repeat(40));
+        let unparameterized = body.replace("github.ref_name", "v0.1.0");
+        for body in [wrong_rev.as_str(), unparameterized.as_str()] {
+            let repo = release_repo(&valid_release_trigger(), "  contents: read\n", body);
+
+            assert!(
+                check_release_policy(repo.path()).is_err(),
+                "body must be rejected: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_policy_requires_attestation_and_release_assets() {
+        let body = valid_release_body();
+        let no_attestation =
+            body.replace("      - uses: actions/attest-build-provenance@sha\n", "");
+        let no_subject = body.replace("          subject-path: dist.tar.gz\n", "");
+        let no_release = body.replace("      - run: gh release create vX dist.tar.gz\n", "");
+        for body in [
+            no_attestation.as_str(),
+            no_subject.as_str(),
+            no_release.as_str(),
+        ] {
+            let repo = release_repo(&valid_release_trigger(), "  contents: read\n", body);
+
+            assert!(
+                check_release_policy(repo.path()).is_err(),
+                "body must be rejected: {body:?}"
+            );
+        }
     }
 
     #[test]
@@ -2558,7 +2681,7 @@ mod tests {
     }
 
     #[test]
-    fn dist_policy_requires_dist_and_versioned_archives_in_release() {
+    fn dist_policy_requires_dist_and_tag_version_in_release() {
         let without_dist = valid_release_body().replace("cargo xtask dist", "tar -czf archive");
         let repo = dist_repo(
             "0.1.0",
@@ -2571,17 +2694,16 @@ mod tests {
             "release without cargo xtask dist must be rejected"
         );
 
-        let stale_archive =
-            valid_release_body().replace("minicontainer-0.1.0-", "minicontainer-0.2.0-");
+        let untagged_version = valid_release_body().replace("github.ref_name", "0.1.0");
         let repo = dist_repo(
             "0.1.0",
             "0.1.0",
-            Some(&stale_archive),
+            Some(&untagged_version),
             Some(&valid_ci_body()),
         );
         assert!(
             check_dist_policy(repo.path()).is_err(),
-            "release archives must follow the Cargo package version"
+            "release archives must take their version from the release tag"
         );
     }
 

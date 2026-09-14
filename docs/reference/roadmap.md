@@ -39,8 +39,9 @@ E2Eの出力上限経路では、連打guestによる125終了、診断の一致
 
 ### 配布
 
-`v0.1.0`タグのpushでmacOS arm64用とLinux x86_64用の配布アーカイブを構築し、`minictr`、固定revisionのminiOS kernel、ライセンス、導入手順を含める。
-手順は[v0.1.0配布手順](releasing.md)、機能と制約の一覧は[v0.1.0 release notes](v0.1.0-release-notes.md)を参照する。
+`v*`タグのpushでmacOS arm64用とLinux x86_64用の配布アーカイブを構築し、tagのGitHub Releaseへ添付する。
+`minictr`、固定revisionのminiOS kernel、ライセンス、`MANIFEST.txt`、`SHA256SUMS`を含め、各アーカイブとchecksumに署名済みprovenanceを付ける。
+手順は[配布手順](releasing.md)、機能と制約の一覧は[v0.1.0 release notes](v0.1.0-release-notes.md)を参照する。
 
 ### 学習ガイド
 
