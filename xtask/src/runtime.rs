@@ -788,10 +788,12 @@ fn run_output_cap_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EE
             actual: format!("status {:?}", report.status),
         });
     }
-    if !report.stdout.is_empty() {
+    // The cap counts displayed bytes: up to 1 MiB streams to the consumer
+    // before the first byte past the cap refuses the run.
+    if report.stdout.is_empty() || report.stdout.len() > 1024 * 1024 {
         return Err(E2EError::UnexpectedRun {
             case: "output-cap stdout",
-            expected: "no forwarded guest output on host failure".to_owned(),
+            expected: "1 to 1048576 streamed bytes before the refusal".to_owned(),
             actual: format!("{} forwarded bytes", report.stdout.len()),
         });
     }

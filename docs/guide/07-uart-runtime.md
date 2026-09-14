@@ -16,7 +16,7 @@ decoderはheaderとpayloadを復元し、不正なheaderと64 KiBを超えるpay
 `Session`の状態は`AwaitReady`、`Running`、`Exited`の三つである。
 
 - `Ready`はABI versionのhandshakeである。期待と異なるversionは拒否する。
-- `Stdout`と`Stderr`はguest出力を連結して`RunOutcome`へ集める。
+- `Stdout`と`Stderr`はguest出力を連結して`RunOutcome`へ集める。`run_with_sink`では同じchunkを終了前に転送先へ逐次渡す。
 - `Diagnostic`はguestの診断bytesを連結する。成功失敗の判定には使わない。
 - `Exit`はu32 little-endianの終了codeを確定する。
 - `GuestError`はguest自身の実行失敗であり、型付きerrorとしてrunを失敗させる。

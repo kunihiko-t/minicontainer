@@ -46,6 +46,8 @@ pub enum RuntimeError {
     Process(ProcessError),
     /// QEMU UART sessionを復元できなかった。
     Session(SessionError),
+    /// 逐次転送先のconsumerがchunkの受け取りに失敗した。
+    Consumer(io::Error),
     /// 主操作の失敗を維持したまま、後始末でも失敗した。
     Cleanup {
         /// runが最初に失敗した理由。
@@ -75,6 +77,9 @@ impl fmt::Display for RuntimeError {
             Self::Io(error) => write!(formatter, "runtime io failed: {error}"),
             Self::Process(error) => write!(formatter, "runtime process failed: {error}"),
             Self::Session(error) => write!(formatter, "runtime session failed: {error}"),
+            Self::Consumer(error) => {
+                write!(formatter, "guest output consumer failed: {error}")
+            }
             Self::Cleanup { primary, failures } => {
                 write!(formatter, "{primary}; cleanup also failed")?;
                 for failure in failures {
@@ -99,7 +104,7 @@ impl Error for RuntimeError {
             Self::Bundle(error) => Some(error),
             Self::InvalidDeadline => None,
             Self::UnsafePayloadPath(_) => None,
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::Consumer(error) => Some(error),
             Self::Process(error) => Some(error),
             Self::Session(error) => Some(error),
             Self::Cleanup { primary, .. } => Some(primary),

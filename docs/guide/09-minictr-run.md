@@ -215,10 +215,11 @@ redirect、timeout、size上限の値は[第12章](12-oci-image-spec.md)を参�
 
 解決したimage tagはcontent-addressed storeから検証済みbundle bytesとして取り出す。
 bundleとkernel pathと期限をruntimeへ渡し、guest outcomeを受け取る。
-ゲスト出力は実行中にメモリーへ蓄積し、成功結果を受け取ってから標準出力、標準エラー出力の順に書き出す。
-二つのストリーム間で、ゲストが出力した順序は保存しない。
-書き込みやフラッシュに失敗したらホスト側の失敗として終わる。
-ランタイムがエラーを返した場合、途中まで蓄積したゲスト出力はCLIに返らない。
+ゲスト出力はdecodeされ次第、stdout chunkは標準出力へ、stderr chunkは標準エラー出力へ、guest frameの順序どおり逐次書き出す。
+pipe越しでも進行が見えるよう、chunkごとにflushする。
+二つのストリームは区別して書き出すが、ホスト側の二出力間の到達順序は保証しない。
+run途中の書き込みやフラッシュ失敗はconsumer失敗としてrunを中断し、QEMU回収とpayload削除を経てホスト側の失敗で終わる。
+ランタイムがエラーを返した場合、中断前に書き出した分は残るが、残りの出力は届かない。
 E2Eのhappy pathは同梱ゲストを`image build`、`image inspect`、`run`へ一続きで通し、このflow全体を公開CLIで検証する。
 
 ## 終了code

@@ -9,7 +9,7 @@ runの失敗は、出所で三つに分ける。
 アプリケーションの非0終了は、ランタイムの失敗とは区別してゲストの結果として返す。
 その値をアプリケーションの成功とみなすかは、呼び出し側が判断する。
 
-- host error: bundle不正、期限の表現不能、payload pathの拒否、QEMU起動失敗、入出力error、cleanup失敗、QEMUの非0終了、出力合計の上限超過。
+- host error: bundle不正、期限の表現不能、payload pathの拒否、QEMU起動失敗、入出力error、cleanup失敗、QEMUの非0終了、出力合計の上限超過、consumer失敗。
 - guest failure: `GuestError` frame。実行中の異常に加え、Exit後のresource回収失敗もここに入る。
 - protocol破損: 不正header、truncated frame、順序違反、Exit欠落、ABI不一致、Exit payload違反、64 KiB超過（frame payloadとboot text）。
 
@@ -34,6 +34,7 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写る。
 - `guest reported an error`を含む行はguest自身の実行失敗である。
 - `runtime session failed: QEMU exited unsuccessfully`を含む行はExit後のQEMU非0終了である。
 - `guest output exceeds 1 MiB`を含む行は出力合計の上限超過である。
+- `guest output consumer failed`を含む行は、run途中の標準出力・標準エラー出力への書き出し失敗である。QEMU回収とpayload削除は行われる。
 - `; cleanup also failed`を含む行は、主操作に加えて後始末も失敗したことを示す。
 
 guest stderrのbytes自体にも`minictr:`は付かない。
@@ -87,7 +88,8 @@ Exit後の`Diagnostic`も合計に数えるため、終了確定後の連打でh
 firmware由来のboot textは64 KiBの別上限で抑える。
 
 上限超過はhost errorであり、終了code 125に写る。
-ランタイムの失敗時には`RunOutcome`が返らないため、途中まで蓄積した出力は転送しない。
+ランタイムの失敗時には`RunOutcome`が返らないため、蓄積分が結果として返ることはない。
+ただし`run_with_sink`では拒否前のchunkが既に転送先へ届いているため、上限超過の診断が出ても表示済みの出力は残る。
 出力上限経路の検証では、125終了と診断の一致に加えてQEMUと一時領域の残留がないことを確認する。
 
 ## 診断logの扱い

@@ -15,6 +15,7 @@ pub use session::{RunOutcome, Session, SessionError, SessionEvent};
 pub use temp::PayloadTemp;
 
 use std::{
+    io,
     path::Path,
     time::{Duration, Instant},
 };
@@ -29,6 +30,26 @@ pub struct RunRequest<'a> {
     pub deadline: Duration,
 }
 
+/// decode済みguest eventをrunの終了前に受け取る転送先。
+///
+/// `push`はguest frameの順序どおりに同期呼び出しされるため、遅いconsumerは
+/// event loopへbackpressureをかける。ただし全体の期限は変わらず、停滞した
+/// consumerを待ってrunが期限を延ばすことはない。`Err`を返すとrunは
+/// [`RuntimeError::Consumer`]で中断するが、QEMUの回収とpayload削除は行う。
+pub trait OutputSink {
+    /// 一つのdecode済みeventを順序どおりに受け取る。
+    fn push(&mut self, event: &SessionEvent) -> io::Result<()>;
+}
+
+/// eventを読み捨てる転送先。
+struct Discard;
+
+impl OutputSink for Discard {
+    fn push(&mut self, _event: &SessionEvent) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// MiniBundleを一時payloadとしてQEMU上で実行するruntime。
 pub struct Runtime<B: ProcessBackend = SystemProcessBackend> {
     backend: B,
@@ -41,7 +62,21 @@ impl<B: ProcessBackend> Runtime<B> {
     }
 
     /// MiniBundleを検証し、QEMUで実行してguest outcomeを返す。
+    ///
+    /// guest出力は`RunOutcome`にだけ集まり、終了前に外部へ出さない。
     pub fn run(&self, request: RunRequest<'_>) -> Result<RunOutcome, RuntimeError> {
+        self.run_with_sink(request, &mut Discard)
+    }
+
+    /// decode済みeventを`sink`へ逐次転送しながらrunを実行する。
+    ///
+    /// 転送しても`Session`の蓄積は変わらないため、1 MiB上限は表示済みbyteを
+    /// 含めた合計で効く。consumerの失敗は[`RuntimeError::Consumer`]で返す。
+    pub fn run_with_sink<S: OutputSink>(
+        &self,
+        request: RunRequest<'_>,
+        sink: &mut S,
+    ) -> Result<RunOutcome, RuntimeError> {
         // 表現できない期限は、payloadや子processを取得する前に型付きerrorへ
         // 変える。`Instant + Duration`のoverflow panicを副作用の後で起こさず、
         // Dropを実装しないbackendでも子processを残さない。
@@ -60,16 +95,23 @@ impl<B: ProcessBackend> Runtime<B> {
         };
 
         let mut session = Session::new();
-        let primary = loop {
+        let primary = 'events: loop {
             // queueにeventが残っていても全体の期限を強制する。backendが期限
             // 過ぎの出力を返し続けても、この検査がrunをtimeoutで終わらせる。
+            // sinkの停滞でloopが止まっても、復帰後の先頭検査が期限を効かせる。
             if Instant::now() >= deadline {
                 break Err(RuntimeError::Process(ProcessError::TimedOut));
             }
             match child.next_event(deadline) {
                 Ok(ProcessEvent::Uart(bytes)) => {
-                    if let Err(error) = session.push_uart(&bytes) {
-                        break Err(RuntimeError::Session(error));
+                    let events = match session.push_uart(&bytes) {
+                        Ok(events) => events,
+                        Err(error) => break Err(RuntimeError::Session(error)),
+                    };
+                    for event in &events {
+                        if let Err(error) = sink.push(event) {
+                            break 'events Err(RuntimeError::Consumer(error));
+                        }
                     }
                 }
                 Ok(ProcessEvent::Diagnostic(_)) => {}
@@ -146,8 +188,8 @@ mod tests {
     use minios_abi::control::{FrameHeader, FrameKind, ReadyPayload};
 
     use super::{
-        CleanupFailure, ProcessBackend, ProcessControl, ProcessError, ProcessEvent, ProcessStatus,
-        QemuCommand, RunRequest, Runtime, RuntimeError, SessionError,
+        CleanupFailure, OutputSink, ProcessBackend, ProcessControl, ProcessError, ProcessEvent,
+        ProcessStatus, QemuCommand, RunRequest, Runtime, RuntimeError, SessionError, SessionEvent,
     };
 
     // Catches skipping any part of the happy-path lifecycle: only a validated
@@ -403,6 +445,297 @@ mod tests {
                 ));
             }
             other => panic!("expected primary and cleanup failures, got {other:?}"),
+        }
+    }
+
+    // Catches buffering the whole run before showing anything: every decoded
+    // chunk must reach the sink, in guest frame order with streams kept
+    // distinct, before the child is reaped.
+    #[test]
+    fn streams_stdout_and_stderr_chunks_before_exit() {
+        let mut stream = ready_frame();
+        stream.extend_from_slice(&frame(FrameKind::Stdout, b"out-one\n"));
+        stream.extend_from_slice(&frame(FrameKind::Stderr, b"err-one\n"));
+        stream.extend_from_slice(&frame(FrameKind::Stdout, b"out-two\n"));
+        stream.extend_from_slice(&frame(FrameKind::Exit, &7_u32.to_le_bytes()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(
+            trace.clone(),
+            payload.clone(),
+            vec![
+                ProcessEvent::Uart(stream),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        ));
+        let mut sink = RecordingSink::new(trace.clone());
+
+        let outcome = runtime
+            .run_with_sink(
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: "/kernel".as_ref(),
+                    deadline: Duration::from_secs(1),
+                },
+                &mut sink,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 7);
+        assert_eq!(
+            sink.events,
+            vec![
+                SessionEvent::Ready,
+                SessionEvent::Stdout(b"out-one\n".to_vec()),
+                SessionEvent::Stderr(b"err-one\n".to_vec()),
+                SessionEvent::Stdout(b"out-two\n".to_vec()),
+                SessionEvent::Exit(7),
+            ]
+        );
+        assert!(
+            sink.reaps_at_push.iter().all(|reaps| *reaps == 0),
+            "every chunk must arrive before the reap, got {:?}",
+            sink.reaps_at_push
+        );
+        assert!(trace.borrow().contains(&"reap"));
+    }
+
+    // Catches losing a control frame that straddles two UART reads: the
+    // decoder still reassembles it and the sink observes one whole chunk.
+    #[test]
+    fn reassembles_a_stdout_frame_split_across_uart_reads() {
+        let mut full = ready_frame();
+        let cut = full.len() + 3;
+        full.extend_from_slice(&frame(FrameKind::Stdout, b"split payload"));
+        full.extend_from_slice(&frame(FrameKind::Exit, &0_u32.to_le_bytes()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(
+            trace.clone(),
+            payload.clone(),
+            vec![
+                ProcessEvent::Uart(full[..cut].to_vec()),
+                ProcessEvent::Uart(full[cut..].to_vec()),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        ));
+        let mut sink = RecordingSink::new(trace.clone());
+
+        runtime
+            .run_with_sink(
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: "/kernel".as_ref(),
+                    deadline: Duration::from_secs(1),
+                },
+                &mut sink,
+            )
+            .unwrap();
+
+        let stdout: Vec<&[u8]> = sink
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Stdout(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stdout, vec![b"split payload".as_slice()]);
+    }
+
+    // Catches leaking the child or payload when the consumer fails mid-run:
+    // the failure is typed, and cleanup still runs exactly once.
+    #[test]
+    fn consumer_failure_aborts_the_run_but_still_reaps_qemu() {
+        let mut stream = ready_frame();
+        stream.extend_from_slice(&frame(FrameKind::Stdout, b"shown\n"));
+        stream.extend_from_slice(&frame(FrameKind::Stderr, b"never shown\n"));
+        stream.extend_from_slice(&frame(FrameKind::Exit, &0_u32.to_le_bytes()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(
+            trace.clone(),
+            payload.clone(),
+            vec![
+                ProcessEvent::Uart(stream),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        ));
+        let mut sink = RecordingSink::new(trace.clone()).fail_after(2);
+
+        let error = runtime
+            .run_with_sink(
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: "/kernel".as_ref(),
+                    deadline: Duration::from_secs(1),
+                },
+                &mut sink,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Consumer(_)),
+            "a sink failure must be typed, got {error:?}"
+        );
+        assert_eq!(sink.events.len(), 2);
+        assert_eq!(
+            trace
+                .borrow()
+                .iter()
+                .filter(|event| **event == "reap")
+                .count(),
+            1
+        );
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches a slow consumer postponing the run past its deadline: the
+    // callback applies backpressure, but the overall deadline still ends the
+    // run and reaps the child.
+    #[test]
+    fn slow_consumer_cannot_extend_the_run_past_the_deadline() {
+        let mut stream = ready_frame();
+        stream.extend_from_slice(&frame(FrameKind::Stdout, b"slow\n"));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(
+            trace.clone(),
+            payload.clone(),
+            vec![
+                ProcessEvent::Uart(stream),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        ));
+        let mut sink = RecordingSink::new(trace.clone()).sleep(Duration::from_millis(300));
+
+        let error = runtime
+            .run_with_sink(
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: "/kernel".as_ref(),
+                    deadline: Duration::from_millis(50),
+                },
+                &mut sink,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Process(ProcessError::TimedOut)),
+            "a stalled consumer must still time out, got {error:?}"
+        );
+        assert_eq!(
+            trace
+                .borrow()
+                .iter()
+                .filter(|event| **event == "reap")
+                .count(),
+            1
+        );
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches counting only buffered bytes toward the output cap: exactly
+    // 1 MiB streams to the consumer, and one more byte is refused even though
+    // the earlier bytes were already displayed.
+    #[test]
+    fn output_cap_counts_bytes_already_streamed_to_the_consumer() {
+        let chunk = vec![b'o'; 32 * 1024];
+        let mut flood = ready_frame();
+        for _ in 0..32 {
+            flood.extend_from_slice(&frame(FrameKind::Stdout, &chunk));
+        }
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(
+            trace.clone(),
+            payload.clone(),
+            vec![
+                ProcessEvent::Uart(flood),
+                ProcessEvent::Uart(frame(FrameKind::Stderr, b"o")),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        ));
+        let mut sink = RecordingSink::new(trace.clone());
+
+        let error = runtime
+            .run_with_sink(
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: "/kernel".as_ref(),
+                    deadline: Duration::from_secs(5),
+                },
+                &mut sink,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RuntimeError::Session(SessionError::GuestOutputTooLarge)
+            ),
+            "the byte past 1 MiB must be refused, got {error:?}"
+        );
+        let streamed: usize = sink
+            .events
+            .iter()
+            .map(|event| match event {
+                SessionEvent::Stdout(bytes)
+                | SessionEvent::Stderr(bytes)
+                | SessionEvent::Diagnostic(bytes) => bytes.len(),
+                SessionEvent::Ready | SessionEvent::Exit(_) => 0,
+            })
+            .sum();
+        assert_eq!(streamed, 1024 * 1024);
+    }
+
+    struct RecordingSink {
+        trace: Rc<RefCell<Vec<&'static str>>>,
+        events: Vec<SessionEvent>,
+        reaps_at_push: Vec<usize>,
+        fail_after: usize,
+        sleep: Duration,
+    }
+
+    impl RecordingSink {
+        fn new(trace: Rc<RefCell<Vec<&'static str>>>) -> Self {
+            Self {
+                trace,
+                events: Vec::new(),
+                reaps_at_push: Vec::new(),
+                fail_after: usize::MAX,
+                sleep: Duration::ZERO,
+            }
+        }
+
+        fn fail_after(mut self, pushes: usize) -> Self {
+            self.fail_after = pushes;
+            self
+        }
+
+        fn sleep(mut self, duration: Duration) -> Self {
+            self.sleep = duration;
+            self
+        }
+    }
+
+    impl OutputSink for RecordingSink {
+        fn push(&mut self, event: &SessionEvent) -> io::Result<()> {
+            if !self.sleep.is_zero() {
+                std::thread::sleep(self.sleep);
+            }
+            if self.events.len() >= self.fail_after {
+                return Err(io::Error::other("injected consumer failure"));
+            }
+            self.reaps_at_push.push(
+                self.trace
+                    .borrow()
+                    .iter()
+                    .filter(|event| **event == "reap")
+                    .count(),
+            );
+            self.events.push(event.clone());
+            Ok(())
         }
     }
 
