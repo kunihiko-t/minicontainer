@@ -46,6 +46,25 @@ indexの`platform`は任意のhintであり、不在でもconfigの宣言で検�
 toolが複写時に付けるannotationは無視し、tagはCLI引数から付ける。
 受け入れ判定の一覧は対応文書の判定表が正である。
 
+## registry pullの契約
+
+`image pull-oci`は匿名のdigest pin pullだけを行う。
+参照は`host[:port]/repository@sha256:<hex>`の形であり、tagの解決と認証は対象外である。
+取得順序はmanifest、config、layerであり、各blobはsizeとdigestの検証を通してから使う。
+manifest自体のdigestはpinと照合し、不一致は取得の失敗にする。
+
+転送の境界は次の通りである。
+
+- schemeはHTTPSだけを使う。loopbackへのHTTPはfixture testだけの例外である。
+- redirectは1 blobにつき5回まで追い、HTTPS以外への転送は取得前に拒否する。
+- timeoutは接続10秒、1 blobの要求全体で60秒である。
+- size上限はmanifestとconfigが64 KiB、layerが8 MiBであり、宣言と実測の両方で検査する。
+
+blobはmemoryに読み、検証が通るまでstoreを変更しない。
+失敗時は一時fileを作らず、storeにtagもblobも残さない。
+診断は状態と成否だけを出し、URLやdigest、認証情報を含めない。
+registryの応答は検証が通るまで信頼しない入力として扱う。
+
 ## 往復の見通し
 
 exportはstoreのbundle bytesを不変のpayloadとしてlayoutへ包む。

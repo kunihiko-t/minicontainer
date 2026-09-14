@@ -18,11 +18,11 @@ use std::{
 };
 
 /// One verified descriptor: its blob bytes plus the claimed digest.
-struct Blob {
+pub(crate) struct Blob {
     /// Blob bytes as read from the layout.
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     /// Claimed `sha256:<hex>` digest.
-    digest: String,
+    pub(crate) digest: String,
 }
 
 /// Imports one layout directory into canonical MiniBundle bytes. The layer
@@ -45,7 +45,6 @@ pub fn import_bundle(dir: &Path) -> Result<Vec<u8>, OciError> {
         .ok_or_else(|| shape("manifest is missing config"))?;
     require_media_type(config_entry, MEDIA_TYPE_CONFIG, "config")?;
     let config = read_blob(dir, &root, config_entry, MAX_JSON_LEN, "config")?;
-    let config_value = parse_json(&config.bytes)?;
 
     let layers = manifest_value
         .get("layers")
@@ -66,6 +65,15 @@ pub fn import_bundle(dir: &Path) -> Result<Vec<u8>, OciError> {
         "layer",
     )?;
 
+    assemble_bundle(&config.bytes, &layer)
+}
+
+/// Assembles canonical MiniBundle bytes from verified config and layer
+/// blobs. Both blobs must already match their manifest descriptors; this
+/// function parses the config, cross-checks it against the bundle, and
+/// rebuilds canonical bytes. Registry pulls share this core.
+pub(crate) fn assemble_bundle(config: &[u8], layer: &Blob) -> Result<Vec<u8>, OciError> {
+    let config_value = parse_json(config)?;
     let bundle = minicontainer_bundle::parse(&layer.bytes).map_err(OciError::Bundle)?;
     require_config_match(&config_value, &layer.digest, &bundle)?;
     let args: Vec<&str> = bundle.manifest.args().collect();
@@ -118,7 +126,11 @@ fn single_entry<'a>(value: &'a JsonValue, member: &str) -> Result<&'a JsonValue,
 }
 
 /// Requires one descriptor media type.
-fn require_media_type(entry: &JsonValue, expected: &str, role: &str) -> Result<(), OciError> {
+pub(crate) fn require_media_type(
+    entry: &JsonValue,
+    expected: &str,
+    role: &str,
+) -> Result<(), OciError> {
     match entry.get("mediaType").and_then(JsonValue::as_str) {
         Some(media) if media == expected => Ok(()),
         Some(media) => Err(shape(&format!("{role} media type is unsupported: {media}"))),
@@ -318,7 +330,7 @@ fn read_layout_file(
 }
 
 /// Decodes a strict `sha256:<64 lowercase hex>` digest to its hex part.
-fn decode_digest(digest: &str) -> Option<String> {
+pub(crate) fn decode_digest(digest: &str) -> Option<String> {
     let hex = digest.strip_prefix("sha256:")?;
     if hex.len() != 64
         || !hex
@@ -338,7 +350,7 @@ fn digest_of(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// Builds a shape error.
-fn shape(message: &str) -> OciError {
+pub(crate) fn shape(message: &str) -> OciError {
     OciError::Shape {
         message: message.to_owned(),
     }

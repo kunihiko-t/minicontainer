@@ -5,7 +5,7 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
@@ -19,6 +19,7 @@ usage: minictr image remove [--store PATH] IMAGE
 usage: minictr image prune [--store PATH] [--dry-run] [--force]
 usage: minictr image export-oci [--store PATH] IMAGE --output DIR
 usage: minictr image import-oci [--store PATH] IMAGE DIR
+usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -49,13 +50,14 @@ FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う�
 `--output`のDIRは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `image import-oci`はIMAGEとDIRの二つを取り、`--store`は任意であり、optionは前後どこに置いてもよい。
 DIRもOS pathとして非UTF-8 byteを透過的に扱う。
+`image pull-oci`はIMAGEとREFERENCEの二つを取り、`--store`は任意であり、optionは前後どこに置いてもよい。
 `image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
 `doctor`はpositionalを取らず、`--store`と`--kernel`だけを一度ずつ指定できる。
 
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
-`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`のstore解決も同じ順序を使う。
+`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`のstore解決も同じ順序を使う。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
 
 ## imageの登録
@@ -201,6 +203,13 @@ myapp sha256:<64桁の小文字16進数>
 layout外への参照とsymlinkは拒否し、未知のplatformとmedia typeは型付きerrorになる。
 復元したbundleは正準形に組み立て直し、storeには正準bytesだけを置く。
 tagはCLI引数から付け、layoutのannotationは引き継がない。
+
+`image pull-oci`は、registryからdigest pinで匿名pullし、IMAGEのtagでstoreへ登録する。
+参照の形は`host[:port]/repository@sha256:<64桁の小文字16進数>`であり、tag指定と認証情報は受け入れない。
+成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
+取得はmanifest、config、layerの順に行い、検証が通るまでstoreを変更しない。
+HTTPSだけを使い、認証を求めるregistryは型付きerrorで報告する。
+redirect、timeout、size上限の値は[第12章](12-oci-image-spec.md)を参照する。
 
 ## 実行と入出力
 

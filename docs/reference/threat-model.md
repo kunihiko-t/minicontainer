@@ -29,6 +29,9 @@ OCI Image Layoutのdirectoryとregistryの応答は、検証が通るまで信�
 layout内の参照pathはrootの内側だけに解決し、symlinkは追従しない。
 JSON文書は64 KiB、MiniBundle layerは8 MiBの上限で読み、超過は拒否する。
 registry pullはhttpsだけを使い、redirectは5回までとし、認証情報は扱わない。
+loopbackへのhttpはfixture testだけの例外であり、CLIのpullはhttpsだけを使う。
+接続10秒、1 blobの要求全体で60秒のtimeoutを付け、失敗時はstoreを変更しない。
+診断は状態と成否だけを出し、URLやdigest、認証情報を含めない。
 未知のannotationとfieldは無視するが、未知のmedia typeとplatformは拒否する。
 対応の詳細は[MiniBundleとOCI Image Layoutの対応](minibundle-oci-mapping.md)を参照する。
 

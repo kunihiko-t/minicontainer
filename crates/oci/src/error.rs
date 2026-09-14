@@ -104,6 +104,11 @@ pub enum OciError {
         /// 不一致の内容。
         message: String,
     },
+    /// registryの参照や転送が失敗した。
+    Registry {
+        /// 失敗の内容。secretは含まない。
+        message: String,
+    },
 }
 
 impl fmt::Display for OciError {
@@ -188,6 +193,9 @@ impl fmt::Display for OciError {
             ),
             Self::ConfigMismatch { message } => {
                 write!(formatter, "oci config does not match the bundle: {message}")
+            }
+            Self::Registry { message } => {
+                write!(formatter, "registry pull failed: {message}")
             }
         }
     }

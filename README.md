@@ -138,7 +138,7 @@ exit=42
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
@@ -151,6 +151,9 @@ usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
 usage: minictr image remove [--store PATH] IMAGE
 usage: minictr image prune [--store PATH] [--dry-run] [--force]
+usage: minictr image export-oci [--store PATH] IMAGE --output DIR
+usage: minictr image import-oci [--store PATH] IMAGE DIR
+usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -165,6 +168,18 @@ usage: minictr image prune [--store PATH] [--dry-run] [--force]
 `image remove`は指定タグだけを削除して`IMAGE removed`と出し、blobと他のタグは保持する。存在しないタグは型付きエラーで失敗する。
 `image prune`は未参照blobの検出だけが既定動作であり、`--force`の指定時だけ削除する。削除前に参照を再確認し、部分失敗は個別に報告する。
 
+`image export-oci`はstoreのimageをOCI Image Layoutのdirectoryへ書き出し、`image import-oci`はlayoutを検証してstoreへ登録する。
+`image pull-oci`はregistryからdigest pinで匿名pullし、指定したタグで登録する。
+成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
+
+```sh
+cargo run -p minictr --locked -- image pull-oci --store "$STORE" hello registry.example.com:5000/demo/hello@sha256:<64桁の小文字16進数>
+```
+
+pullはHTTPSだけを使い、認証はしない。参照はtagではなくdigest pinだけを受け入れる。
+redirectは5回まで、接続10秒・要求60秒のtimeout、manifestとconfigは64 KiB・layerは8 MiBの上限で取得する。
+詳細は[第12章](docs/guide/12-oci-image-spec.md)を参照する。
+
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。
 
@@ -174,7 +189,8 @@ QEMUバックエンドは固定した引数で起動し、通常の成功経路�
 後始末の失敗もエラーとして返す。ホストの停止や`SIGKILL`、`SIGTERM`による強制終了では、後始末を実行できない場合がある。
 ゲスト出力はメモリーに蓄積し、実行完了後に表示する。stdout、stderr、診断の合計は1 MiBが上限であり、超過はホスト側の失敗として扱う。対話入力とリアルタイムの出力表示には対応していない。
 
-OCI互換、ネットワーク、永続ボリューム、Linuxアプリケーション互換、マルチテナント分離は現在の機能ではない。
+OCI互換はMiniBundle用artifactの配布形式（export、import、匿名pull）だけであり、Docker runtime互換とLinuxアプリケーション実行互換ではない。
+ネットワークはregistry pullのHTTPS clientだけであり、ゲストへの提供、永続ボリューム、マルチテナント分離は現在の機能ではない。
 詳細は[脅威モデル](docs/reference/threat-model.md)で確認できる。
 
 ## 検証

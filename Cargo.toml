@@ -12,3 +12,4 @@ repository = "https://github.com/kunihiko-t/minicontainer"
 [workspace.dependencies]
 minios-abi = { git = "https://github.com/kunihiko-t/minios.git", tag = "minios-abi-v0.1.1" }
 sha2 = "=0.11.0"
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls"] }
