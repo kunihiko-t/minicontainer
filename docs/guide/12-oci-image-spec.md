@@ -65,6 +65,23 @@ blobはmemoryに読み、検証が通るまでstoreを変更しない。
 診断は状態と成否だけを出し、URLやdigest、認証情報を含めない。
 registryの応答は検証が通るまで信頼しない入力として扱う。
 
+## 互換表
+
+外部toolとの双方向交換を次の版で検証する。
+fixtureは`tests/fixtures/oci-interop/`に置き、由来と更新手順は同梱のREADMEが正である。
+
+| tool | 版 | 配布物の読み取り | tool出力の取り込み | 備考 |
+| --- | --- | --- | --- | --- |
+| ORAS | 1.3.4 | `cp`と`manifest fetch`と`blob fetch`で確認する | `cp`出力をimportして実行する | indexの`platform`を落とし`ref.name`を付ける。両方とも無視する |
+| Skopeo | 1.24.0 | `copy`と`inspect --raw`で確認する | `copy`出力をimportして実行する | indexの`platform`とannotationを落とす |
+
+CIのUbuntu jobは、ORASのpin版tarballのchecksum検証と導入、fixtureのchecksum検証、fixtureのimportとinspect、再exportのblob一致、実行可能guestのexportとtool複写とimportと実行を順に行う。
+SkopeoはUbuntuのaptで導入し、版をlogに残す。pin済みfixtureのimportが決定版の主張を担う。
+
+互換の主張は、blobのbyte一致とimportの成功と実行の成功だけである。
+annotation、tag、未知のfieldの保持は主張しない。importは捨てる。
+Docker向けLinux applicationの実行互換も主張しない。
+
 ## 往復の見通し
 
 exportはstoreのbundle bytesを不変のpayloadとしてlayoutへ包む。
