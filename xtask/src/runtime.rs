@@ -281,6 +281,16 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         capped.elapsed.as_secs_f64()
     ));
 
+    log("e2e: resources path (`--memory 256 --cpus 2` keeps stdout, stderr, exit 42)");
+    let resourced = run_resources_path(&minictr, &kernel)?;
+    log(&format!(
+        "e2e: resources path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
+        resourced.minictr_pid,
+        resourced.qemu_before,
+        resourced.qemu_after,
+        resourced.elapsed.as_secs_f64()
+    ));
+
     log("e2e: interrupt path (SIGINT to a running group exits 125 without leftovers)");
     let interrupted = run_interrupt_path(&minictr, &kernel)?;
     log(&format!(
@@ -807,6 +817,63 @@ fn run_output_cap_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EE
     Ok(report)
 }
 
+fn run_resources_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
+    let extra = [
+        OsString::from("--memory"),
+        OsString::from("256"),
+        OsString::from("--cpus"),
+        OsString::from("2"),
+    ];
+    let store = prepare_store(&hello_elf_bytes())?;
+    let store_path = store.path.clone();
+    let qemu_before = qemu_pids()?;
+    let payload_before = payload_temp_leftovers();
+    let started = Instant::now();
+    let outcome = run_minictr_with_extra_args(
+        minictr,
+        &store.path,
+        kernel,
+        HAPPY_PATH_TIMEOUT_MS,
+        E2E_IMAGE,
+        &extra,
+    );
+    let elapsed = started.elapsed();
+    let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
+    let completed = outcome?;
+    let report = CaseReport {
+        minictr_pid: completed.pid,
+        qemu_before,
+        qemu_after,
+        elapsed,
+        status: completed.status.code(),
+        stdout: completed.stdout,
+        stderr: completed.stderr,
+    };
+
+    if report.status != Some(E2E_EXIT_CODE) {
+        return Err(E2EError::UnexpectedRun {
+            case: "resources exit code",
+            expected: format!("exit {}", E2E_EXIT_CODE),
+            actual: format!("status {:?}", report.status),
+        });
+    }
+    if report.stdout != E2E_STDOUT {
+        return Err(E2EError::UnexpectedRun {
+            case: "resources stdout",
+            expected: format!("{:?}", E2E_STDOUT),
+            actual: format!("{:?}", report.stdout),
+        });
+    }
+    if report.stderr != E2E_STDERR {
+        return Err(E2EError::UnexpectedRun {
+            case: "resources stderr",
+            expected: format!("{:?}", E2E_STDERR),
+            actual: format!("{:?}", report.stderr),
+        });
+    }
+    Ok(report)
+}
+
 /// `minictr`のQEMUが現れるまで待ち、起動中のrunへsignalできる状態を
 /// 確認する。待ち時間内に現れなければ起動したrunを残さずtimeout error、
 /// 途中で`minictr`が終われば空振りとしてerrorにする。
@@ -963,13 +1030,21 @@ fn run_minictr(
     timeout_ms: &str,
     image: &str,
 ) -> Result<CompletedProcess, E2EError> {
-    run_with_timeout(
-        minictr,
-        &minictr_run_args(store, kernel, timeout_ms, image),
-        None,
-        &[],
-        QEMU_RUN_TIMEOUT,
-    )
+    run_minictr_with_extra_args(minictr, store, kernel, timeout_ms, image, &[])
+}
+
+fn run_minictr_with_extra_args(
+    minictr: &Path,
+    store: &Path,
+    kernel: &Path,
+    timeout_ms: &str,
+    image: &str,
+    extra: &[OsString],
+) -> Result<CompletedProcess, E2EError> {
+    let mut args = minictr_run_args(store, kernel, timeout_ms, image);
+    let image_at = args.len() - 1;
+    args.splice(image_at..image_at, extra.iter().cloned());
+    run_with_timeout(minictr, &args, None, &[], QEMU_RUN_TIMEOUT)
 }
 
 /// `minictr run`を自groupのleaderとして起動し、待たずに返す。signalを

@@ -15,7 +15,8 @@ use minicontainer_bundle::{
     ImageSpec, MAX_BUNDLE_LEN, Store, TagRecord, build, format_digest, parse, parse_digest,
 };
 use minicontainer_runtime::{
-    OutputSink, RunOutcome, RunRequest, Runtime, RuntimeError, SessionEvent, SystemProcessBackend,
+    OutputSink, QemuResources, RunOutcome, RunRequest, Runtime, RuntimeError, SessionEvent,
+    SystemProcessBackend,
 };
 
 use cli::{
@@ -419,6 +420,7 @@ pub trait Runner {
         bundle: &[u8],
         kernel: &Path,
         timeout: Duration,
+        resources: QemuResources,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError>;
@@ -465,6 +467,7 @@ impl Runner for RealRunner {
         bundle: &[u8],
         kernel: &Path,
         timeout: Duration,
+        resources: QemuResources,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError> {
@@ -485,6 +488,7 @@ impl Runner for RealRunner {
                 bundle,
                 kernel,
                 deadline: timeout,
+                resources,
             },
             &mut CliSink::new(stdout, stderr),
         )
@@ -510,6 +514,10 @@ pub fn run_resolved(
         &bundle,
         &resolved.kernel,
         resolved.timeout,
+        QemuResources {
+            memory_mib: resolved.memory_mib,
+            cpus: resolved.cpus,
+        },
         runner,
         stdout,
         stderr,
@@ -1360,13 +1368,14 @@ pub fn execute(
     bundle: &[u8],
     kernel: &Path,
     timeout: Duration,
+    resources: QemuResources,
     runner: &dyn Runner,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
     // Guest bytes are already streamed to stdout and stderr while the run
     // is in progress; only the exit code mapping and the final flush remain.
-    let outcome = match runner.run(bundle, kernel, timeout, stdout, stderr) {
+    let outcome = match runner.run(bundle, kernel, timeout, resources, stdout, stderr) {
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = writeln!(stderr, "minictr: {error}");
@@ -1450,6 +1459,7 @@ mod tests {
             _bundle: &[u8],
             _kernel: &Path,
             _timeout: Duration,
+            _resources: QemuResources,
             stdout: &mut dyn Write,
             stderr: &mut dyn Write,
         ) -> Result<RunOutcome, RuntimeError> {
@@ -1675,6 +1685,8 @@ mod tests {
             store: Path::new("/store").to_path_buf(),
             kernel: Path::new("/kernel").to_path_buf(),
             timeout: Duration::from_secs(5),
+            memory_mib: 128,
+            cpus: 1,
         }
     }
 
@@ -1747,6 +1759,53 @@ mod tests {
         assert_eq!(stderr, b"err");
     }
 
+    // Catches dropping configured resource limits between resolve and run:
+    // the runner observes the exact values carried by ResolvedRun.
+    #[test]
+    fn forwards_configured_limits_to_the_runner() {
+        struct RecordingRunner {
+            seen: RefCell<Option<QemuResources>>,
+        }
+
+        impl Runner for RecordingRunner {
+            fn run(
+                &self,
+                _bundle: &[u8],
+                _kernel: &Path,
+                _timeout: Duration,
+                resources: QemuResources,
+                _stdout: &mut dyn Write,
+                _stderr: &mut dyn Write,
+            ) -> Result<RunOutcome, RuntimeError> {
+                *self.seen.borrow_mut() = Some(resources);
+                Ok(outcome(b"", b"", 0))
+            }
+        }
+
+        let runner = RecordingRunner {
+            seen: RefCell::new(None),
+        };
+        let store = FakeStore {
+            result: Ok(vec![1, 2, 3]),
+        };
+        let mut config = resolved();
+        config.memory_mib = 256;
+        config.cpus = 2;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_resolved(&config, &runner, &store, &mut stdout, &mut stderr);
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            *runner.seen.borrow(),
+            Some(QemuResources {
+                memory_mib: 256,
+                cpus: 2,
+            })
+        );
+    }
+
     // Catches mapping a nonzero guest exit to success or to a host error.
     #[test]
     fn preserves_a_nonzero_guest_exit() {
@@ -1758,6 +1817,7 @@ mod tests {
             b"bundle",
             Path::new("/kernel"),
             Duration::from_secs(5),
+            QemuResources::DEFAULT,
             &runner,
             &mut stdout,
             &mut stderr,
@@ -1778,6 +1838,7 @@ mod tests {
             b"bundle",
             Path::new("/kernel"),
             Duration::from_secs(5),
+            QemuResources::DEFAULT,
             &runner,
             &mut stdout,
             &mut stderr,
@@ -1799,6 +1860,7 @@ mod tests {
             b"bundle",
             Path::new("/kernel"),
             Duration::from_secs(5),
+            QemuResources::DEFAULT,
             &runner,
             &mut stdout,
             &mut stderr,
@@ -1821,6 +1883,7 @@ mod tests {
             b"bundle",
             Path::new("/kernel"),
             Duration::from_secs(5),
+            QemuResources::DEFAULT,
             &runner,
             &mut stdout,
             &mut stderr,
@@ -1847,6 +1910,7 @@ mod tests {
             b"bundle",
             Path::new("/kernel"),
             Duration::from_secs(5),
+            QemuResources::DEFAULT,
             &runner,
             &mut stdout,
             &mut stderr,
@@ -1871,6 +1935,7 @@ mod tests {
             b"bundle",
             Path::new("/kernel"),
             Duration::from_secs(5),
+            QemuResources::DEFAULT,
             &runner,
             &mut stdout,
             &mut stderr,
@@ -1898,6 +1963,7 @@ mod tests {
             b"bundle",
             Path::new("/kernel"),
             Duration::from_secs(5),
+            QemuResources::DEFAULT,
             &runner,
             &mut stdout,
             &mut stderr,

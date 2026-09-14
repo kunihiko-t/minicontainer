@@ -83,6 +83,7 @@ Pull Requestの統合条件は[コントリビュート](../../CONTRIBUTING.md)�
 ## E2Eは最終段階である
 
 第16段階は、pin留めしたminiOS revisionからguest kernelをbuildし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了code 42を確認する。
+resources経路では`--memory 256 --cpus 2`の非既定値でも同じ出力と終了codeになり、QEMUと一時領域の残留がないことを確認する。
 timeout経路、malformed-frame経路、出力上限経路では、非0終了に加えてQEMUと一時領域の残留がないことを確認する。
 timeout経路とmalformed-frame経路では失敗時にguest出力を転送しない。
 出力上限経路では拒否までに1 MiB以内の出力が逐次転送されるため、125終了と診断の一致に加えて転送量が1 MiB以内であることを確認する。

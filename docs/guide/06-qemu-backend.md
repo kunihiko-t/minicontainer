@@ -5,19 +5,31 @@ payloadの用意は第5章、出力と終了の扱いは第7章と第8章を参�
 
 ## 決定的なcommand line
 
-`QemuCommand::new`はkernel pathとpayload pathから引数順まで固定の起動commandを組み立てる。
+`QemuCommand::new`はkernel path、payload path、resource量から引数順まで固定の起動commandを組み立てる。
 programは`qemu-system-riscv64`である。
 
 ```text
--machine virt -m 128M -smp 1 -bios default
+-machine virt -m <memory>M -smp <cpus> -bios default
 -kernel <kernel>
 -device loader,file=<payload>,addr=0x87800000,force-raw=on
 -serial stdio -monitor none -display none
 ```
 
-machineは`virt`、memoryは128 MiB、hartは一つである。
+machineは`virt`である。memoryとvCPUはCLIで指定し、省略時は128 MiBと1 vCPUになる。
+数値だけを書式化するため、QEMU引数への注入面はない。
 serialはstdioへ直結し、monitorとdisplayは無効化するため、QEMUは対話なしで動く。
 起動条件とkernel予約窓の検査はminiOS側が行い、host側はcommandの形だけを保証する。
+
+## resourceの範囲
+
+公開するmemoryは128から8192 MiB、vCPUは1から8である。
+memoryの下限128は、payload予約窓`0x8780_0000..0x8800_0000`がRAMに載るために必要であり、既定値と一致する。
+これより小さい値ではloaderがpayloadを配置できない。
+上限8192 MiBと8 vCPUは学習用途の公開上限であり、CPU quotaやhost cgroup、hotplugは対象外である。
+
+kernelはboot hartだけを使い、予約窓より上も管理しない。
+追加のhartはOpenSBIに駐留したままguestへ影響せず、追加のmemoryも未使用のまま残る。
+非既定値の起動はE2Eのresources経路 (`--memory 256 --cpus 2`で標準出力、標準エラー出力、終了code 42) で検証する。
 
 ## 子processの起動と読み取り
 

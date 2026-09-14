@@ -130,6 +130,12 @@ hello from guest
 exit=42
 ```
 
+guest resourceを変える場合は`--memory`と`--cpus`を付ける。どちらも省略時は128 MiBと1 vCPUのままである。
+
+```sh
+cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" --memory 256 --cpus 2 hello
+```
+
 ゲストの標準エラー出力は`minictr`の標準エラー出力に届く。Cargoのビルド状況も標準エラー出力に表示される。
 この例の42は意図した終了コードであり、シェルの`set -e`が有効でも結果を確認できる形にしている。
 `minictr`は0〜255のゲスト終了コードをそのまま返し、範囲外はホスト側の失敗として扱う。
@@ -142,7 +148,7 @@ exit=42
 構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
-usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
+usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image import [--store PATH] IMAGE FILE
