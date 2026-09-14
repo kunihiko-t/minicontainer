@@ -33,6 +33,8 @@ pub enum ImageCommand {
     Build(ImageBuildArgs),
     /// MiniBundle fileを検証してstoreへ登録する。
     Import(ImageImportArgs),
+    /// storeのMiniBundleを検証してfileへ書き出す。
+    Export(ImageExportArgs),
     /// 登録済みtagを一覧する。
     List(ImageListArgs),
     /// 一つのtagのmanifestを確認する。
@@ -59,6 +61,17 @@ pub struct ImageImportArgs {
     pub image: String,
     /// 読み取るMiniBundle fileのpath。
     pub file: PathBuf,
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
+}
+
+/// `image export`の型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageExportArgs {
+    /// store内で解決するimage tagまたは`sha256:`付きdigest。
+    pub image: String,
+    /// 書き出す先のfile path。
+    pub output: PathBuf,
     /// `--store`の指定値。`None`なら環境とHOMEから解決する。
     pub store: Option<PathBuf>,
 }
@@ -147,6 +160,17 @@ pub struct ResolvedImport {
     pub store: PathBuf,
 }
 
+/// `image export`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedExport {
+    /// store内で解決するimage tagまたは`sha256:`付きdigest。
+    pub image: String,
+    /// 書き出す先のfile path。
+    pub output: PathBuf,
+    /// bundle storeのroot。
+    pub store: PathBuf,
+}
+
 /// `image list`に必要な不変入力を解決した結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedList {
@@ -180,6 +204,10 @@ pub enum CliError {
     MissingImportImage,
     /// `image import`にbundle file pathが与えられなかった。
     MissingFile,
+    /// `image export`にimageが与えられなかった。
+    MissingExportImage,
+    /// `image export`に`--output`が与えられなかった。
+    MissingOutput,
     /// `image inspect`にimageが与えられなかった。
     MissingInspectImage,
     /// 余分なpositional引数。
@@ -216,6 +244,10 @@ impl fmt::Display for CliError {
                 formatter.write_str("missing image for `minictr image import`")
             }
             Self::MissingFile => formatter.write_str("missing file for `minictr image import`"),
+            Self::MissingExportImage => {
+                formatter.write_str("missing image for `minictr image export`")
+            }
+            Self::MissingOutput => formatter.write_str("missing output for `minictr image export`"),
             Self::MissingInspectImage => {
                 formatter.write_str("missing image for `minictr image inspect`")
             }
@@ -247,7 +279,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
+    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
 }
 
 /// OS引数からcommandをparseする。
@@ -268,6 +300,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
             match subcommand.as_str() {
                 "build" => return parse_image_build(arguments),
                 "import" => return parse_image_import(arguments),
+                "export" => return parse_image_export(arguments),
                 "list" => return parse_image_list(arguments),
                 "inspect" => return parse_image_inspect(arguments),
                 unknown => return Err(CliError::UnknownCommand(unknown.to_owned())),
@@ -472,6 +505,68 @@ fn parse_image_import(arguments: impl IntoIterator<Item = OsString>) -> Result<C
     Ok(Command::Image(ImageCommand::Import(ImageImportArgs {
         image,
         file,
+        store,
+    })))
+}
+
+/// `image export`の引数をparseする。IMAGEを一つ取り、`--output`は必須で
+/// `--store`と共に前後どこに置いてもよい。
+fn parse_image_export(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut image: Option<String> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut store: Option<PathBuf> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                "--output" => {
+                    if output.is_some() {
+                        return Err(CliError::DuplicateOption("--output"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--output"))?,
+                    };
+                    output = Some(PathBuf::from(value));
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        if image.is_some() {
+            return Err(CliError::UnexpectedArgument(text));
+        }
+        image = Some(text);
+    }
+
+    let Some(image) = image else {
+        return Err(CliError::MissingExportImage);
+    };
+    let Some(output) = output else {
+        return Err(CliError::MissingOutput);
+    };
+    Ok(Command::Image(ImageCommand::Export(ImageExportArgs {
+        image,
+        output,
         store,
     })))
 }
@@ -737,6 +832,25 @@ pub fn resolve_import(
     Ok(ResolvedImport {
         image: args.image.clone(),
         file: args.file.clone(),
+        store,
+    })
+}
+
+/// parse済み`image export`引数と環境からstore pathを解決する。
+pub fn resolve_export(
+    args: &ImageExportArgs,
+    env: &dyn Environ,
+) -> Result<ResolvedExport, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedExport {
+        image: args.image.clone(),
+        output: args.output.clone(),
         store,
     })
 }
@@ -1142,7 +1256,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
+            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE"
         );
     }
 
@@ -1682,6 +1796,167 @@ mod tests {
             home: None,
         };
         assert_eq!(resolve_import(&args, &env), Err(CliError::MissingHome));
+    }
+
+    // Catches drifting from the export acceptance syntax: `image export`
+    // takes an image tag and a required `--output` path.
+    #[test]
+    fn parses_image_export_with_required_output() {
+        assert_eq!(
+            parse(["image", "export", "hello", "--output", "./hello.mcb"]),
+            Ok(Command::Image(ImageCommand::Export(ImageExportArgs {
+                image: "hello".into(),
+                output: PathBuf::from("./hello.mcb"),
+                store: None,
+            })))
+        );
+    }
+
+    // Catches rejecting a valid option order: `--store` and `--output`
+    // may precede, split, or follow the IMAGE positional.
+    #[test]
+    fn parses_image_export_options_in_any_order() {
+        let expected = Command::Image(ImageCommand::Export(ImageExportArgs {
+            image: "hello".into(),
+            output: PathBuf::from("./hello.mcb"),
+            store: Some(PathBuf::from("/data/store")),
+        }));
+
+        assert_eq!(
+            parse([
+                "image",
+                "export",
+                "--store",
+                "/data/store",
+                "--output",
+                "./hello.mcb",
+                "hello",
+            ]),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "export",
+                "hello",
+                "--store=/data/store",
+                "--output=./hello.mcb",
+            ]),
+            Ok(expected)
+        );
+    }
+
+    // Catches accepting malformed export options or positionals.
+    #[test]
+    fn rejects_invalid_image_export_arguments() {
+        assert_eq!(
+            parse(["image", "export"]),
+            Err(CliError::MissingExportImage)
+        );
+        assert_eq!(
+            parse(["image", "export", "--output", "./a.mcb"]),
+            Err(CliError::MissingExportImage)
+        );
+        assert_eq!(
+            parse(["image", "export", "hello"]),
+            Err(CliError::MissingOutput)
+        );
+        assert_eq!(
+            parse(["image", "export", "hello", "extra", "--output", "./a.mcb"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+        assert_eq!(
+            parse([
+                "image", "export", "--output", "./a.mcb", "--output", "./b.mcb", "hello",
+            ]),
+            Err(CliError::DuplicateOption("--output"))
+        );
+        assert_eq!(
+            parse(["image", "export", "--output"]),
+            Err(CliError::MissingValue("--output"))
+        );
+        assert_eq!(
+            parse(["image", "export", "hello", "--arg", "x"]),
+            Err(CliError::UnknownOption("--arg".to_owned()))
+        );
+    }
+
+    // Catches decoding the `--output` value: it stays an opaque OS path
+    // while the IMAGE tag must remain UTF-8.
+    #[test]
+    fn keeps_non_utf8_export_paths_as_paths() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0xff]);
+        let parsed = parse_os([
+            OsString::from("image"),
+            OsString::from("export"),
+            OsString::from("hello"),
+            OsString::from("--output"),
+            raw.clone(),
+        ])
+        .unwrap();
+        let Command::Image(ImageCommand::Export(args)) = parsed else {
+            panic!("expected an image export command");
+        };
+        assert_eq!(args.output.as_os_str().as_bytes(), raw.as_bytes());
+
+        assert_eq!(
+            parse_os([
+                OsString::from("image"),
+                OsString::from("export"),
+                raw.clone(),
+                OsString::from("--output"),
+                OsString::from("./hello.mcb"),
+            ]),
+            Err(CliError::NonUtf8Argument(raw))
+        );
+    }
+
+    // Catches resolving the export store out of order: an explicit CLI
+    // path wins over the environment, which wins over HOME.
+    #[test]
+    fn resolves_export_store_from_the_documented_environment() {
+        let args = ImageExportArgs {
+            image: "hello".into(),
+            output: PathBuf::from("./hello.mcb"),
+            store: None,
+        };
+        let resolved = resolve_export(&args, &home_env()).unwrap();
+        assert_eq!(
+            resolved,
+            ResolvedExport {
+                image: "hello".into(),
+                output: PathBuf::from("./hello.mcb"),
+                store: PathBuf::from("/home/test/.minicontainer"),
+            }
+        );
+
+        let env = FakeEnv {
+            store: Some(OsString::from("/env/store")),
+            kernel: None,
+            home: Some(OsString::from("/home/test")),
+        };
+        assert_eq!(
+            resolve_export(&args, &env).unwrap().store,
+            PathBuf::from("/env/store")
+        );
+
+        let explicit = ImageExportArgs {
+            store: Some(PathBuf::from("/cli/store")),
+            ..args.clone()
+        };
+        assert_eq!(
+            resolve_export(&explicit, &env).unwrap().store,
+            PathBuf::from("/cli/store")
+        );
+
+        let env = FakeEnv {
+            store: None,
+            kernel: None,
+            home: None,
+        };
+        assert_eq!(resolve_export(&args, &env), Err(CliError::MissingHome));
     }
 
     // Catches drifting from the Task 19 acceptance syntax: `image list`

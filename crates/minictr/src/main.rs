@@ -4,21 +4,22 @@ mod cli;
 
 use std::{
     ffi::OsString,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use minicontainer_bundle::{
-    ImageSpec, MAX_BUNDLE_LEN, Store, TagRecord, build, format_digest, parse,
+    ImageSpec, MAX_BUNDLE_LEN, Store, TagRecord, build, format_digest, parse, parse_digest,
 };
 use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, SystemProcessBackend};
 
 use cli::{
-    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedImport,
-    ResolvedInspect, ResolvedList, ResolvedRun, VERSION, help, parse_os, resolve, resolve_build,
-    resolve_doctor, resolve_import, resolve_inspect, resolve_list,
+    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
+    ResolvedImport, ResolvedInspect, ResolvedList, ResolvedRun, VERSION, help, parse_os, resolve,
+    resolve_build, resolve_doctor, resolve_export, resolve_import, resolve_inspect, resolve_list,
 };
 
 /// usage errorのprocess終了code。
@@ -107,6 +108,17 @@ pub fn real_main(
                 };
                 import_resolved(&resolved, &RealStore, stdout, stderr)
             }
+            ImageCommand::Export(args) => {
+                let resolved = match resolve_export(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                export_resolved(&resolved, &RealStore, stdout, stderr)
+            }
             ImageCommand::List(args) => {
                 let resolved = match resolve_list(&args, env) {
                     Ok(resolved) => resolved,
@@ -137,6 +149,8 @@ pub fn real_main(
 pub trait ImageStore {
     /// image tagを検証済みbundle bytesとして返す。
     fn resolve(&self, store_root: &Path, image: &str) -> Result<Vec<u8>, StoreError>;
+    /// digestで指定した検証済みbundle bytesを返す。
+    fn resolve_digest(&self, store_root: &Path, digest: [u8; 32]) -> Result<Vec<u8>, StoreError>;
     /// bundle bytesをstoreへimportしてdigestを返す。
     fn import(&self, store_root: &Path, bytes: &[u8]) -> Result<[u8; 32], StoreError>;
     /// digestへimage tagを付ける。
@@ -167,6 +181,11 @@ impl ImageStore for RealStore {
     fn resolve(&self, store_root: &Path, image: &str) -> Result<Vec<u8>, StoreError> {
         let store = Store::new(store_root).map_err(StoreError::Store)?;
         store.resolve(image).map_err(StoreError::Store)
+    }
+
+    fn resolve_digest(&self, store_root: &Path, digest: [u8; 32]) -> Result<Vec<u8>, StoreError> {
+        let store = Store::new(store_root).map_err(StoreError::Store)?;
+        store.resolve_digest(digest).map_err(StoreError::Store)
     }
 
     fn import(&self, store_root: &Path, bytes: &[u8]) -> Result<[u8; 32], StoreError> {
@@ -260,6 +279,51 @@ impl From<StoreError> for ImportError {
         match error {
             StoreError::Store(error) => Self::Store(error),
         }
+    }
+}
+
+/// image export失敗の公開分類。
+#[derive(Debug)]
+pub enum ExportError {
+    /// digest指定の形式が不正である。
+    InvalidDigest(String),
+    /// 出力先に既存のfileがある。
+    OutputExists(PathBuf),
+    /// 出力fileの書き出しが失敗した。
+    OutputIo(std::io::Error),
+    /// store操作が失敗した。
+    Store(minicontainer_bundle::StoreError),
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDigest(image) => write!(
+                formatter,
+                "invalid digest `{image}`; expected sha256:<64 lowercase hex digits>"
+            ),
+            Self::OutputExists(path) => write!(
+                formatter,
+                "output file already exists at {}",
+                path.to_string_lossy()
+            ),
+            Self::OutputIo(error) => write!(formatter, "failed to write output file: {error}"),
+            Self::Store(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl From<StoreError> for ExportError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Store(error) => Self::Store(error),
+        }
+    }
+}
+
+impl From<minicontainer_bundle::BundleError> for ExportError {
+    fn from(error: minicontainer_bundle::BundleError) -> Self {
+        Self::Store(minicontainer_bundle::StoreError::Bundle(error))
     }
 }
 
@@ -371,6 +435,38 @@ pub fn import_resolved(
     stderr: &mut dyn Write,
 ) -> i32 {
     let digest = match import_and_store(resolved, store) {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    if let Err(error) = writeln!(
+        stdout,
+        "{image} sha256:{digest}",
+        image = resolved.image,
+        digest = format_digest(digest)
+    ) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    // `main` ends with `process::exit`, which skips destructors, so a piped
+    // success line must be flushed explicitly before reporting success.
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// 解決済み`image export`を実行し、process終了codeを返す。
+pub fn export_resolved(
+    resolved: &ResolvedExport,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let digest = match export_and_write(resolved, store) {
         Ok(digest) => digest,
         Err(error) => {
             let _ = writeln!(stderr, "minictr: {error}");
@@ -809,6 +905,97 @@ fn import_and_store(
     Ok(digest)
 }
 
+/// tag名と`sha256:`付きdigest指定の区別。
+enum ImageRef<'a> {
+    Tag(&'a str),
+    Digest([u8; 32]),
+}
+
+/// IMAGEをtagまたはdigest指定に分ける。`sha256:`接頭辞のない64桁は
+/// digestではなくtagとして扱う。
+fn split_image_ref(image: &str) -> Result<ImageRef<'_>, ExportError> {
+    let Some(encoded) = image.strip_prefix("sha256:") else {
+        return Ok(ImageRef::Tag(image));
+    };
+    let digest =
+        parse_digest(encoded).ok_or_else(|| ExportError::InvalidDigest(image.to_owned()))?;
+    Ok(ImageRef::Digest(digest))
+}
+
+/// bundleの解決、出力先の存在確認、atomic書き出しを順に行う。解決に
+/// 失敗したら出力先へ触れず、既存の出力先は上書きしない。
+fn export_and_write(
+    resolved: &ResolvedExport,
+    store: &dyn ImageStore,
+) -> Result<[u8; 32], ExportError> {
+    let bytes = match split_image_ref(&resolved.image)? {
+        ImageRef::Tag(name) => store.resolve(&resolved.store, name)?,
+        ImageRef::Digest(digest) => store.resolve_digest(&resolved.store, digest)?,
+    };
+    write_output_file(&resolved.output, &bytes)?;
+    Ok(parse(&bytes)?.header.digest)
+}
+
+/// 既存の出力先を拒否してからatomicに書き出す。
+fn write_output_file(destination: &Path, bytes: &[u8]) -> Result<(), ExportError> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(ExportError::OutputExists(destination.to_path_buf()));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ExportError::OutputIo(error)),
+    }
+    atomic_write_file(destination, bytes).map_err(ExportError::OutputIo)
+}
+
+static NEXT_EXPORT_FILE: AtomicU64 = AtomicU64::new(0);
+const EXPORT_TEMP_ATTEMPTS: usize = 128;
+
+/// 一時fileへの書き出しとrenameで出力先をatomicに作る。storeの
+/// `atomic_write`と同じ手順で、失敗時は一時fileを残さない。
+fn atomic_write_file(destination: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let directory = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic destination has no parent directory",
+        )
+    })?;
+
+    for _ in 0..EXPORT_TEMP_ATTEMPTS {
+        let sequence = NEXT_EXPORT_FILE.fetch_add(1, Ordering::Relaxed);
+        let temporary = directory.join(format!(
+            ".minicontainer-export-{}-{sequence}",
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+
+        let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&temporary, destination) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique atomic temporary file",
+    ))
+}
+
 /// 取得済みbundleを実行し、guest入出力をhostへ接続する。
 pub fn execute(
     bundle: &[u8],
@@ -926,6 +1113,14 @@ mod tests {
                 .map_err(|_| StoreError::Store(minicontainer_bundle::StoreError::UnsafeStorePath))
         }
 
+        fn resolve_digest(
+            &self,
+            _store_root: &Path,
+            _digest: [u8; 32],
+        ) -> Result<Vec<u8>, StoreError> {
+            panic!("run tests do not resolve digests");
+        }
+
         fn import(&self, _store_root: &Path, _bytes: &[u8]) -> Result<[u8; 32], StoreError> {
             panic!("run tests do not import bundles");
         }
@@ -952,6 +1147,14 @@ mod tests {
     impl ImageStore for QueryStore {
         fn resolve(&self, _store_root: &Path, _image: &str) -> Result<Vec<u8>, StoreError> {
             Ok(self.bundle.clone())
+        }
+
+        fn resolve_digest(
+            &self,
+            _store_root: &Path,
+            _digest: [u8; 32],
+        ) -> Result<Vec<u8>, StoreError> {
+            panic!("image query tests do not resolve digests");
         }
 
         fn import(&self, _store_root: &Path, _bytes: &[u8]) -> Result<[u8; 32], StoreError> {
@@ -1005,6 +1208,14 @@ mod tests {
     impl ImageStore for RecordingStore {
         fn resolve(&self, _store_root: &Path, _image: &str) -> Result<Vec<u8>, StoreError> {
             panic!("image build tests do not resolve tags");
+        }
+
+        fn resolve_digest(
+            &self,
+            _store_root: &Path,
+            _digest: [u8; 32],
+        ) -> Result<Vec<u8>, StoreError> {
+            panic!("image build tests do not resolve digests");
         }
 
         fn import(&self, _store_root: &Path, bytes: &[u8]) -> Result<[u8; 32], StoreError> {
@@ -1300,6 +1511,14 @@ mod tests {
                 Err(StoreError::Store(
                     minicontainer_bundle::StoreError::RootNotAbsolute,
                 ))
+            }
+
+            fn resolve_digest(
+                &self,
+                _root: &Path,
+                _digest: [u8; 32],
+            ) -> Result<Vec<u8>, StoreError> {
+                panic!("run tests do not resolve digests");
             }
 
             fn import(&self, _root: &Path, _bytes: &[u8]) -> Result<[u8; 32], StoreError> {
@@ -2750,5 +2969,465 @@ mod tests {
             String::from_utf8_lossy(&stderr)
         );
         assert!(store.calls.borrow().is_empty());
+    }
+
+    fn resolved_export(image: &str, output: &Path, store: &Path) -> ResolvedExport {
+        ResolvedExport {
+            image: image.to_owned(),
+            output: output.to_path_buf(),
+            store: store.to_path_buf(),
+        }
+    }
+
+    fn temp_export_root(prefix: &str) -> std::path::PathBuf {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("minictr-test-{prefix}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn export_fixture(root: &Path, tag: &str) -> Vec<u8> {
+        let elf_path = root.join("app.elf");
+        std::fs::write(&elf_path, b"ELF").unwrap();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("build"),
+                OsString::from("--store"),
+                root.as_os_str().to_owned(),
+                OsString::from(tag),
+                elf_path.into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(code, 0);
+        Store::new(root).unwrap().resolve(tag).unwrap()
+    }
+
+    // Catches wiring `image export` to anything but image resolution,
+    // output refusal, and atomic file creation.
+    #[test]
+    fn image_export_round_trips_bytes_through_the_public_cli() {
+        let root = temp_export_root("export-roundtrip");
+        let expected = export_fixture(&root, "hello");
+        let output = root.join("hello.mcb");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("export"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("hello"),
+                OsString::from("--output"),
+                output.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+        let digest = minicontainer_bundle::parse(&expected)
+            .unwrap()
+            .header
+            .digest;
+        assert_eq!(
+            stdout,
+            format!(
+                "hello sha256:{}\n",
+                minicontainer_bundle::format_digest(digest)
+            )
+            .into_bytes()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches resolving a digest reference as a tag, or a tag as a digest.
+    #[test]
+    fn image_export_resolves_a_digest_reference() {
+        let root = temp_export_root("export-digest");
+        let expected = export_fixture(&root, "hello");
+        let digest = minicontainer_bundle::parse(&expected)
+            .unwrap()
+            .header
+            .digest;
+        let reference = format!("sha256:{}", minicontainer_bundle::format_digest(digest));
+        let output = root.join("by-digest.mcb");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("export"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from(&reference),
+                OsString::from("--output"),
+                output.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+        assert_eq!(
+            stdout,
+            format!(
+                "{reference} sha256:{}\n",
+                minicontainer_bundle::format_digest(digest)
+            )
+            .into_bytes()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches accepting a malformed digest reference, or treating a bare
+    // hex tag as a digest.
+    #[test]
+    fn image_export_rejects_malformed_digest_references() {
+        let root = temp_export_root("export-bad-digest");
+        export_fixture(&root, "hello");
+
+        for reference in [
+            "sha256:xyz".to_owned(),
+            format!("sha256:{}", "AB".repeat(32)),
+            format!("sha256:{}", "ab".repeat(31)),
+        ] {
+            let output = root.join("bad.mcb");
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = export_resolved(
+                &resolved_export(&reference, &output, &root),
+                &RealStore,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(code, RUNTIME_EXIT, "reference: {reference}");
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&stderr).contains("invalid digest"),
+                "stderr was {:?}",
+                String::from_utf8_lossy(&stderr)
+            );
+            assert!(!output.exists());
+        }
+
+        let bare_hex = "ab".repeat(32);
+        let output = root.join("bare.mcb");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = export_resolved(
+            &resolved_export(&bare_hex, &output, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(
+            !String::from_utf8_lossy(&stderr).contains("invalid digest"),
+            "a bare hex tag must resolve as a tag: {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(!output.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches writing an output file for an image that does not resolve.
+    #[test]
+    fn image_export_rejects_missing_images_without_writing() {
+        let root = temp_export_root("export-missing");
+        export_fixture(&root, "hello");
+
+        for reference in ["absent".to_owned(), format!("sha256:{}", "11".repeat(32))] {
+            let output = root.join("missing.mcb");
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = export_resolved(
+                &resolved_export(&reference, &output, &root),
+                &RealStore,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(code, RUNTIME_EXIT, "reference: {reference}");
+            assert!(stdout.is_empty());
+            assert!(!stderr.is_empty());
+            assert!(!output.exists(), "reference: {reference}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches exporting bytes that no longer match their digest, and
+    // leaving a partial output behind.
+    #[test]
+    fn image_export_rejects_a_corrupt_blob_without_writing() {
+        let root = temp_export_root("export-corrupt");
+        let expected = export_fixture(&root, "hello");
+        let digest = minicontainer_bundle::parse(&expected)
+            .unwrap()
+            .header
+            .digest;
+        let blob = root.join(format!(
+            "images/sha256/{}.mcb",
+            minicontainer_bundle::format_digest(digest)
+        ));
+        let mut corrupted = expected.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0x01;
+        std::fs::write(&blob, &corrupted).unwrap();
+        let output = root.join("corrupt.mcb");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = export_resolved(
+            &resolved_export("hello", &output, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("digest"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(!output.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches overwriting an existing output, changing it in place, or
+    // leaving a temporary file beside it.
+    #[test]
+    fn image_export_refuses_to_overwrite_existing_outputs() {
+        let root = temp_export_root("export-exists");
+        export_fixture(&root, "hello");
+
+        let file_path = root.join("taken.mcb");
+        std::fs::write(&file_path, b"precious").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = export_resolved(
+            &resolved_export("hello", &file_path, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("already exists"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"precious");
+
+        let dir_path = root.join("taken-dir");
+        std::fs::create_dir(&dir_path).unwrap();
+        let code = export_resolved(
+            &resolved_export("hello", &dir_path, &root),
+            &RealStore,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(code, RUNTIME_EXIT);
+
+        let mut entries: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert!(
+            entries
+                .iter()
+                .all(|name| { !name.to_string_lossy().starts_with(".minicontainer-export-") }),
+            "no temporary file may survive: {entries:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches succeeding when the output directory cannot hold the file.
+    #[test]
+    fn image_export_reports_an_unwritable_parent() {
+        let root = temp_export_root("export-parent");
+        export_fixture(&root, "hello");
+        let output = root.join("absent-dir").join("hello.mcb");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = export_resolved(
+            &resolved_export("hello", &output, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("failed to write output file"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(!root.join("absent-dir").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches ignoring a broken stdout pipe or flush and exiting zero.
+    #[test]
+    fn maps_export_output_failures_to_host_errors() {
+        let root = temp_export_root("export-output-fail");
+        export_fixture(&root, "hello");
+        let resolved = resolved_export("hello", &root.join("hello.mcb"), &root);
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            export_resolved(
+                &resolved,
+                &RealStore,
+                &mut FailingWriter {
+                    message: "export write broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+
+        let output = root.join("flush.mcb");
+        let resolved = resolved_export("hello", &output, &root);
+        let mut stderr = Vec::new();
+        assert_eq!(
+            export_resolved(
+                &resolved,
+                &RealStore,
+                &mut FlushFailingWriter {
+                    buffered: Vec::new(),
+                    message: "export flush broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to flush stdout"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches panicking on an undecodable output path whose parent is
+    // missing. The filesystem never sees the name on this path.
+    #[test]
+    fn image_export_handles_a_non_utf8_output_without_a_parent() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_export_root("export-nonutf8");
+        export_fixture(&root, "hello");
+
+        let raw = OsString::from_vec(vec![0x6f, 0x75, 0x74, 0xff]);
+        let output = root.join("absent").join(Path::new(&raw));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = export_resolved(
+            &resolved_export("hello", &output, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("failed to write output file"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches refusing a byte name the filesystem accepts: Linux stores
+    // arbitrary bytes, so export must succeed there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn image_export_writes_a_non_utf8_output_on_linux() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_export_root("export-nonutf8-linux");
+        let expected = export_fixture(&root, "hello");
+
+        let raw = OsString::from_vec(vec![0x6f, 0x75, 0x74, 0xff]);
+        let output = root.join(Path::new(&raw));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = export_resolved(
+            &resolved_export("hello", &output, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches panicking on, or littering after, a byte name the
+    // filesystem rejects: APFS refuses non-UTF-8 names, so the rename
+    // fails and the temporary file must not survive.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn image_export_cleans_up_after_a_rejected_non_utf8_output_on_macos() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_export_root("export-nonutf8-macos");
+        export_fixture(&root, "hello");
+
+        let raw = OsString::from_vec(vec![0x6f, 0x75, 0x74, 0xff]);
+        let output = root.join(Path::new(&raw));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = export_resolved(
+            &resolved_export("hello", &output, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("failed to write output file"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(!output.exists());
+        let turds = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".minicontainer-export-")
+            })
+            .count();
+        assert_eq!(turds, 0);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

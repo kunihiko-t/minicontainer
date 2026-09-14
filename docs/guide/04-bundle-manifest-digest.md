@@ -35,6 +35,7 @@ digestは破損検出とcontent addressingに使い、署名や配布元の認�
 ストアを同時に敵対的なプロセスが変更する状況の封じ込めは保証しない。
 `import`は検証済みbundleをdigest名で`images/sha256`へ書き込み、`tag`はtag名と小文字hex digestを対応付ける。
 `resolve`はtagからdigestを引き、bytesを再検証してdigestとpathの一致を確認してから返す。
+`resolve_digest`はdigestから直接同じ検証をして返す。`image export`のtag指定とdigest指定はこの二つに対応する。
 `list_tags`はtag名のbyte順で`TagRecord`を返し、imageの有無は確認しない。
 非UTF-8名、symlink、壊れたdigestなどの不正entryはskipせず型付きerrorで返す。
 tag名はmanifestのname文法に従い、単一path成分でない名前は別途拒否する。
@@ -42,4 +43,5 @@ tag名はmanifestのname文法に従い、単一path成分でない名前は別�
 bundle全体の上限8 MiBは`minicontainer_bundle::MAX_BUNDLE_LEN`として公開し、`minictr image build`のELF読み取りと`minictr image import`のfile読み取りも同じ上限を使う。
 配布されたbundle fileは`image import`で取り込む。検証してからstoreへ書き込むため、不正なfileではstoreを変更しない。取り込みでmanifestのnameは書き換えず、store側のtagだけを付ける。
 digestの小文字hex64桁への変換は`minicontainer_bundle::format_digest`として公開し、store path、tag、CLIの成功表示で共有する。
+逆変換は`minicontainer_bundle::parse_digest`として公開し、tag fileとCLIのdigest指定で形式を共有する。
 CLIの表示では先頭に`sha256:`を付ける。
