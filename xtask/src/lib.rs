@@ -2,6 +2,7 @@
 
 pub mod cargo;
 pub mod cli;
+pub mod dist;
 pub mod docs;
 pub mod publication;
 pub mod runtime;
@@ -272,6 +273,7 @@ fn run_phases<E>(
 #[derive(Debug)]
 pub enum XtaskError {
     Cargo(cargo::CargoError),
+    Dist(dist::DistError),
     Docs(docs::DocsError),
     Publication(publication::PublicationError),
     Runtime(runtime::E2EError),
@@ -283,6 +285,7 @@ impl fmt::Display for XtaskError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cargo(error) => error.fmt(formatter),
+            Self::Dist(error) => error.fmt(formatter),
             Self::Docs(error) => error.fmt(formatter),
             Self::Publication(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
@@ -296,6 +299,7 @@ impl std::error::Error for XtaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Cargo(error) => Some(error),
+            Self::Dist(error) => Some(error),
             Self::Docs(error) => Some(error),
             Self::Publication(error) => Some(error),
             Self::Runtime(error) => Some(error),
@@ -390,6 +394,7 @@ pub fn run(command: Command) -> Result<(), XtaskError> {
         Command::Setup => tools::check_setup(),
         Command::CheckHost => run_check_host(&workspace_root()),
         Command::Check => run_check(&workspace_root()),
+        Command::Dist(args) => dist::run(&workspace_root(), &args).map_err(XtaskError::Dist),
     }
 }
 

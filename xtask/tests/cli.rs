@@ -14,7 +14,7 @@ fn non_utf8_argument_prints_usage_and_exits_2() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).expect("diagnostic is UTF-8"),
-        "xtask argument is not valid UTF-8\n\nusage: cargo xtask <setup|check-host|check>\n"
+        "xtask argument is not valid UTF-8\n\nusage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\n"
     );
 }
 
@@ -30,6 +30,20 @@ fn utf8_cli_errors_print_usage_and_exit_2() {
             vec!["check-host", "extra"],
             "unexpected xtask argument: extra",
         ),
+        (vec!["dist"], "missing required xtask option: --target"),
+        (
+            vec![
+                "dist",
+                "--target",
+                "t",
+                "--minictr",
+                "m",
+                "--kernel",
+                "k",
+                "extra",
+            ],
+            "unexpected xtask argument: extra",
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .args(arguments)
@@ -40,7 +54,9 @@ fn utf8_cli_errors_print_usage_and_exit_2() {
         assert!(output.stdout.is_empty());
         assert_eq!(
             String::from_utf8(output.stderr).expect("diagnostic is UTF-8"),
-            format!("{diagnostic}\n\nusage: cargo xtask <setup|check-host|check>\n")
+            format!(
+                "{diagnostic}\n\nusage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\n"
+            )
         );
     }
 }

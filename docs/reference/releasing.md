@@ -14,30 +14,38 @@ cargo xtask check
 ```
 
 Ubuntu CIの`check`とmacOS CIの`check-host`も同じcommitで成功させる。
+Ubuntu CIは配布archiveのsmokeも実行するため、その成功も確認する。
 tag、Cargo package version、archive名のversionは`0.1.0`で一致させる。
 
 ## 配布内容
 
 matrixは`macos-15`と`ubuntu-24.04`であり、成果物名のtargetは`aarch64-apple-darwin`と`x86_64-unknown-linux-gnu`である。
-各jobは次の二つのfileをuploadする。
+archiveは`cargo xtask dist`がbuildする。各jobは次の二つのfileをuploadする。
 
-- `minicontainer-v0.1.0-<target>.tar.gz`
-- `minicontainer-v0.1.0-<target>.tar.gz.sha256`
+- `minicontainer-0.1.0-<target>.tar.gz`
+- `minicontainer-0.1.0-<target>.tar.gz.sha256`
 
 archiveを展開すると次の配置になる。
 
 ```text
-minicontainer-v0.1.0-<target>/
-  bin/minictr
-  share/minicontainer/minios-kernel
-  README.md
+minicontainer-0.1.0-<target>/
+  minictr
+  kernel/minios.bin
   LICENSE-MIT
   LICENSE-APACHE
+  MANIFEST.txt
+  SHA256SUMS
 ```
 
 `minictr`はrelease buildであり、実行bitを付けて格納する。
-`minios-kernel`は固定revision `9be99255a59d58d19db25b835af0e28a8d2a4036` のminiOSを`--release --locked --target riscv64gc-unknown-none-elf`でbuildしたものである。
+`kernel/minios.bin`は固定revision `9be99255a59d58d19db25b835af0e28a8d2a4036` のminiOSを`--release --locked --target riscv64gc-unknown-none-elf`でbuildしたものである。
 配布kernelは[脅威モデル](threat-model.md)の信頼する計算基盤と同じ前提で扱う。
+`MANIFEST.txt`はarchive version、target、各fileのmodeとSHA-256を記録する。
+`SHA256SUMS`は`sha256sum -c`形式でpayloadと`MANIFEST.txt`を検査できる。
+
+archive versionは既定でxtaskのCargo package versionになる。
+公開gateはxtaskと`minictr`のversion一致、release workflowの`cargo xtask dist`使用、Cargo versionに対応するarchive名のuploadを検査する。
+`dist`は`tar`や`sha256sum`を使わずRust toolchainだけでarchiveを組み立て、完成品を読み戻して検証してから成功を報告する。
 
 ## checksumの確認
 
@@ -45,22 +53,28 @@ checksum fileは`<hash>  <file名>`の一行である。
 Linuxでは`sha256sum`、macOSでは`shasum`で確認する。
 
 ```sh
-sha256sum -c minicontainer-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-shasum -a 256 -c minicontainer-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
+sha256sum -c minicontainer-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+shasum -a 256 -c minicontainer-0.1.0-aarch64-apple-darwin.tar.gz.sha256
+```
+
+展開後はarchive内の`SHA256SUMS`でも内容を検査できる。
+
+```sh
+(cd minicontainer-0.1.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS)
 ```
 
 ## 導入と実行
 
-展開したdirectoryから`bin/minictr`を直接実行する。
+展開したdirectoryから`minictr`を直接実行する。
 
 ```sh
-bin/minictr --help
-bin/minictr --version
-bin/minictr run --store "$STORE" --kernel share/minicontainer/minios-kernel hello
+./minictr --help
+./minictr --version
+./minictr run --store "$STORE" --kernel kernel/minios.bin hello
 ```
 
-`--kernel`にはarchive内の`share/minicontainer/minios-kernel`を渡す。
-imageの登録と実行は`image build`、`image inspect`、`run`で行い、commandの形は同梱READMEのクイックスタートと同じである。
+`--kernel`にはarchive内の`kernel/minios.bin`を渡す。
+imageの登録と実行は`image build`、`image inspect`、`run`で行い、commandの形はREADMEのクイックスタートと同じである。
 archiveには同梱ゲスト例のsourceを含まないため、利用者が用意した静的RISC-V 64 ELFを使う。
 
 ## 未対応事項
@@ -69,3 +83,4 @@ archiveには同梱ゲスト例のsourceを含まないため、利用者が用�
 - 署名、notarization、Homebrew formulaは用意しない。
 - Windows用とLinux arm64用のarchiveは作らない。
 - 配布archive自体の再現可能build (bit一致) は保証しない。
+- archiveにREADMEや導入手順書は含まない。導入手順はこの文書が正である。

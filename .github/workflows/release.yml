@@ -33,33 +33,15 @@ jobs:
           git clone https://github.com/kunihiko-t/minios.git minios
           git -C minios checkout --detach 9be99255a59d58d19db25b835af0e28a8d2a4036
           cargo build --manifest-path minios/Cargo.toml --target-dir minios/target -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --release --locked
-      - name: Assemble distribution directory
-        run: |
-          set -eu
-          DIST="minicontainer-v0.1.0-${{ matrix.target }}"
-          mkdir -p "$DIST/bin" "$DIST/share/minicontainer"
-          cp target/release/minictr "$DIST/bin/minictr"
-          cp minios/target/riscv64gc-unknown-none-elf/release/minios-kernel "$DIST/share/minicontainer/minios-kernel"
-          cp README.md LICENSE-MIT LICENSE-APACHE "$DIST/"
-          chmod +x "$DIST/bin/minictr"
-      - name: Create archive and checksum
-        run: |
-          set -eu
-          DIST="minicontainer-v0.1.0-${{ matrix.target }}"
-          ARCHIVE="$DIST.tar.gz"
-          tar -czf "$ARCHIVE" "$DIST"
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
-          else
-            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
-          fi
+      - name: Build distribution archive
+        run: cargo xtask dist --target ${{ matrix.target }} --minictr target/release/minictr --kernel minios/target/riscv64gc-unknown-none-elf/release/minios-kernel --output dist
       - name: Upload archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: minicontainer-v0.1.0-${{ matrix.target }}.tar.gz
+          path: dist/minicontainer-0.1.0-${{ matrix.target }}.tar.gz
           archive: false
       - name: Upload checksum
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: minicontainer-v0.1.0-${{ matrix.target }}.tar.gz.sha256
+          path: dist/minicontainer-0.1.0-${{ matrix.target }}.tar.gz.sha256
           archive: false

@@ -85,6 +85,14 @@ pub enum PublicationError {
         line: usize,
         reference: String,
     },
+    PackageVersionMissing {
+        path: PathBuf,
+    },
+    PackageVersionMismatch {
+        path: PathBuf,
+        xtask: String,
+        minictr: String,
+    },
 }
 
 impl PublicationError {
@@ -97,7 +105,9 @@ impl PublicationError {
             | Self::NonUtf8Symlink { path }
             | Self::ForbiddenContent { path, .. }
             | Self::Workflow { path, .. }
-            | Self::MutableAction { path, .. } => Some(path),
+            | Self::MutableAction { path, .. }
+            | Self::PackageVersionMissing { path }
+            | Self::PackageVersionMismatch { path, .. } => Some(path),
             Self::MissingReadmeText { .. } => Some(Path::new("README.md")),
             Self::Git { .. } | Self::NonUtf8TrackedPath => None,
         }
@@ -174,6 +184,20 @@ impl fmt::Display for PublicationError {
                 "{}:{line}: action reference must be pinned to a 40-character commit SHA: {reference}",
                 path.display()
             ),
+            Self::PackageVersionMissing { path } => write!(
+                formatter,
+                "{}: cargo manifest must declare a package version",
+                path.display()
+            ),
+            Self::PackageVersionMismatch {
+                path,
+                xtask,
+                minictr,
+            } => write!(
+                formatter,
+                "{}: minictr version {minictr} must match the xtask version {xtask}",
+                path.display()
+            ),
         }
     }
 }
@@ -186,6 +210,7 @@ pub fn check(root: &Path) -> Result<(), PublicationError> {
     check_tracked_tree(root)?;
     check_workflow_policy(root)?;
     check_release_policy(root)?;
+    check_dist_policy(root)?;
     Ok(())
 }
 
@@ -247,8 +272,8 @@ fn tracked_workflows(root: &Path) -> Result<Vec<PathBuf>, PublicationError> {
 const RELEASE_TAG: &str = "v0.1.0";
 /// miniOS kernel revision packed into release archives.
 const RELEASE_KERNEL_REV: &str = "9be99255a59d58d19db25b835af0e28a8d2a4036";
-/// Release archive name prefix shared by the tarball and its checksum.
-const RELEASE_ARCHIVE_PREFIX: &str = "minicontainer-v0.1.0-";
+/// Command that owns release archive builds.
+const DIST_COMMAND: &str = "cargo xtask dist";
 
 /// Enforces the release workflow contract when `release.yml` is tracked.
 fn check_release_policy(root: &Path) -> Result<(), PublicationError> {
@@ -272,14 +297,115 @@ fn check_release_policy(root: &Path) -> Result<(), PublicationError> {
             message: "release workflow must build the pinned kernel revision",
         });
     }
-    if !contents.contains(RELEASE_ARCHIVE_PREFIX) {
-        return Err(PublicationError::Workflow {
-            path: path.to_path_buf(),
-            line: 1,
-            message: "release workflow must pack versioned release archives",
+    Ok(())
+}
+
+/// Requires the release workflow to build its archives with
+/// `cargo xtask dist` for the Cargo package version, and the CI workflow to
+/// smoke-test that same archive build. The expected archive prefix derives
+/// from the manifests so a version bump forces the workflow update in the
+/// same change.
+fn check_dist_policy(root: &Path) -> Result<(), PublicationError> {
+    let xtask = package_version(root, Path::new("xtask/Cargo.toml"))?;
+    let minictr = package_version(root, Path::new("crates/minictr/Cargo.toml"))?;
+    if xtask != minictr {
+        return Err(PublicationError::PackageVersionMismatch {
+            path: PathBuf::from("crates/minictr/Cargo.toml"),
+            xtask,
+            minictr,
         });
     }
+    let expected_prefix = format!("minicontainer-{xtask}-");
+    let workflows = tracked_workflows(root)?;
+    if let Some(path) = workflows
+        .iter()
+        .find(|path| path.file_stem().is_some_and(|stem| stem == "release"))
+    {
+        let contents =
+            fs::read_to_string(root.join(path)).map_err(|error| PublicationError::Read {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        if !contents.contains(DIST_COMMAND) {
+            return Err(PublicationError::Workflow {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "release workflow must build archives with cargo xtask dist",
+            });
+        }
+        if !contents.contains(&expected_prefix) {
+            return Err(PublicationError::Workflow {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "release workflow must upload archives for the Cargo package version",
+            });
+        }
+    }
+    if let Some(path) = workflows
+        .iter()
+        .find(|path| path.file_stem().is_some_and(|stem| stem == "ci"))
+    {
+        let contents =
+            fs::read_to_string(root.join(path)).map_err(|error| PublicationError::Read {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        if !contents.contains(DIST_COMMAND) {
+            return Err(PublicationError::Workflow {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "ci workflow must smoke-test the release archive build",
+            });
+        }
+        if !contents.contains(RELEASE_KERNEL_REV) {
+            return Err(PublicationError::Workflow {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "ci smoke must build the pinned release kernel revision",
+            });
+        }
+    }
     Ok(())
+}
+
+/// Reads the `[package] version` of one Cargo manifest.
+fn package_version(root: &Path, manifest: &Path) -> Result<String, PublicationError> {
+    let contents =
+        fs::read_to_string(root.join(manifest)).map_err(|error| PublicationError::Read {
+            path: manifest.to_owned(),
+            message: error.to_string(),
+        })?;
+    let mut in_package = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let header = trimmed.split('#').next().map(str::trim).unwrap_or("");
+        if header.starts_with('[') {
+            if in_package {
+                break;
+            }
+            in_package = header == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("version") else {
+            continue;
+        };
+        let Some(value) = rest
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim)
+            .and_then(|value| value.strip_prefix('"'))
+            .and_then(|value| value.split('"').next())
+        else {
+            continue;
+        };
+        return Ok(value.to_owned());
+    }
+    Err(PublicationError::PackageVersionMissing {
+        path: manifest.to_owned(),
+    })
 }
 
 /// Requires a tag-push-only trigger for the release version.
@@ -1552,6 +1678,14 @@ mod tests {
                 ".github/dependabot.yml",
                 "version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: \"/\"\n    schedule:\n      interval: weekly\n  - package-ecosystem: github-actions\n    directory: \"/\"\n    schedule:\n      interval: weekly\n",
             );
+            repo.write(
+                "xtask/Cargo.toml",
+                "[package]\nname = \"xtask\"\nversion = \"0.1.0\"\n",
+            );
+            repo.write(
+                "crates/minictr/Cargo.toml",
+                "[package]\nname = \"minictr\"\nversion = \"0.1.0\"\n",
+            );
             repo.git(["add", "."]);
             repo
         }
@@ -2223,9 +2357,49 @@ mod tests {
 
     fn valid_release_body() -> String {
         format!(
-            "    steps:\n      - run: git checkout {rev}\n      - run: tar minicontainer-v0.1.0-x\n",
+            "    steps:\n      - run: git checkout {rev}\n      - run: cargo xtask dist --target t\n      - run: upload minicontainer-0.1.0-x\n",
             rev = RELEASE_KERNEL_REV
         )
+    }
+
+    fn valid_ci_body() -> String {
+        format!(
+            "jobs:\n  smoke:\n    steps:\n      - run: git checkout {rev}\n      - run: cargo xtask dist --target t\n",
+            rev = RELEASE_KERNEL_REV
+        )
+    }
+
+    fn cargo_manifest(name: &str, version: &str) -> String {
+        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition.workspace = true\n")
+    }
+
+    fn dist_repo(
+        xtask_version: &str,
+        minictr_version: &str,
+        release_body: Option<&str>,
+        ci_body: Option<&str>,
+    ) -> TestRepo {
+        let repo = TestRepo::public_fixture();
+        repo.write("xtask/Cargo.toml", &cargo_manifest("xtask", xtask_version));
+        repo.write(
+            "crates/minictr/Cargo.toml",
+            &cargo_manifest("minictr", minictr_version),
+        );
+        if let Some(body) = release_body {
+            repo.write(
+                ".github/workflows/release.yml",
+                &release_fixture(&valid_release_trigger(), "  contents: read\n", body),
+            );
+        }
+        if let Some(body) = ci_body {
+            repo.write(
+                ".github/workflows/ci.yml",
+                &format!("name: ci\non:\n  push:\n{body}"),
+            );
+        }
+        repo.add_all();
+        repo.commit_noreply();
+        repo
     }
 
     fn release_repo(trigger: &str, permissions: &str, body: &str) -> TestRepo {
@@ -2291,18 +2465,151 @@ mod tests {
     }
 
     #[test]
-    fn release_policy_requires_the_pinned_kernel_and_archive_version() {
-        let body = valid_release_body();
-        let wrong_rev = body.replace(RELEASE_KERNEL_REV, &"0".repeat(40));
-        let wrong_archive = body.replace("minicontainer-v0.1.0-", "minicontainer-v0.2.0-");
-        for body in [wrong_rev.as_str(), wrong_archive.as_str()] {
-            let repo = release_repo(&valid_release_trigger(), "  contents: read\n", body);
+    fn release_policy_requires_the_pinned_kernel() {
+        let body = valid_release_body().replace(RELEASE_KERNEL_REV, &"0".repeat(40));
+        let repo = release_repo(&valid_release_trigger(), "  contents: read\n", &body);
 
-            assert!(
-                check_release_policy(repo.path()).is_err(),
-                "body must be rejected: {body:?}"
-            );
-        }
+        assert!(
+            check_release_policy(repo.path()).is_err(),
+            "a wrong kernel revision must be rejected"
+        );
+    }
+
+    #[test]
+    fn dist_policy_accepts_matching_versions_with_dist_workflows() {
+        let repo = dist_repo(
+            "0.1.0",
+            "0.1.0",
+            Some(&valid_release_body()),
+            Some(&valid_ci_body()),
+        );
+
+        check_dist_policy(repo.path()).expect("a valid dist setup must pass");
+    }
+
+    #[test]
+    fn dist_policy_ignores_repositories_without_release_or_ci_workflows() {
+        let repo = dist_repo("0.1.0", "0.1.0", None, None);
+
+        check_dist_policy(repo.path()).expect("missing workflows must stay optional");
+    }
+
+    #[test]
+    fn dist_policy_rejects_version_mismatch_and_missing_versions() {
+        let repo = dist_repo(
+            "0.1.0",
+            "0.2.0",
+            Some(&valid_release_body()),
+            Some(&valid_ci_body()),
+        );
+        assert_eq!(
+            check_dist_policy(repo.path()),
+            Err(PublicationError::PackageVersionMismatch {
+                path: PathBuf::from("crates/minictr/Cargo.toml"),
+                xtask: "0.1.0".to_owned(),
+                minictr: "0.2.0".to_owned(),
+            })
+        );
+        assert_eq!(
+            PublicationError::PackageVersionMismatch {
+                path: PathBuf::from("crates/minictr/Cargo.toml"),
+                xtask: "0.1.0".to_owned(),
+                minictr: "0.2.0".to_owned(),
+            }
+            .to_string(),
+            "crates/minictr/Cargo.toml: minictr version 0.2.0 must match the xtask version 0.1.0"
+        );
+
+        let repo = TestRepo::public_fixture();
+        repo.write(
+            "xtask/Cargo.toml",
+            "[package]\nname = \"xtask\"\n[dependencies]\nversioned = \"1\"\n",
+        );
+        repo.write(
+            "crates/minictr/Cargo.toml",
+            &cargo_manifest("minictr", "0.1.0"),
+        );
+        assert_eq!(
+            check_dist_policy(repo.path()),
+            Err(PublicationError::PackageVersionMissing {
+                path: PathBuf::from("xtask/Cargo.toml"),
+            })
+        );
+    }
+
+    #[test]
+    fn package_version_tolerates_comments_and_ignores_other_sections() {
+        let repo = TestRepo::public_fixture();
+        repo.write(
+            "commented.toml",
+            "# leading comment\n[package] # trailing comment\nname = \"x\"\nversion = \"1.2.3\" # pinned\n[dependencies]\nversion = \"9.9.9\"\n",
+        );
+        assert_eq!(
+            package_version(repo.path(), Path::new("commented.toml")),
+            Ok("1.2.3".to_owned())
+        );
+        repo.write("empty.toml", "[package]\nname = \"x\"\n");
+        assert_eq!(
+            package_version(repo.path(), Path::new("empty.toml")),
+            Err(PublicationError::PackageVersionMissing {
+                path: PathBuf::from("empty.toml"),
+            })
+        );
+    }
+
+    #[test]
+    fn dist_policy_requires_dist_and_versioned_archives_in_release() {
+        let without_dist = valid_release_body().replace("cargo xtask dist", "tar -czf archive");
+        let repo = dist_repo(
+            "0.1.0",
+            "0.1.0",
+            Some(&without_dist),
+            Some(&valid_ci_body()),
+        );
+        assert!(
+            check_dist_policy(repo.path()).is_err(),
+            "release without cargo xtask dist must be rejected"
+        );
+
+        let stale_archive =
+            valid_release_body().replace("minicontainer-0.1.0-", "minicontainer-0.2.0-");
+        let repo = dist_repo(
+            "0.1.0",
+            "0.1.0",
+            Some(&stale_archive),
+            Some(&valid_ci_body()),
+        );
+        assert!(
+            check_dist_policy(repo.path()).is_err(),
+            "release archives must follow the Cargo package version"
+        );
+    }
+
+    #[test]
+    fn dist_policy_requires_the_archive_smoke_step_in_ci() {
+        let without_dist = valid_ci_body().replace("cargo xtask dist", "cargo xtask check");
+        let repo = dist_repo(
+            "0.1.0",
+            "0.1.0",
+            Some(&valid_release_body()),
+            Some(&without_dist),
+        );
+        assert!(
+            check_dist_policy(repo.path()).is_err(),
+            "ci without the archive smoke step must be rejected"
+        );
+
+        let without_rev = valid_ci_body().replace(RELEASE_KERNEL_REV, &"0".repeat(40));
+        let repo = dist_repo(
+            "0.1.0",
+            "0.1.0",
+            Some(&valid_release_body()),
+            Some(&without_rev),
+        );
+        assert!(
+            check_dist_policy(repo.path()).is_err(),
+            "ci smoke must build the pinned release kernel"
+        );
     }
 
     #[test]
@@ -2680,7 +2987,8 @@ mod tests {
         repo.write(
             ".github/workflows/ci.yml",
             &format!(
-                "jobs:\n  check:\n    steps:\n      - uses: owner/action@{sha}\n      - uses: ./local-action\n"
+                "jobs:\n  check:\n    steps:\n      - uses: owner/action@{sha}\n      - uses: ./local-action\n      - run: git checkout {rev}\n      - run: cargo xtask dist --target t\n",
+                rev = RELEASE_KERNEL_REV
             ),
         );
         repo.add_all();
