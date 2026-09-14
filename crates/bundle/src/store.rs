@@ -63,6 +63,31 @@ impl Store {
         Ok(())
     }
 
+    /// Removes one tag without touching blobs. Refuses symlinks and
+    /// entries that leave the store root; a missing tag is a typed error.
+    /// The tag content is not validated, so a corrupt tag stays removable.
+    pub fn remove_tag(&self, name: &str) -> Result<(), StoreError> {
+        validate_tag_name(name)?;
+        self.ensure_layout()?;
+        let path = self.root.join("tags").join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(StoreError::UnsafeStorePath);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::TagNotFound(name.to_owned()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let canonical = fs::canonicalize(&path)?;
+        if !canonical.starts_with(&self.root) {
+            return Err(StoreError::UnsafeStorePath);
+        }
+        fs::remove_file(&canonical)?;
+        Ok(())
+    }
+
     /// Resolves a tag and returns the validated bundle bytes it names.
     pub fn resolve(&self, name: &str) -> Result<Vec<u8>, StoreError> {
         validate_tag_name(name)?;
@@ -428,6 +453,158 @@ mod tests {
             store.resolve_digest(digest),
             Err(StoreError::Bundle(_))
         ));
+    }
+
+    // Production break caught: removing a tag deletes its blob, sibling
+    // tags, or shared bytes that another tag still resolves.
+    #[test]
+    fn removes_only_the_named_tag() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let shared = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"shared",
+        })
+        .unwrap();
+        let other = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"other",
+        })
+        .unwrap();
+        let shared_digest = store.import(&shared).unwrap();
+        let other_digest = store.import(&other).unwrap();
+        store.tag("first", shared_digest).unwrap();
+        store.tag("second", shared_digest).unwrap();
+        store.tag("third", other_digest).unwrap();
+
+        store.remove_tag("first").unwrap();
+
+        assert!(store.resolve("first").is_err());
+        assert_eq!(store.resolve("second").unwrap(), shared);
+        assert_eq!(store.resolve("third").unwrap(), other);
+        assert_eq!(
+            fs::read_dir(home.path().join("images/sha256"))
+                .unwrap()
+                .count(),
+            2
+        );
+        let mut tags: Vec<String> = fs::read_dir(home.path().join("tags"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        tags.sort();
+        assert_eq!(tags, vec!["second".to_owned(), "third".to_owned()]);
+    }
+
+    // Production break caught: removing a missing tag succeeds silently
+    // or reports a bare I/O error instead of a typed diagnostic.
+    #[test]
+    fn removing_a_missing_tag_is_a_typed_error() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+
+        let missing = store.remove_tag("absent");
+        assert!(
+            matches!(missing, Err(StoreError::TagNotFound(_))),
+            "got {missing:?}"
+        );
+        assert_eq!(
+            missing.unwrap_err().to_string(),
+            "tag `absent` does not exist"
+        );
+
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        store.tag("once", digest).unwrap();
+        store.remove_tag("once").unwrap();
+        assert!(matches!(
+            store.remove_tag("once"),
+            Err(StoreError::TagNotFound(_))
+        ));
+    }
+
+    // Production break caught: removing a tag follows a symlink or a
+    // planted directory, deleting outside the tags namespace.
+    #[cfg(unix)]
+    #[test]
+    fn remove_tag_refuses_symlinked_entries() {
+        use std::os::unix::fs::symlink;
+
+        let home = TempHome::new();
+        let outside = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        store.tag("linked", digest).unwrap();
+        let link = home.path().join("tags/linked");
+        fs::remove_file(&link).unwrap();
+        let target = outside.path().join("precious");
+        fs::write(&target, b"precious").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(matches!(
+            store.remove_tag("linked"),
+            Err(StoreError::UnsafeStorePath)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"precious");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let directory = home.path().join("tags/subdir");
+        fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            store.remove_tag("subdir"),
+            Err(StoreError::UnsafeStorePath)
+        ));
+        assert!(directory.is_dir());
+    }
+
+    // Production break caught: a tag with corrupt content cannot be
+    // removed, or an invalid name reaches the filesystem.
+    #[test]
+    fn remove_tag_ignores_content_but_validates_names() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        store.tag("broken", digest).unwrap();
+        fs::write(home.path().join("tags/broken"), b"not a digest").unwrap();
+
+        store.remove_tag("broken").unwrap();
+        assert!(!home.path().join("tags/broken").exists());
+
+        for name in ["..", "../escape", "nested/name"] {
+            assert!(
+                matches!(
+                    store.remove_tag(name),
+                    Err(StoreError::InvalidTag(_) | StoreError::UnsafeTagName)
+                ),
+                "remove accepted {name:?}"
+            );
+        }
+        assert!(!home.path().join("escape").exists());
+        assert!(!home.path().join("tags/nested").exists());
     }
 
     // Production break caught: Store::new accepts a relative root and writes beneath the process working directory.
