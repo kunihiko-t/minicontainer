@@ -85,6 +85,20 @@ impl Store {
         Ok(bytes)
     }
 
+    /// Resolves stored bytes directly by digest, re-validating them.
+    pub fn resolve_digest(&self, digest: [u8; 32]) -> Result<Vec<u8>, StoreError> {
+        self.ensure_layout()?;
+        let bundle_max_len = usize::try_from(BUNDLE_MAX_LEN)
+            .map_err(|_| StoreError::Bundle(BundleError::LengthOverflow))?;
+        let bytes = read_store_file_up_to(&self.root, &self.image_path(digest), bundle_max_len)?
+            .ok_or(StoreError::Bundle(BundleError::TooLarge))?;
+        let bundle = parse(&bytes)?;
+        if bundle.header.digest != digest {
+            return Err(StoreError::DigestPathMismatch);
+        }
+        Ok(bytes)
+    }
+
     /// Lists every tag by UTF-8 byte order without resolving its image.
     pub fn list_tags(&self) -> Result<Vec<TagRecord>, StoreError> {
         self.ensure_layout()?;
@@ -246,7 +260,7 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> io::Result<()> {
     ))
 }
 
-fn decode_digest(encoded: &[u8]) -> Option<[u8; 32]> {
+pub(crate) fn decode_digest(encoded: &[u8]) -> Option<[u8; 32]> {
     if encoded.len() != 64 {
         return None;
     }
@@ -349,6 +363,71 @@ mod tests {
             b"d2e0c602acbf711b5d1cb7a2ae07dd19d9eda0f68cb736a507b97a739ea97d48"
         );
         assert_eq!(store.resolve("hello").unwrap(), bytes);
+    }
+
+    // Production break caught: resolving by digest returns other bytes,
+    // skips validation, or reports a missing blob as a tag error.
+    #[test]
+    fn resolves_stored_bytes_directly_by_digest() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+
+        assert_eq!(store.resolve_digest(digest).unwrap(), bytes);
+
+        let missing = store.resolve_digest([0x11; 32]);
+        assert!(
+            matches!(&missing, Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound),
+            "a missing blob must surface its I/O error, got {missing:?}"
+        );
+    }
+
+    // Production break caught: a blob stored under the wrong digest path
+    // or corrupted in place resolves without complaint.
+    #[test]
+    fn resolve_digest_revalidates_bytes_and_path() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        let image = home
+            .path()
+            .join(format!("images/sha256/{}.mcb", format_digest(digest)));
+
+        let misplaced = [0x22; 32];
+        fs::copy(
+            &image,
+            home.path()
+                .join(format!("images/sha256/{}.mcb", format_digest(misplaced))),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                store.resolve_digest(misplaced),
+                Err(StoreError::DigestPathMismatch)
+            ),
+            "a misplaced blob must fail resolution"
+        );
+
+        let mut corrupted = bytes.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0x01;
+        fs::write(&image, &corrupted).unwrap();
+        assert!(matches!(
+            store.resolve_digest(digest),
+            Err(StoreError::Bundle(_))
+        ));
     }
 
     // Production break caught: Store::new accepts a relative root and writes beneath the process working directory.

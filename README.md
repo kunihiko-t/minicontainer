@@ -105,6 +105,15 @@ summary: passed 3/3 checks
 全検査の成功で終了コード0、一つでも失敗したら`fail`行をすべて出して終了コード1になる。
 診断は環境を変更しない。失敗行の`fix:`に従って直してから実行する。
 
+登録したimageは`image export`でファイルへ取り出す。タグの代わりに`sha256:`付きdigestでも指定できる。
+
+```sh
+cargo run -p minictr --locked -- image export --store "$STORE" hello --output ./hello.mcb
+```
+
+`hello sha256:<64桁>`と表示され、`./hello.mcb`にbundleバイト列がそのまま書き出される。
+出力先にファイルがある場合は上書きせず失敗する。
+
 最後に`minictr run`で実行する。
 
 ```sh
@@ -129,7 +138,7 @@ exit=42
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image import`、`image list`、`image inspect`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`help`、`--version`である。
 構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
@@ -137,6 +146,7 @@ usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image import [--store PATH] IMAGE FILE
+usage: minictr image export [--store PATH] IMAGE --output PATH
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
 ```
@@ -147,6 +157,7 @@ usage: minictr image inspect [--store PATH] IMAGE
 `image build`は静的RISC-V 64 ELFからMiniBundleを構築し、指定したタグでローカルストアへ登録する。
 成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
 `image import`は配布されたMiniBundleファイルを検証してから同じ形で登録し、manifestの名前は書き換えない。
+`image export`はタグまたは`sha256:`付きdigestで解決したbundleを検証して`--output`へ書き出す。出力先の上書きはしない。
 `image list`はタグの一覧、`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
 `doctor`はQEMUのversion、kernel file、store rootを診断し、各検査の`ok`または`fail`と`summary`の4行を標準出力へ出す。全検査の成功で終了コード0、一つでも失敗したら終了コード1になり、診断自体は環境を変更しない。
 

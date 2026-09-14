@@ -5,13 +5,14 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image list`、`image inspect`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image import [--store PATH] IMAGE FILE
+usage: minictr image export [--store PATH] IMAGE --output PATH
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
 ```
@@ -33,6 +34,8 @@ IMAGEはUTF-8でなければならず、ELFは`--store`と同じくOS pathとし
 optionはIMAGEとELFの前後どこに置いてもよい。
 `image import`はIMAGEとFILEを取り、`--store`を前後どこに置いてもよい。
 FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
+`image export`はIMAGEを一つ取り、`--store`と必須の`--output`を前後どこに置いてもよい。
+`--output`の値は`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
@@ -41,7 +44,7 @@ FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う�
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
-`image build`、`image import`、`image list`、`image inspect`のstore解決も同じ順序を使う。
+`image build`、`image import`、`image export`、`image list`、`image inspect`のstore解決も同じ順序を使う。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
 
 ## imageの登録
@@ -74,6 +77,20 @@ manifest内のnameは書き換えず、CLIのtagだけを付ける。
 配布物のnameと手元のtagが異なる場合があり、`image inspect`の`tag`と`name`で区別する。
 同じbytesの再importは同じdigestを報告し、blobはcontent addressingで再利用する。
 既存tagへのimportはtagだけをatomicに付け替え、置き換え前のblobは残す。
+
+## imageの取り出し
+
+`image export`は、tagまたは`sha256:`付きdigestで解決したbundleを検証してから`--output`へ書き出す。
+成功すると`build`と同じく入力とdigestの一行だけを標準出力へ出す。
+
+```text
+myapp sha256:<64桁の小文字16進数>
+```
+
+書き出すbytesはstoreのblobと同一であり、解決時にdigestを再検証する。
+digest指定は`sha256:`接頭辞が必須であり、接頭辞のない64桁はtagとして扱う。
+出力先にfileやdirectoryがある場合は上書きせず失敗する。強制上書きのoptionはなく、先に取り除いてから再実行する。
+書き出しは一時fileとrenameで行い、途中失敗で部分fileや一時fileを残さない。
 
 ## imageの確認
 
@@ -139,6 +156,8 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、
 `image build`のparse失敗とstore pathの既定値解決失敗は使い方の誤りとして終了code 2になる。
 `image import`では、fileの読み取り失敗、上限超過、bundle検証失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
 `image import`のparse失敗とstore pathの既定値解決失敗は終了code 2になる。
+`image export`では、image解決失敗、digest検証失敗、出力先の存在、書き出し失敗が終了code 125になり、成功表示は出さない。
+`image export`のparse失敗、`--output`の不足、store pathの既定値解決失敗は終了code 2になる。
 `image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
 `doctor`は全検査の成功で終了code 0、一つでも失敗したら終了code 1になる。
 `doctor`のparse失敗と既定値解決失敗は終了code 2、出力失敗は終了code 125になる。

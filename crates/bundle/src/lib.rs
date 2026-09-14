@@ -140,6 +140,11 @@ fn digest_for(header: &BootHeader, variable_bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// 小文字hex64桁のdigestを読む。CLIのdigest指定とtag fileで形式を共有する。
+pub fn parse_digest(encoded: &str) -> Option<[u8; 32]> {
+    store::decode_digest(encoded.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +461,22 @@ mod tests {
             }),
             Err(BundleError::Manifest(ManifestError::ArgumentTooLong))
         );
+    }
+
+    // Production break caught: digest references and tag files drift apart,
+    // so export accepts a digest that resolve rejects or vice versa.
+    #[test]
+    fn parses_only_lowercase_hex_digests() {
+        assert_eq!(parse_digest(&"ab".repeat(32)), Some([0xab; 32]));
+        assert_eq!(parse_digest(&"00".repeat(32)), Some([0x00; 32]));
+        for encoded in [
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "AB".repeat(32),
+            format!("{}g{}", "a".repeat(62), "b"),
+            String::new(),
+        ] {
+            assert_eq!(parse_digest(&encoded), None, "must not parse {encoded:?}");
+        }
     }
 }
