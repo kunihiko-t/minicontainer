@@ -5,12 +5,13 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image list`、`image inspect`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
+usage: minictr image import [--store PATH] IMAGE FILE
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
 ```
@@ -30,6 +31,8 @@ command名、option名、image名はUTF-8でなければならず、storeとkern
 IMAGEはUTF-8でなければならず、ELFは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `--arg`の値はmanifestへ格納するためUTF-8でなければならない。
 optionはIMAGEとELFの前後どこに置いてもよい。
+`image import`はIMAGEとFILEを取り、`--store`を前後どこに置いてもよい。
+FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
@@ -38,7 +41,7 @@ optionはIMAGEとELFの前後どこに置いてもよい。
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
-`image build`、`image list`、`image inspect`のstore解決も同じ順序を使う。
+`image build`、`image import`、`image list`、`image inspect`のstore解決も同じ順序を使う。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
 
 ## imageの登録
@@ -56,6 +59,21 @@ ELFの中身はhostでは検証せず、guestのloaderが検証する。
 tag名とゲスト引数の文法はbundle構築時に検証し、不正な入力はhost側の失敗として終わる。
 tag付けに失敗した後に未参照のdigestが残ることは許容する。
 同じbytesのblobは再利用でき、削除やrollbackを加えるほうがstore操作を複雑にするためである。
+
+## imageの取り込み
+
+`image import`は、MiniBundle fileを上限付きで読み、検証してからstoreへ登録する。
+検証はstore操作より先に行い、不正bundleではlayout directoryも作らない。
+成功すると`build`と同じくタグとdigestの一行だけを標準出力へ出す。
+
+```text
+myapp sha256:<64桁の小文字16進数>
+```
+
+manifest内のnameは書き換えず、CLIのtagだけを付ける。
+配布物のnameと手元のtagが異なる場合があり、`image inspect`の`tag`と`name`で区別する。
+同じbytesの再importは同じdigestを報告し、blobはcontent addressingで再利用する。
+既存tagへのimportはtagだけをatomicに付け替え、置き換え前のblobは残す。
 
 ## imageの確認
 
@@ -119,6 +137,8 @@ guestの終了codeは0から255の範囲でそのままprocess終了codeにな�
 timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、診断は標準エラー出力へ出る。
 `image build`では、ELFの読み取り失敗、上限超過、bundle構築失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
 `image build`のparse失敗とstore pathの既定値解決失敗は使い方の誤りとして終了code 2になる。
+`image import`では、fileの読み取り失敗、上限超過、bundle検証失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
+`image import`のparse失敗とstore pathの既定値解決失敗は終了code 2になる。
 `image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
 `doctor`は全検査の成功で終了code 0、一つでも失敗したら終了code 1になる。
 `doctor`のparse失敗と既定値解決失敗は終了code 2、出力失敗は終了code 125になる。
