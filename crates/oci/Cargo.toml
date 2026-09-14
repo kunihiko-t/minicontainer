@@ -9,3 +9,4 @@ repository.workspace = true
 [dependencies]
 minicontainer-bundle = { path = "../bundle" }
 sha2.workspace = true
+ureq.workspace = true

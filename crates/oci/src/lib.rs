@@ -12,10 +12,12 @@ mod export;
 mod import;
 mod json;
 mod parse;
+mod registry;
 
 pub use error::OciError;
 pub use export::{ExportedLayout, export_bundle};
 pub use import::import_bundle;
+pub use registry::{PullOptions, Reference, parse_reference, pull_bundle};
 
 /// `oci-layout`が宣言するlayout版。
 pub const OCI_LAYOUT_VERSION: &str = "1.0.0";

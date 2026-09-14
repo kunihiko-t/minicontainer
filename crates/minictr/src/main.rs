@@ -19,9 +19,10 @@ use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, Syste
 use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
     ResolvedExportOci, ResolvedImport, ResolvedImportOci, ResolvedInspect, ResolvedList,
-    ResolvedPrune, ResolvedRemove, ResolvedRun, VERSION, help, parse_os, resolve, resolve_build,
-    resolve_doctor, resolve_export, resolve_export_oci, resolve_import, resolve_import_oci,
-    resolve_inspect, resolve_list, resolve_prune, resolve_remove,
+    ResolvedPrune, ResolvedPullOci, ResolvedRemove, ResolvedRun, VERSION, help, parse_os, resolve,
+    resolve_build, resolve_doctor, resolve_export, resolve_export_oci, resolve_import,
+    resolve_import_oci, resolve_inspect, resolve_list, resolve_prune, resolve_pull_oci,
+    resolve_remove,
 };
 
 /// usage errorのprocess終了code。
@@ -186,6 +187,17 @@ pub fn real_main(
                     }
                 };
                 import_oci_resolved(&resolved, &RealStore, stdout, stderr)
+            }
+            ImageCommand::PullOci(args) => {
+                let resolved = match resolve_pull_oci(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                pull_oci_resolved(&resolved, &RealStore, stdout, stderr)
             }
         },
     }
@@ -1021,6 +1033,58 @@ pub fn import_oci_resolved(
     stderr: &mut dyn Write,
 ) -> i32 {
     let bundle = match minicontainer_oci::import_bundle(&resolved.dir) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    let digest = match store.import(&resolved.store, &bundle) {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = writeln!(stderr, "{error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    if let Err(error) = store.tag(&resolved.store, &resolved.image, digest) {
+        let _ = writeln!(stderr, "{error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = writeln!(
+        stdout,
+        "{image} sha256:{digest}",
+        image = resolved.image,
+        digest = format_digest(digest)
+    ) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// registryから匿名pullしてstoreへimportし、成功行を出す。参照のparseと
+/// pullの検証が通るまでstoreを変更しない。
+pub fn pull_oci_resolved(
+    resolved: &ResolvedPullOci,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let reference = match minicontainer_oci::parse_reference(&resolved.reference) {
+        Ok(reference) => reference,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    let bundle = match minicontainer_oci::pull_bundle(
+        &reference,
+        &minicontainer_oci::PullOptions::default(),
+    ) {
         Ok(bundle) => bundle,
         Err(error) => {
             let _ = writeln!(stderr, "minictr: {error}");
@@ -4612,5 +4676,45 @@ mod tests {
             "an invalid layout must not create a tag"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches pulling from a malformed reference without touching the
+    // network or the store.
+    #[test]
+    fn image_pull_oci_rejects_a_malformed_reference() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-pull-oci-badref-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("pull-oci"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("hello"),
+                OsString::from("not-a-reference"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr)
+                .contains("reference must be host/repository@sha256:<hex>")
+        );
+        assert!(
+            !root.join("tags/hello").exists(),
+            "a bad reference must not create a tag"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
