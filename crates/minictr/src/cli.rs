@@ -43,6 +43,8 @@ pub enum ImageCommand {
     Remove(ImageRemoveArgs),
     /// 未参照blobを検出して掃除する。
     Prune(ImagePruneArgs),
+    /// storeのimageをOCI Image Layoutへexportする。
+    ExportOci(ImageExportOciArgs),
 }
 
 /// `image build`の型付き引数。
@@ -112,6 +114,17 @@ pub struct ImagePruneArgs {
     pub dry_run: bool,
     /// `--force`の指定有無。指定時だけ削除する。
     pub force: bool,
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
+}
+
+/// `image export-oci`の型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageExportOciArgs {
+    /// store内で解決するimage tag。
+    pub image: String,
+    /// layoutを書き出す先のdirectory。
+    pub output: PathBuf,
     /// `--store`の指定値。`None`なら環境とHOMEから解決する。
     pub store: Option<PathBuf>,
 }
@@ -229,6 +242,17 @@ pub struct ResolvedPrune {
     pub store: PathBuf,
 }
 
+/// `image export-oci`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedExportOci {
+    /// store内で解決するimage tag。
+    pub image: String,
+    /// layoutを書き出す先のdirectory。
+    pub output: PathBuf,
+    /// bundle storeのroot。
+    pub store: PathBuf,
+}
+
 /// command parseまたは既定path解決が失敗した理由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
@@ -254,6 +278,10 @@ pub enum CliError {
     MissingInspectImage,
     /// `image remove`にimageが与えられなかった。
     MissingRemoveImage,
+    /// `image export-oci`にimageが与えられなかった。
+    MissingExportOciImage,
+    /// `image export-oci`に`--output`が与えられなかった。
+    MissingExportOciOutput,
     /// 余分なpositional引数。
     UnexpectedArgument(String),
     /// 対応していないoption。
@@ -302,6 +330,12 @@ impl fmt::Display for CliError {
             Self::MissingRemoveImage => {
                 formatter.write_str("missing image for `minictr image remove`")
             }
+            Self::MissingExportOciImage => {
+                formatter.write_str("missing image for `minictr image export-oci`")
+            }
+            Self::MissingExportOciOutput => {
+                formatter.write_str("missing output for `minictr image export-oci`")
+            }
             Self::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected minictr argument: {argument}")
             }
@@ -337,7 +371,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]"
+    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR"
 }
 
 /// OS引数からcommandをparseする。
@@ -363,6 +397,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
                 "inspect" => return parse_image_inspect(arguments),
                 "remove" => return parse_image_remove(arguments),
                 "prune" => return parse_image_prune(arguments),
+                "export-oci" => return parse_image_export_oci(arguments),
                 unknown => return Err(CliError::UnknownCommand(unknown.to_owned())),
             }
         }
@@ -872,6 +907,72 @@ fn parse_image_prune(arguments: impl IntoIterator<Item = OsString>) -> Result<Co
     })))
 }
 
+/// `image export-oci`の引数をparseする。IMAGEを一つ取り、`--output`は必須で
+/// `--store`は任意である。
+fn parse_image_export_oci(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<Command, CliError> {
+    let mut image: Option<String> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut store: Option<PathBuf> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                "--output" => {
+                    if output.is_some() {
+                        return Err(CliError::DuplicateOption("--output"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--output"))?,
+                    };
+                    output = Some(PathBuf::from(value));
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        if image.is_some() {
+            return Err(CliError::UnexpectedArgument(text));
+        }
+        image = Some(text);
+    }
+
+    let Some(image) = image else {
+        return Err(CliError::MissingExportOciImage);
+    };
+    let Some(output) = output else {
+        return Err(CliError::MissingExportOciOutput);
+    };
+    Ok(Command::Image(ImageCommand::ExportOci(
+        ImageExportOciArgs {
+            image,
+            output,
+            store,
+        },
+    )))
+}
+
 /// 引数を取らないcommandを確定する。後続のtokenは、optionの形でも
 /// 受け付けず、打ち間違いとして型付きerrorにする。
 fn parse_bare_command(
@@ -1085,6 +1186,25 @@ pub fn resolve_prune(args: &ImagePruneArgs, env: &dyn Environ) -> Result<Resolve
     };
     Ok(ResolvedPrune {
         force: args.force,
+        store,
+    })
+}
+
+/// parse済み`image export-oci`引数と環境からstore pathを解決する。
+pub fn resolve_export_oci(
+    args: &ImageExportOciArgs,
+    env: &dyn Environ,
+) -> Result<ResolvedExportOci, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedExportOci {
+        image: args.image.clone(),
+        output: args.output.clone(),
         store,
     })
 }
@@ -1460,7 +1580,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]"
+            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR"
         );
     }
 
@@ -2573,5 +2693,115 @@ mod tests {
             home: None,
         };
         assert_eq!(resolve_prune(&args, &env), Err(CliError::MissingHome));
+    }
+
+    // Catches drifting from the export-oci syntax: one image tag with a
+    // required `--output` directory and an optional `--store`.
+    #[test]
+    fn parses_image_export_oci_with_required_output() {
+        assert_eq!(
+            parse(["image", "export-oci", "hello", "--output", "out"]),
+            Ok(Command::Image(ImageCommand::ExportOci(
+                ImageExportOciArgs {
+                    image: "hello".into(),
+                    output: PathBuf::from("out"),
+                    store: None,
+                }
+            )))
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "export-oci",
+                "--store",
+                "/data/store",
+                "hello",
+                "--output=out",
+            ]),
+            Ok(Command::Image(ImageCommand::ExportOci(
+                ImageExportOciArgs {
+                    image: "hello".into(),
+                    output: PathBuf::from("out"),
+                    store: Some(PathBuf::from("/data/store")),
+                }
+            )))
+        );
+    }
+
+    // Catches running `image export-oci` without an image tag, without an
+    // output directory, or with extras.
+    #[test]
+    fn rejects_missing_image_output_and_extras_for_export_oci() {
+        assert_eq!(
+            parse(["image", "export-oci", "--output", "out"]),
+            Err(CliError::MissingExportOciImage)
+        );
+        assert_eq!(
+            parse(["image", "export-oci", "hello"]),
+            Err(CliError::MissingExportOciOutput)
+        );
+        assert_eq!(
+            parse(["image", "export-oci", "hello", "extra", "--output", "out"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "export-oci",
+                "hello",
+                "--output",
+                "a",
+                "--output",
+                "b"
+            ]),
+            Err(CliError::DuplicateOption("--output"))
+        );
+        assert_eq!(
+            parse(["image", "export-oci", "hello", "--output"]),
+            Err(CliError::MissingValue("--output"))
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "export-oci",
+                "hello",
+                "--output",
+                "out",
+                "--tag",
+                "v1"
+            ]),
+            Err(CliError::UnknownOption("--tag".to_owned()))
+        );
+    }
+
+    #[test]
+    fn resolves_export_oci_store_from_cli_env_and_home() {
+        let args = ImageExportOciArgs {
+            image: "hello".into(),
+            output: PathBuf::from("out"),
+            store: None,
+        };
+        let env = FakeEnv {
+            store: Some(OsString::from("/env/store")),
+            kernel: None,
+            home: Some(OsString::from("/home/test")),
+        };
+        assert_eq!(
+            resolve_export_oci(&args, &env).unwrap(),
+            ResolvedExportOci {
+                image: "hello".into(),
+                output: PathBuf::from("out"),
+                store: PathBuf::from("/env/store"),
+            }
+        );
+        let explicit = ImageExportOciArgs {
+            image: "hello".into(),
+            output: PathBuf::from("out"),
+            store: Some(PathBuf::from("/cli/store")),
+        };
+        assert_eq!(
+            resolve_export_oci(&explicit, &env).unwrap().store,
+            PathBuf::from("/cli/store")
+        );
     }
 }

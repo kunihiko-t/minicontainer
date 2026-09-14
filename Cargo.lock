@@ -124,6 +124,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "minicontainer-oci"
+version = "0.1.0"
+dependencies = [
+ "minicontainer-bundle",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "minicontainer-protocol"
 version = "0.1.0"
 dependencies = [
@@ -146,6 +154,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "minicontainer-bundle",
+ "minicontainer-oci",
  "minicontainer-runtime",
 ]
 
