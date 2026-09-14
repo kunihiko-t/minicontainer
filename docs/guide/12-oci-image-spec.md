@@ -38,6 +38,14 @@ OCIのblobのダイジェストは格納したバイト列から計算するた�
 同じ入力からはbyte一致のlayoutを作り、golden fixtureの値は対応文書の例と一致する。
 成功行のdigestは`index.json`のSHA-256であり、CLIの形は[第9章](09-minictr-run.md)を参照する。
 
+## importの契約
+
+`image import-oci`はlayoutをstoreの外で検証し尽くしてから、正準のMiniBundle bytesだけをstoreへ置く。
+検証の順序はsize、digest、JSON parse、意味検証、MiniBundle parseであり、失敗時はtagもblobも作らない。
+indexの`platform`は任意のhintであり、不在でもconfigの宣言で検証する。
+toolが複写時に付けるannotationは無視し、tagはCLI引数から付ける。
+受け入れ判定の一覧は対応文書の判定表が正である。
+
 ## 往復の見通し
 
 exportはstoreのbundle bytesを不変のpayloadとしてlayoutへ包む。
