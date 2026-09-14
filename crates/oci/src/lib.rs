@@ -2,16 +2,20 @@
 //!
 //! 対応の定義は`docs/reference/minibundle-oci-mapping.md`が正である。
 //! このcrateはそのv1対応のexport側（storeのbundle bytesからlayout
-//! directoryの生成）を実装する。import側は#17で追加する。
+//! directoryの生成）とimport側（layoutの検証と正準bundleへの復元）を
+//! 実装する。
 
 #![forbid(unsafe_code)]
 
 mod error;
 mod export;
+mod import;
 mod json;
+mod parse;
 
 pub use error::OciError;
 pub use export::{ExportedLayout, export_bundle};
+pub use import::import_bundle;
 
 /// `oci-layout`が宣言するlayout版。
 pub const OCI_LAYOUT_VERSION: &str = "1.0.0";

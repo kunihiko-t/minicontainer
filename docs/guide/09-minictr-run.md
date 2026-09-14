@@ -5,13 +5,7 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-<<<<<<< HEAD
-`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`help`、`--version`である。
-||||||| parent of daf9f37 (feat(oci): export stored images as OCI Image Layout)
-`minictr`が実装するcommandは`run`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
-=======
-`minictr`が実装するcommandは`run`、`image build`、`image list`、`image inspect`、`image export-oci`、`help`、`--version`である。
->>>>>>> daf9f37 (feat(oci): export stored images as OCI Image Layout)
+`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
@@ -21,13 +15,10 @@ usage: minictr image import [--store PATH] IMAGE FILE
 usage: minictr image export [--store PATH] IMAGE --output PATH
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
-<<<<<<< HEAD
 usage: minictr image remove [--store PATH] IMAGE
 usage: minictr image prune [--store PATH] [--dry-run] [--force]
-||||||| parent of daf9f37 (feat(oci): export stored images as OCI Image Layout)
-=======
 usage: minictr image export-oci [--store PATH] IMAGE --output DIR
->>>>>>> daf9f37 (feat(oci): export stored images as OCI Image Layout)
+usage: minictr image import-oci [--store PATH] IMAGE DIR
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -51,29 +42,21 @@ FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う�
 `--output`の値は`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
-<<<<<<< HEAD
 `image remove`もIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image prune`はpositionalを取らず、`--store`と値なしflagの`--dry-run`と`--force`だけを一度ずつ指定できる。
 `--dry-run`と`--force`の併用と、flagへの`=値`の付与は型付きerrorになる。
-||||||| parent of daf9f37 (feat(oci): export stored images as OCI Image Layout)
-=======
 `image export-oci`はIMAGEを一つ取り、`--output`は必須、`--store`は任意であり、optionは前後どこに置いてもよい。
 `--output`のDIRは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
->>>>>>> daf9f37 (feat(oci): export stored images as OCI Image Layout)
+`image import-oci`はIMAGEとDIRの二つを取り、`--store`は任意であり、optionは前後どこに置いてもよい。
+DIRもOS pathとして非UTF-8 byteを透過的に扱う。
 `image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
 `doctor`はpositionalを取らず、`--store`と`--kernel`だけを一度ずつ指定できる。
 
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
-<<<<<<< HEAD
-`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`のstore解決も同じ順序を使う。
+`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`のstore解決も同じ順序を使う。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
-||||||| parent of daf9f37 (feat(oci): export stored images as OCI Image Layout)
-`image build`、`image list`、`image inspect`のstore解決も同じ順序を使う。
-=======
-`image build`、`image list`、`image inspect`、`image export-oci`のstore解決も同じ順序を使う。
->>>>>>> daf9f37 (feat(oci): export stored images as OCI Image Layout)
 
 ## imageの登録
 
@@ -144,7 +127,6 @@ elf-bytes: 4096
 manifest引数の内容は表示せず、件数だけを表示する。
 未参照のtagは一覧に出るが、同じtagのinspectは`resolve`経由で失敗する。
 
-<<<<<<< HEAD
 ## 実行前の診断
 
 `doctor`は、QEMU、kernel file、store rootの三つの検査を順に行う。
@@ -193,8 +175,6 @@ store側も参照中blobの削除を拒否する。部分失敗はblobごとに�
 blob名でない配置物は候補に含めず、symlink名のblobは削除せず失敗として報告する。
 確認と削除の隙間は狭めるだけでなくせない。並行する攻撃者への対策ではない。
 
-||||||| parent of daf9f37 (feat(oci): export stored images as OCI Image Layout)
-=======
 ## imageの配布
 
 `image export-oci`は、storeのbundle bytesをOCI Image Layoutのdirectoryへexportする。
@@ -210,7 +190,18 @@ fileは一時directoryに書いてからrenameで公開し、完成品を読み�
 layer blobはstoreのbundle bytesと同一であり、tagはlayoutに引き継がない。
 media type、正準JSON、digestの対応は[MiniBundleとOCI Image Layoutの対応](../reference/minibundle-oci-mapping.md)が正である。
 
->>>>>>> daf9f37 (feat(oci): export stored images as OCI Image Layout)
+`image import-oci`は、layout directoryを検証してMiniBundleを復元し、IMAGEのtagでstoreへ登録する。
+成功すると次のようにtagとbundle digestの一行だけを標準出力へ出す。
+
+```text
+myapp sha256:<64桁の小文字16進数>
+```
+
+検証の順序はsize、digest、JSON parse、意味検証、MiniBundle parseであり、一つでも失敗したらstoreを変更しない。
+layout外への参照とsymlinkは拒否し、未知のplatformとmedia typeは型付きerrorになる。
+復元したbundleは正準形に組み立て直し、storeには正準bytesだけを置く。
+tagはCLI引数から付け、layoutのannotationは引き継がない。
+
 ## 実行と入出力
 
 解決したimage tagはcontent-addressed storeから検証済みbundle bytesとして取り出す。

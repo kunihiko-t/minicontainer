@@ -61,7 +61,9 @@ layout/
 ```
 
 `index.json`はmanifest記述を一つだけ持つ。
-manifest記述は`platform`を必須とし、`architecture`は`riscv64`、`os`は`minios`だけを受け入れる。
+manifest記述の`platform`は任意のhintとし、存在するときは`architecture`が`riscv64`、`os`が`minios`であることを要求する。
+toolが複写時にhintを落としても受け入れる。
+platformの正はconfigの`architecture`と`os`であり、両方とも`riscv64`と`minios`だけを受け入れる。
 `os`の`minios`は意図的な独自値であり、Linuxではない。
 importは`linux`を含む他の値を拒否する。
 
@@ -169,9 +171,11 @@ HTTP診断にsecretを含めない。
 | `index.json`の不在、parse失敗、重複key | 拒否する |
 | manifest記述が0個または2個以上 | 拒否する |
 | manifest記述のmedia type違い | 拒否する |
-| `platform`の不在、`riscv64`と`minios`以外 | 拒否する |
+| `platform`の値違い（存在時のみ検証する） | 拒否する |
+| `platform`の不在 | 受け入れる（configで検証する） |
 | config記述のmedia type違い | 拒否する |
-| configのparse失敗、`Entrypoint`と`Cmd`の不一致 | 拒否する |
+| configのparse失敗、`architecture`と`os`の不一致 | 拒否する |
+| configの`Entrypoint`と`Cmd`の不一致 | 拒否する |
 | layer記述が0個または2個以上、media type違い | 拒否する |
 | descriptorのdigest不一致、size不一致 | 拒否する（store不変） |
 | layer blobのMiniBundle parse失敗 | 拒否する（BundleErrorを返す） |

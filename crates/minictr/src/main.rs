@@ -18,10 +18,10 @@ use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, Syste
 
 use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
-    ResolvedExportOci, ResolvedImport, ResolvedInspect, ResolvedList, ResolvedPrune,
-    ResolvedRemove, ResolvedRun, VERSION, help, parse_os, resolve, resolve_build, resolve_doctor,
-    resolve_export, resolve_export_oci, resolve_import, resolve_inspect, resolve_list,
-    resolve_prune, resolve_remove,
+    ResolvedExportOci, ResolvedImport, ResolvedImportOci, ResolvedInspect, ResolvedList,
+    ResolvedPrune, ResolvedRemove, ResolvedRun, VERSION, help, parse_os, resolve, resolve_build,
+    resolve_doctor, resolve_export, resolve_export_oci, resolve_import, resolve_import_oci,
+    resolve_inspect, resolve_list, resolve_prune, resolve_remove,
 };
 
 /// usage errorのprocess終了code。
@@ -175,6 +175,17 @@ pub fn real_main(
                     }
                 };
                 export_oci_resolved(&resolved, &RealStore, stdout, stderr)
+            }
+            ImageCommand::ImportOci(args) => {
+                let resolved = match resolve_import_oci(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                import_oci_resolved(&resolved, &RealStore, stdout, stderr)
             }
         },
     }
@@ -990,6 +1001,48 @@ pub fn export_oci_resolved(
         "{image} oci-layout sha256:{digest}",
         image = resolved.image,
         digest = format_digest(exported.index)
+    ) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// OCI Image Layoutを検証してstoreへimportし、成功行を出す。検証が通る
+/// までstoreを変更しない。
+pub fn import_oci_resolved(
+    resolved: &ResolvedImportOci,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let bundle = match minicontainer_oci::import_bundle(&resolved.dir) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    let digest = match store.import(&resolved.store, &bundle) {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = writeln!(stderr, "{error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    if let Err(error) = store.tag(&resolved.store, &resolved.image, digest) {
+        let _ = writeln!(stderr, "{error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = writeln!(
+        stdout,
+        "{image} sha256:{digest}",
+        image = resolved.image,
+        digest = format_digest(digest)
     ) {
         let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
         return RUNTIME_EXIT;
@@ -4471,6 +4524,92 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&stderr)
                 .contains("missing output for `minictr image export-oci`")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches importing anything but the validated layout bytes and catches
+    // drifting import-oci output from the stable success line.
+    #[test]
+    fn image_import_oci_registers_the_validated_layout() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-import-oci-store-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let elf: Vec<u8> = (0..16).collect();
+        let bytes = build(ImageSpec {
+            name: "hello",
+            args: &[],
+            elf: &elf,
+        })
+        .unwrap();
+        let layout = root.join("layout");
+        minicontainer_oci::export_bundle(&bytes, &layout).unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("import-oci"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("restored"),
+                layout.into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "restored sha256:f8200f06e25dcb0f36a744b780c0fa1b40030c9a6bb9786b122cad44cad221ff\n"
+        );
+        let store = Store::new(&root).unwrap();
+        assert_eq!(store.resolve("restored").unwrap(), bytes);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches changing the store when the layout is invalid.
+    #[test]
+    fn image_import_oci_leaves_the_store_unchanged_on_invalid_layout() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-import-oci-invalid-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let layout = root.join("layout");
+        std::fs::create_dir_all(&layout).unwrap();
+        std::fs::write(layout.join("index.json"), b"{}").unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("import-oci"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("broken"),
+                layout.into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+        assert!(
+            !root.join("tags/broken").exists(),
+            "an invalid layout must not create a tag"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
