@@ -31,6 +31,13 @@ storeの`images/sha256`と`tags`の配置は、この二点ではOCIの考え方
 OCIのblobのダイジェストは格納したバイト列から計算するため、ヘッダー内のdigest欄をゼロにして計算するMiniBundleのダイジェストをそのまま代用できない。
 二つのdigest領域の違いは対応文書の計算例で確認する。
 
+## exportの契約
+
+`image export-oci`はstoreのtagを解決し、bundle bytesを不変のpayloadとしてlayoutへ包む。
+`--output`の出力先が存在する場合は上書きせず失敗する。
+同じ入力からはbyte一致のlayoutを作り、golden fixtureの値は対応文書の例と一致する。
+成功行のdigestは`index.json`のSHA-256であり、CLIの形は[第9章](09-minictr-run.md)を参照する。
+
 ## 往復の見通し
 
 exportはstoreのbundle bytesを不変のpayloadとしてlayoutへ包む。

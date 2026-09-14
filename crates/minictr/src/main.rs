@@ -18,9 +18,10 @@ use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, Syste
 
 use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
-    ResolvedImport, ResolvedInspect, ResolvedList, ResolvedPrune, ResolvedRemove, ResolvedRun,
-    VERSION, help, parse_os, resolve, resolve_build, resolve_doctor, resolve_export,
-    resolve_import, resolve_inspect, resolve_list, resolve_prune, resolve_remove,
+    ResolvedExportOci, ResolvedImport, ResolvedInspect, ResolvedList, ResolvedPrune,
+    ResolvedRemove, ResolvedRun, VERSION, help, parse_os, resolve, resolve_build, resolve_doctor,
+    resolve_export, resolve_export_oci, resolve_import, resolve_inspect, resolve_list,
+    resolve_prune, resolve_remove,
 };
 
 /// usage errorのprocess終了code。
@@ -163,6 +164,17 @@ pub fn real_main(
                     }
                 };
                 prune_resolved(&resolved, &RealStore, stdout, stderr)
+            }
+            ImageCommand::ExportOci(args) => {
+                let resolved = match resolve_export_oci(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                export_oci_resolved(&resolved, &RealStore, stdout, stderr)
             }
         },
     }
@@ -950,6 +962,43 @@ fn prune_force(
         return RUNTIME_EXIT;
     }
     if failed { RUNTIME_EXIT } else { 0 }
+}
+
+/// storeのbundle bytesをOCI Image Layoutへexportし、成功行を出す。
+pub fn export_oci_resolved(
+    resolved: &ResolvedExportOci,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let bytes = match store.resolve(&resolved.store, &resolved.image) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = writeln!(stderr, "{error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    let exported = match minicontainer_oci::export_bundle(&bytes, &resolved.output) {
+        Ok(exported) => exported,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    if let Err(error) = writeln!(
+        stdout,
+        "{image} oci-layout sha256:{digest}",
+        image = resolved.image,
+        digest = format_digest(exported.index)
+    ) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
 }
 
 /// ELFのmetadata確認、上限付きread、bundle構築、import、tagを順に行う。
@@ -4304,6 +4353,125 @@ mod tests {
             RUNTIME_EXIT
         );
         assert!(String::from_utf8_lossy(&stderr).contains("failed to flush stdout"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches drifting export-oci output from the stable success line and
+    // catches exporting anything but the resolved bundle bytes.
+    #[test]
+    fn image_export_oci_writes_a_layout_for_the_resolved_image() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-export-oci-store-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::new(&root).unwrap();
+        let elf: Vec<u8> = (0..16).collect();
+        let bytes = build(ImageSpec {
+            name: "hello",
+            args: &[],
+            elf: &elf,
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        store.tag("hello", digest).unwrap();
+        let output = root.join("layout");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("export-oci"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("hello"),
+                OsString::from("--output"),
+                output.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "hello oci-layout sha256:29dd36cc92562f77bb648ee0ad74d4fe3cde3330f723fadd0f514c15309ceb54\n"
+        );
+        let layer =
+            std::fs::read(output.join(
+                "blobs/sha256/6c710671215c4929fa600956d236ae82df1f3a9f05f0b125c3fb0feed9096136",
+            ))
+            .unwrap();
+        assert_eq!(layer, bytes, "the layer blob is the stored bundle");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches overwriting an existing destination or succeeding without
+    // `--output`.
+    #[test]
+    fn image_export_oci_rejects_existing_destinations_and_missing_output() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "minictr-test-export-oci-clash-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::new(&root).unwrap();
+        let bytes = build(ImageSpec {
+            name: "hello",
+            args: &[],
+            elf: b"ELF-bytes",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        store.tag("hello", digest).unwrap();
+        let output = root.join("layout");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("export-oci"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("hello"),
+                OsString::from("--output"),
+                output.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8_lossy(&stderr).contains("oci destination already exists"));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("export-oci"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("hello"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, USAGE_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr)
+                .contains("missing output for `minictr image export-oci`")
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

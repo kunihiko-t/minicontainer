@@ -1,0 +1,114 @@
+use std::{fmt, path::PathBuf};
+
+/// OCI変換の型付き失敗。
+#[derive(Debug, PartialEq, Eq)]
+pub enum OciError {
+    /// 入力bytesがMiniBundleとして不正である。
+    Bundle(minicontainer_bundle::BundleError),
+    /// 出力先がすでに存在する。
+    DestinationExists {
+        /// 指定された出力先。
+        path: PathBuf,
+    },
+    /// 出力先の親directoryを作れない。
+    CreateParent {
+        /// 親directory。
+        path: PathBuf,
+        /// OS errorの内容。
+        message: String,
+    },
+    /// 一時出力directoryを作れない。
+    CreateTemp {
+        /// 一時directory。
+        path: PathBuf,
+        /// OS errorの内容。
+        message: String,
+    },
+    /// layout fileを書けない。
+    WriteFile {
+        /// 書き込み先。
+        path: PathBuf,
+        /// OS errorの内容。
+        message: String,
+    },
+    /// 一時directoryを出力先へ移動できない。
+    Publish {
+        /// 一時directory。
+        temp: PathBuf,
+        /// 出力先。
+        dest: PathBuf,
+        /// OS errorの内容。
+        message: String,
+    },
+    /// 完成品の読み戻し検証が不一致である。
+    Readback {
+        /// 不一致の内容。
+        message: String,
+    },
+}
+
+impl fmt::Display for OciError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bundle(error) => write!(formatter, "invalid MiniBundle: {error}"),
+            Self::DestinationExists { path } => write!(
+                formatter,
+                "oci destination already exists: {}",
+                path.display()
+            ),
+            Self::CreateParent { path, message } => write!(
+                formatter,
+                "oci parent directory cannot be created ({}): {message}",
+                path.display()
+            ),
+            Self::CreateTemp { path, message } => write!(
+                formatter,
+                "oci temporary directory cannot be created ({}): {message}",
+                path.display()
+            ),
+            Self::WriteFile { path, message } => write!(
+                formatter,
+                "oci file cannot be written ({}): {message}",
+                path.display()
+            ),
+            Self::Publish {
+                temp,
+                dest,
+                message,
+            } => write!(
+                formatter,
+                "oci layout cannot be published ({} -> {}): {message}",
+                temp.display(),
+                dest.display()
+            ),
+            Self::Readback { message } => {
+                write!(formatter, "oci layout verification failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OciError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_name_the_failed_step() {
+        assert_eq!(
+            OciError::DestinationExists {
+                path: PathBuf::from("out")
+            }
+            .to_string(),
+            "oci destination already exists: out"
+        );
+        assert_eq!(
+            OciError::Readback {
+                message: "index.json differs".to_owned()
+            }
+            .to_string(),
+            "oci layout verification failed: index.json differs"
+        );
+    }
+}
