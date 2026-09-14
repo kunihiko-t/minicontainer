@@ -20,6 +20,18 @@ QEMUとminiOSは信頼する計算基盤である。
 QEMUまたはminiOSの脆弱性はこのモデルの前提を崩す。
 配布アーカイブ内のkernel binaryも固定revisionからbuildした同じminiOSであり、信頼前提は変わらない。
 
+## OCI入力の扱い
+
+OCI Image Layoutのdirectoryとregistryの応答は、検証が通るまで信頼しない入力として扱う。
+信頼できるのは、sizeとdigestの検証、JSONと意味の検証、MiniBundle parseをすべて通過したbundle bytesだけである。
+検証が一つでも失敗したらstoreを変更せず、tagも付けない。
+
+layout内の参照pathはrootの内側だけに解決し、symlinkは追従しない。
+JSON文書は64 KiB、MiniBundle layerは8 MiBの上限で読み、超過は拒否する。
+registry pullはhttpsだけを使い、redirectは5回までとし、認証情報は扱わない。
+未知のannotationとfieldは無視するが、未知のmedia typeとplatformは拒否する。
+対応の詳細は[MiniBundleとOCI Image Layoutの対応](minibundle-oci-mapping.md)を参照する。
+
 ## 仮想マシン境界
 
 一つのRISC-V 64アプリケーションを一つのQEMU仮想マシンで実行する。
