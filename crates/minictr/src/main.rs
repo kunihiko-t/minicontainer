@@ -18,9 +18,9 @@ use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, Syste
 
 use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
-    ResolvedImport, ResolvedInspect, ResolvedList, ResolvedRemove, ResolvedRun, VERSION, help,
-    parse_os, resolve, resolve_build, resolve_doctor, resolve_export, resolve_import,
-    resolve_inspect, resolve_list, resolve_remove,
+    ResolvedImport, ResolvedInspect, ResolvedList, ResolvedPrune, ResolvedRemove, ResolvedRun,
+    VERSION, help, parse_os, resolve, resolve_build, resolve_doctor, resolve_export,
+    resolve_import, resolve_inspect, resolve_list, resolve_prune, resolve_remove,
 };
 
 /// usage errorのprocess終了code。
@@ -153,6 +153,17 @@ pub fn real_main(
                 };
                 remove_resolved(&resolved, &RealStore, stdout, stderr)
             }
+            ImageCommand::Prune(args) => {
+                let resolved = match resolve_prune(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                prune_resolved(&resolved, &RealStore, stdout, stderr)
+            }
         },
     }
 }
@@ -171,6 +182,10 @@ pub trait ImageStore {
     fn list_tags(&self, store_root: &Path) -> Result<Vec<TagRecord>, StoreError>;
     /// 一つのtagだけを削除する。blobは保持する。
     fn remove_tag(&self, store_root: &Path, name: &str) -> Result<(), StoreError>;
+    /// どのtagからも参照されないblobのdigestをbyte順で返す。
+    fn orphans(&self, store_root: &Path) -> Result<Vec<[u8; 32]>, StoreError>;
+    /// 未参照blobを一つ削除する。参照中は拒否する。
+    fn remove_blob(&self, store_root: &Path, digest: [u8; 32]) -> Result<(), StoreError>;
 }
 
 /// bundle store失敗の公開分類。
@@ -220,6 +235,16 @@ impl ImageStore for RealStore {
     fn remove_tag(&self, store_root: &Path, name: &str) -> Result<(), StoreError> {
         let store = Store::new(store_root).map_err(StoreError::Store)?;
         store.remove_tag(name).map_err(StoreError::Store)
+    }
+
+    fn orphans(&self, store_root: &Path) -> Result<Vec<[u8; 32]>, StoreError> {
+        let store = Store::new(store_root).map_err(StoreError::Store)?;
+        store.orphans().map_err(StoreError::Store)
+    }
+
+    fn remove_blob(&self, store_root: &Path, digest: [u8; 32]) -> Result<(), StoreError> {
+        let store = Store::new(store_root).map_err(StoreError::Store)?;
+        store.remove_blob(digest).map_err(StoreError::Store)
     }
 }
 
@@ -842,6 +867,91 @@ pub fn remove_resolved(
     0
 }
 
+/// 解決済み`image prune`を実行し、process終了codeを返す。`--force`の
+/// ない呼び出しは候補の表示だけで削除しない。
+pub fn prune_resolved(
+    resolved: &ResolvedPrune,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let orphans = match store.orphans(&resolved.store) {
+        Ok(orphans) => orphans,
+        Err(error) => {
+            let _ = writeln!(stderr, "{error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    if resolved.force {
+        prune_force(&resolved.store, store, &orphans, stdout, stderr)
+    } else {
+        prune_list(&orphans, stdout, stderr)
+    }
+}
+
+/// 候補の表示だけを行い、削除しない。
+fn prune_list(orphans: &[[u8; 32]], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
+    for digest in orphans {
+        if let Err(error) = writeln!(stdout, "sha256:{}", format_digest(*digest)) {
+            let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+            return RUNTIME_EXIT;
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// 候補を一つずつ削除する。削除直前に参照状態を再確認し、再参照は
+/// 飛ばす。store側も参照中blobの削除を拒否する。部分失敗は個別に
+/// 報告し、一つでもあればhost失敗で終わる。
+fn prune_force(
+    store_root: &Path,
+    store: &dyn ImageStore,
+    orphans: &[[u8; 32]],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let mut failed = false;
+    for digest in orphans {
+        let line = format!("sha256:{}", format_digest(*digest));
+        let records = match store.list_tags(store_root) {
+            Ok(records) => records,
+            Err(StoreError::Store(inner)) => {
+                let _ = writeln!(stderr, "minictr: failed to re-check references: {inner}");
+                failed = true;
+                continue;
+            }
+        };
+        if records.iter().any(|record| record.digest == *digest) {
+            let _ = writeln!(stderr, "minictr: {line} is referenced; skipping");
+            continue;
+        }
+        match store.remove_blob(store_root, *digest) {
+            Ok(()) => {
+                if let Err(error) = writeln!(stdout, "{line}") {
+                    let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+                    return RUNTIME_EXIT;
+                }
+            }
+            Err(StoreError::Store(minicontainer_bundle::StoreError::BlobReferenced)) => {
+                let _ = writeln!(stderr, "minictr: {line} is referenced; skipping");
+            }
+            Err(StoreError::Store(inner)) => {
+                let _ = writeln!(stderr, "minictr: failed to remove {line}: {inner}");
+                failed = true;
+            }
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    if failed { RUNTIME_EXIT } else { 0 }
+}
+
 /// ELFのmetadata確認、上限付きread、bundle構築、import、tagを順に行う。
 /// ELFの中身は検証せずminiOSのloaderへ委ねる。tag失敗後に残る未参照
 /// blobは消さない。同じbytesは再利用でき、rollbackのほうがstore操作を
@@ -1182,6 +1292,14 @@ mod tests {
         fn remove_tag(&self, _store_root: &Path, _name: &str) -> Result<(), StoreError> {
             panic!("run tests do not remove tags");
         }
+
+        fn orphans(&self, _store_root: &Path) -> Result<Vec<[u8; 32]>, StoreError> {
+            panic!("run tests do not list orphans");
+        }
+
+        fn remove_blob(&self, _store_root: &Path, _digest: [u8; 32]) -> Result<(), StoreError> {
+            panic!("run tests do not remove blobs");
+        }
     }
 
     struct QueryStore {
@@ -1221,6 +1339,14 @@ mod tests {
 
         fn remove_tag(&self, _store_root: &Path, _name: &str) -> Result<(), StoreError> {
             panic!("image query tests do not remove tags");
+        }
+
+        fn orphans(&self, _store_root: &Path) -> Result<Vec<[u8; 32]>, StoreError> {
+            panic!("image query tests do not list orphans");
+        }
+
+        fn remove_blob(&self, _store_root: &Path, _digest: [u8; 32]) -> Result<(), StoreError> {
+            panic!("image query tests do not remove blobs");
         }
     }
 
@@ -1290,6 +1416,14 @@ mod tests {
 
         fn remove_tag(&self, _store_root: &Path, _name: &str) -> Result<(), StoreError> {
             panic!("image build tests do not remove tags");
+        }
+
+        fn orphans(&self, _store_root: &Path) -> Result<Vec<[u8; 32]>, StoreError> {
+            panic!("image build tests do not list orphans");
+        }
+
+        fn remove_blob(&self, _store_root: &Path, _digest: [u8; 32]) -> Result<(), StoreError> {
+            panic!("image build tests do not remove blobs");
         }
     }
 
@@ -1588,6 +1722,14 @@ mod tests {
 
             fn remove_tag(&self, _root: &Path, _name: &str) -> Result<(), StoreError> {
                 panic!("run tests do not remove tags");
+            }
+
+            fn orphans(&self, _root: &Path) -> Result<Vec<[u8; 32]>, StoreError> {
+                panic!("run tests do not list orphans");
+            }
+
+            fn remove_blob(&self, _root: &Path, _digest: [u8; 32]) -> Result<(), StoreError> {
+                panic!("run tests do not remove blobs");
             }
         }
 
@@ -3684,6 +3826,478 @@ mod tests {
                 &mut FlushFailingWriter {
                     buffered: Vec::new(),
                     message: "remove flush broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to flush stdout"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn resolved_prune(force: bool, store: &Path) -> ResolvedPrune {
+        ResolvedPrune {
+            force,
+            store: store.to_path_buf(),
+        }
+    }
+
+    fn temp_prune_root(prefix: &str) -> std::path::PathBuf {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("minictr-test-{prefix}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Imports one referenced and two orphaned blobs, returning the
+    /// referenced digest and both orphan digests in sorted order.
+    fn prune_fixture(root: &Path) -> ([u8; 32], Vec<[u8; 32]>) {
+        let store = Store::new(root).unwrap();
+        let mut orphans = Vec::new();
+        for elf in ["orphan-a", "orphan-b"] {
+            let bytes = build(ImageSpec {
+                name: "a",
+                args: &[],
+                elf: elf.as_bytes(),
+            })
+            .unwrap();
+            orphans.push(store.import(&bytes).unwrap());
+        }
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"kept",
+        })
+        .unwrap();
+        let kept = store.import(&bytes).unwrap();
+        store.tag("kept", kept).unwrap();
+        orphans.sort();
+        (kept, orphans)
+    }
+
+    fn digest_lines(digests: &[[u8; 32]]) -> Vec<u8> {
+        let mut output = String::new();
+        for digest in digests {
+            output.push_str(&format!("sha256:{}\n", format_digest(*digest)));
+        }
+        output.into_bytes()
+    }
+
+    struct ScriptedPruneStore {
+        orphans: Vec<[u8; 32]>,
+        snapshots: RefCell<VecDeque<Result<Vec<TagRecord>, StoreError>>>,
+        refuse: Vec<[u8; 32]>,
+        fail: Vec<[u8; 32]>,
+        removed: RefCell<Vec<[u8; 32]>>,
+    }
+
+    impl ScriptedPruneStore {
+        fn new(orphans: Vec<[u8; 32]>) -> Self {
+            Self {
+                orphans,
+                snapshots: RefCell::new(VecDeque::new()),
+                refuse: Vec::new(),
+                fail: Vec::new(),
+                removed: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ImageStore for ScriptedPruneStore {
+        fn resolve(&self, _root: &Path, _image: &str) -> Result<Vec<u8>, StoreError> {
+            panic!("prune tests do not resolve tags");
+        }
+
+        fn resolve_digest(&self, _root: &Path, _digest: [u8; 32]) -> Result<Vec<u8>, StoreError> {
+            panic!("prune tests do not resolve digests");
+        }
+
+        fn import(&self, _root: &Path, _bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+            panic!("prune tests do not import bundles");
+        }
+
+        fn tag(&self, _root: &Path, _name: &str, _digest: [u8; 32]) -> Result<(), StoreError> {
+            panic!("prune tests do not tag bundles");
+        }
+
+        fn list_tags(&self, _root: &Path) -> Result<Vec<TagRecord>, StoreError> {
+            self.snapshots.borrow_mut().pop_front().expect("snapshot")
+        }
+
+        fn remove_tag(&self, _root: &Path, _name: &str) -> Result<(), StoreError> {
+            panic!("prune tests do not remove tags");
+        }
+
+        fn orphans(&self, _root: &Path) -> Result<Vec<[u8; 32]>, StoreError> {
+            Ok(self.orphans.clone())
+        }
+
+        fn remove_blob(&self, _root: &Path, digest: [u8; 32]) -> Result<(), StoreError> {
+            if self.refuse.contains(&digest) {
+                return Err(StoreError::Store(
+                    minicontainer_bundle::StoreError::BlobReferenced,
+                ));
+            }
+            if self.fail.contains(&digest) {
+                return Err(StoreError::Store(minicontainer_bundle::StoreError::Io(
+                    std::io::Error::other("remove boom"),
+                )));
+            }
+            self.removed.borrow_mut().push(digest);
+            Ok(())
+        }
+    }
+
+    // Catches deleting in dry-run mode or listing out of order: the
+    // default run only prints sorted candidates.
+    #[test]
+    fn image_prune_dry_run_lists_orphans_without_deleting() {
+        let root = temp_prune_root("prune-dry-run");
+        let (_kept, orphans) = prune_fixture(&root);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = prune_resolved(
+            &resolved_prune(false, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, digest_lines(&orphans));
+        assert!(stderr.is_empty());
+        assert_eq!(
+            std::fs::read_dir(root.join("images/sha256"))
+                .unwrap()
+                .count(),
+            3
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches deleting a referenced blob: force mode removes only the
+    // orphans and reports each deletion.
+    #[test]
+    fn image_prune_force_deletes_only_orphans() {
+        let root = temp_prune_root("prune-force");
+        let (kept, orphans) = prune_fixture(&root);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = prune_resolved(
+            &resolved_prune(true, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, digest_lines(&orphans));
+        assert!(stderr.is_empty());
+        assert!(Store::new(&root).unwrap().resolve("kept").is_ok());
+        assert_eq!(
+            Store::new(&root).unwrap().orphans().unwrap(),
+            Vec::<[u8; 32]>::new()
+        );
+        let kept_path = root.join(format!(
+            "images/sha256/{}.mcb",
+            minicontainer_bundle::format_digest(kept)
+        ));
+        assert!(kept_path.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches failing an empty prune: nothing to delete exits zero with
+    // empty output.
+    #[test]
+    fn image_prune_force_with_no_orphans_succeeds_quietly() {
+        let root = temp_prune_root("prune-empty");
+        Store::new(&root).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = prune_resolved(
+            &resolved_prune(true, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches deleting without re-checking: a tag created after the
+    // snapshot must skip deletion instead of orphaning the new tag.
+    #[test]
+    fn image_prune_skips_a_blob_referenced_after_the_snapshot() {
+        let digest = [0xab; 32];
+        let store = ScriptedPruneStore::new(vec![digest]);
+        store.snapshots.borrow_mut().push_back(Ok(vec![TagRecord {
+            name: "late".to_owned(),
+            digest,
+        }]));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = prune_resolved(
+            &resolved_prune(true, Path::new("/store")),
+            &store,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("is referenced; skipping"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(store.removed.borrow().is_empty());
+    }
+
+    // Catches ignoring the store-side refusal: a blob the store reports
+    // as referenced maps to a skip, not a failure.
+    #[test]
+    fn image_prune_maps_a_store_refusal_to_a_skip() {
+        let digest = [0xab; 32];
+        let mut store = ScriptedPruneStore::new(vec![digest]);
+        store.snapshots.borrow_mut().push_back(Ok(Vec::new()));
+        store.refuse.push(digest);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = prune_resolved(
+            &resolved_prune(true, Path::new("/store")),
+            &store,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("is referenced; skipping"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(store.removed.borrow().is_empty());
+    }
+
+    // Catches stopping at the first failure or hiding it: every blob is
+    // attempted, each failure is reported, and the exit code reflects it.
+    #[test]
+    fn image_prune_reports_each_partial_failure() {
+        let first = [0x11; 32];
+        let second = [0x22; 32];
+        let third = [0x33; 32];
+        let mut store = ScriptedPruneStore::new(vec![first, second, third]);
+        store.snapshots.borrow_mut().push_back(Ok(Vec::new()));
+        store.snapshots.borrow_mut().push_back(Ok(Vec::new()));
+        store
+            .snapshots
+            .borrow_mut()
+            .push_back(Err(StoreError::Store(
+                minicontainer_bundle::StoreError::Io(std::io::Error::other("tags boom")),
+            )));
+        store.fail.push(second);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = prune_resolved(
+            &resolved_prune(true, Path::new("/store")),
+            &store,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert_eq!(stdout, digest_lines(&[first]));
+        let diagnostic = String::from_utf8_lossy(&stderr);
+        assert!(
+            diagnostic.contains(&format!(
+                "failed to remove sha256:{}",
+                format_digest(second)
+            )),
+            "stderr was {diagnostic:?}"
+        );
+        assert!(
+            diagnostic.contains("failed to re-check references"),
+            "stderr was {diagnostic:?}"
+        );
+        assert_eq!(store.removed.borrow().as_slice(), [first]);
+    }
+
+    // Catches deleting through a symlinked blob name.
+    #[cfg(unix)]
+    #[test]
+    fn image_prune_reports_a_symlinked_blob_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_prune_root("prune-symlink");
+        let outside = temp_prune_root("prune-symlink-outside");
+        let store = Store::new(&root).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        let link = root.join(format!(
+            "images/sha256/{}.mcb",
+            minicontainer_bundle::format_digest(digest)
+        ));
+        std::fs::remove_file(&link).unwrap();
+        let target = outside.join("precious");
+        std::fs::write(&target, b"precious").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = prune_resolved(
+            &resolved_prune(true, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr)
+                .contains("store path is a symlink or leaves the store root"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"precious");
+        assert!(link.is_symlink());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    // Catches reporting success when the blob directory cannot be changed.
+    #[cfg(unix)]
+    #[test]
+    fn image_prune_reports_a_read_only_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_prune_root("prune-readonly");
+        let (_kept, orphans) = prune_fixture(&root);
+        let images = root.join("images/sha256");
+        let mut permissions = std::fs::metadata(&images).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&images, permissions).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = prune_resolved(
+            &resolved_prune(true, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        let mut permissions = std::fs::metadata(&images).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&images, permissions).unwrap();
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("failed to remove"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(Store::new(&root).unwrap().orphans().unwrap(), orphans);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches wiring `image prune` to anything but snapshot, re-check,
+    // and delete through the public CLI.
+    #[test]
+    fn image_prune_runs_dry_run_and_force_through_the_public_cli() {
+        let root = temp_prune_root("prune-cli");
+        let (_kept, orphans) = prune_fixture(&root);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("prune"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, digest_lines(&orphans));
+        assert!(stderr.is_empty());
+        assert_eq!(Store::new(&root).unwrap().orphans().unwrap(), orphans);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("prune"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("--force"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, digest_lines(&orphans));
+        assert!(stderr.is_empty());
+        assert_eq!(
+            Store::new(&root).unwrap().orphans().unwrap(),
+            Vec::<[u8; 32]>::new()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches ignoring a broken stdout pipe or flush and exiting zero.
+    #[test]
+    fn maps_prune_output_failures_to_host_errors() {
+        let root = temp_prune_root("prune-output-fail");
+        prune_fixture(&root);
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            prune_resolved(
+                &resolved_prune(false, &root),
+                &RealStore,
+                &mut FailingWriter {
+                    message: "prune write broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            prune_resolved(
+                &resolved_prune(false, &root),
+                &RealStore,
+                &mut FlushFailingWriter {
+                    buffered: Vec::new(),
+                    message: "prune flush broken",
                 },
                 &mut stderr,
             ),

@@ -42,6 +42,9 @@ tag名はmanifestのname文法に従い、単一path成分でない名前は別�
 `remove_tag`はtag fileだけをunlinkし、blobには触れない。存在しないtagは型付きerrorで報告する。
 削除前にtag名の文法、symlinkと非fileの有無、canonicalize後のstore内到達を確認し、store外のpathへは到達しない。
 tag fileの内容は検証しないため、壊れた内容のtagも削除できる。
+`orphans`はtag参照のないblob digestをbyte順で返し、blob名でない配置物は無視する。
+`remove_blob`は参照の再確認、symlinkと非fileの拒否、store内到達検査を経てからunlinkする。
+存在しないblobの削除は成功とし、参照中blobの削除は型付きerrorで拒否する。
 
 bundle全体の上限8 MiBは`minicontainer_bundle::MAX_BUNDLE_LEN`として公開し、`minictr image build`のELF読み取りと`minictr image import`のfile読み取りも同じ上限を使う。
 配布されたbundle fileは`image import`で取り込む。検証してからstoreへ書き込むため、不正なfileではstoreを変更しない。取り込みでmanifestのnameは書き換えず、store側のtagだけを付ける。
