@@ -16,9 +16,9 @@ use minicontainer_bundle::{
 use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, SystemProcessBackend};
 
 use cli::{
-    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedInspect,
-    ResolvedList, ResolvedRun, VERSION, help, parse_os, resolve, resolve_build, resolve_doctor,
-    resolve_inspect, resolve_list,
+    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedImport,
+    ResolvedInspect, ResolvedList, ResolvedRun, VERSION, help, parse_os, resolve, resolve_build,
+    resolve_doctor, resolve_import, resolve_inspect, resolve_list,
 };
 
 /// usage errorのprocess終了code。
@@ -95,6 +95,17 @@ pub fn real_main(
                     }
                 };
                 build_resolved(&resolved, &RealStore, stdout, stderr)
+            }
+            ImageCommand::Import(args) => {
+                let resolved = match resolve_import(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                import_resolved(&resolved, &RealStore, stdout, stderr)
             }
             ImageCommand::List(args) => {
                 let resolved = match resolve_list(&args, env) {
@@ -212,6 +223,46 @@ impl From<StoreError> for BuildError {
     }
 }
 
+/// image import失敗の公開分類。
+#[derive(Debug)]
+pub enum ImportError {
+    /// bundle fileの読み取りが失敗した。
+    BundleIo(std::io::Error),
+    /// bundle fileが8 MiB上限を超えた。
+    BundleTooLarge,
+    /// MiniBundleの検証が失敗した。
+    Bundle(minicontainer_bundle::BundleError),
+    /// store操作が失敗した。
+    Store(minicontainer_bundle::StoreError),
+}
+
+impl std::fmt::Display for ImportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BundleIo(error) => write!(formatter, "failed to read bundle input: {error}"),
+            Self::BundleTooLarge => {
+                formatter.write_str("bundle input exceeds the 8 MiB bundle limit")
+            }
+            Self::Bundle(error) => write!(formatter, "invalid MiniBundle: {error}"),
+            Self::Store(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl From<minicontainer_bundle::BundleError> for ImportError {
+    fn from(error: minicontainer_bundle::BundleError) -> Self {
+        Self::Bundle(error)
+    }
+}
+
+impl From<StoreError> for ImportError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Store(error) => Self::Store(error),
+        }
+    }
+}
+
 /// guest実行の境界。testではQEMUなしの偽装で差し替える。
 pub trait Runner {
     /// bundleをQEMU上で実行してguest outcomeを返す。
@@ -288,6 +339,38 @@ pub fn build_resolved(
     stderr: &mut dyn Write,
 ) -> i32 {
     let digest = match build_and_store(resolved, store) {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    if let Err(error) = writeln!(
+        stdout,
+        "{image} sha256:{digest}",
+        image = resolved.image,
+        digest = format_digest(digest)
+    ) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    // `main` ends with `process::exit`, which skips destructors, so a piped
+    // success line must be flushed explicitly before reporting success.
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// 解決済み`image import`を実行し、process終了codeを返す。
+pub fn import_resolved(
+    resolved: &ResolvedImport,
+    store: &dyn ImageStore,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let digest = match import_and_store(resolved, store) {
         Ok(digest) => digest,
         Err(error) => {
             let _ = writeln!(stderr, "minictr: {error}");
@@ -654,21 +737,76 @@ fn read_elf_with(
     path: &Path,
     open: &dyn Fn(&Path) -> std::io::Result<File>,
 ) -> Result<Vec<u8>, BuildError> {
-    if std::fs::metadata(path).map_err(BuildError::ElfIo)?.len() > MAX_BUNDLE_LEN {
-        return Err(BuildError::ElfTooLarge);
+    read_bounded_with(path, open).map_err(|error| match error {
+        BoundedReadError::Io(error) => BuildError::ElfIo(error),
+        BoundedReadError::TooLarge => BuildError::ElfTooLarge,
+    })
+}
+
+/// bundle file入力をmetadata確認つきの上限付きで読む。本体を読む前に
+/// 8 MiBを超える入力を拒否し、metadata確認後に伸びた入力もsentinelで拒否する。
+fn read_bundle(path: &Path) -> Result<Vec<u8>, ImportError> {
+    read_bundle_with(path, &|path| File::open(path))
+}
+
+/// `read_bundle`の本体。open境界だけを注入可能にし、metadata確認を先に
+/// 行う順序は変えない。
+fn read_bundle_with(
+    path: &Path,
+    open: &dyn Fn(&Path) -> std::io::Result<File>,
+) -> Result<Vec<u8>, ImportError> {
+    read_bounded_with(path, open).map_err(|error| match error {
+        BoundedReadError::Io(error) => ImportError::BundleIo(error),
+        BoundedReadError::TooLarge => ImportError::BundleTooLarge,
+    })
+}
+
+/// 上限付き入力読みの失敗。呼び出し側が用途別のerrorへ写像する。
+#[derive(Debug)]
+enum BoundedReadError {
+    /// 入力の読み取りが失敗した。
+    Io(std::io::Error),
+    /// 入力が8 MiB上限を超えた。
+    TooLarge,
+}
+
+/// metadata確認つき上限付きreadの共有本体。open境界だけを注入可能にし、
+/// 種類別のerrorへの写像は呼び出し側が行う。
+fn read_bounded_with(
+    path: &Path,
+    open: &dyn Fn(&Path) -> std::io::Result<File>,
+) -> Result<Vec<u8>, BoundedReadError> {
+    if std::fs::metadata(path).map_err(BoundedReadError::Io)?.len() > MAX_BUNDLE_LEN {
+        return Err(BoundedReadError::TooLarge);
     }
-    let file = open(path).map_err(BuildError::ElfIo)?;
-    if file.metadata().map_err(BuildError::ElfIo)?.len() > MAX_BUNDLE_LEN {
-        return Err(BuildError::ElfTooLarge);
+    let file = open(path).map_err(BoundedReadError::Io)?;
+    if file.metadata().map_err(BoundedReadError::Io)?.len() > MAX_BUNDLE_LEN {
+        return Err(BoundedReadError::TooLarge);
     }
     let mut bounded = file.take(MAX_BUNDLE_LEN + 1);
     let mut bytes = Vec::new();
-    bounded.read_to_end(&mut bytes).map_err(BuildError::ElfIo)?;
-    let len = u64::try_from(bytes.len()).map_err(|_| BuildError::ElfTooLarge)?;
+    bounded
+        .read_to_end(&mut bytes)
+        .map_err(BoundedReadError::Io)?;
+    let len = u64::try_from(bytes.len()).map_err(|_| BoundedReadError::TooLarge)?;
     if len > MAX_BUNDLE_LEN {
-        return Err(BuildError::ElfTooLarge);
+        return Err(BoundedReadError::TooLarge);
     }
     Ok(bytes)
+}
+
+/// bundle fileの上限付きread、検証、import、tagを順に行う。検証より
+/// 先にstoreへ触れないため、不正bundleではstoreを変更しない。manifest
+/// 内のnameは書き換えず、CLIのtagだけを付ける。
+fn import_and_store(
+    resolved: &ResolvedImport,
+    store: &dyn ImageStore,
+) -> Result<[u8; 32], ImportError> {
+    let bytes = read_bundle(&resolved.file)?;
+    parse(&bytes)?;
+    let digest = store.import(&resolved.store, &bytes)?;
+    store.tag(&resolved.store, &resolved.image, digest)?;
+    Ok(digest)
 }
 
 /// 取得済みbundleを実行し、guest入出力をhostへ接続する。
@@ -2201,5 +2339,416 @@ mod tests {
         let diagnostic = String::from_utf8_lossy(&stderr);
         assert!(diagnostic.contains("without HOME"));
         assert!(diagnostic.contains("usage: minictr doctor"));
+    }
+
+    fn resolved_import(file: &Path, store: &Path) -> ResolvedImport {
+        ResolvedImport {
+            image: "hello".to_owned(),
+            file: file.to_path_buf(),
+            store: store.to_path_buf(),
+        }
+    }
+
+    fn write_temp_bundle(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "minictr-test-bundle-{}-{id}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn temp_store_root(prefix: &str) -> std::path::PathBuf {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("minictr-test-{prefix}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn fixture_bundle(name: &str, elf: &[u8]) -> Vec<u8> {
+        build(ImageSpec {
+            name,
+            args: &[],
+            elf,
+        })
+        .unwrap()
+    }
+
+    // Catches wiring `image import` to anything but parse, store resolution,
+    // bounded file read, validation, import, and tag.
+    #[test]
+    fn image_import_registers_a_tag_through_the_public_cli() {
+        let root = temp_store_root("import-store");
+        let bytes = fixture_bundle("origin", b"ELF");
+        let file_path = root.join("hello.mcb");
+        std::fs::write(&file_path, &bytes).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("import"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("hello"),
+                file_path.into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        let stored = Store::new(&root).unwrap().resolve("hello").unwrap();
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(stored, bytes);
+        let digest = minicontainer_bundle::parse(&stored).unwrap().header.digest;
+        assert_eq!(
+            stdout,
+            format!(
+                "hello sha256:{}\n",
+                minicontainer_bundle::format_digest(digest)
+            )
+            .into_bytes()
+        );
+        assert_eq!(
+            minicontainer_bundle::parse(&stored)
+                .unwrap()
+                .manifest
+                .name(),
+            "origin"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches changing the store for an invalid bundle: validation runs
+    // before any store call, so even layout directories stay untouched.
+    #[test]
+    fn image_import_rejects_an_invalid_bundle_without_touching_the_store() {
+        let parent = temp_store_root("import-invalid");
+        let file_path = parent.join("broken.mcb");
+        std::fs::write(&file_path, b"not a bundle").unwrap();
+        let store_path = parent.join("store");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("image"),
+                OsString::from("import"),
+                OsString::from("--store"),
+                store_path.clone().into_os_string(),
+                OsString::from("hello"),
+                file_path.into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("invalid MiniBundle"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            !store_path.exists(),
+            "an invalid bundle must not create the store"
+        );
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    // Catches duplicating blob storage: re-importing identical bytes
+    // reports the same digest and keeps a single content-addressed file.
+    #[test]
+    fn image_import_reuses_an_identical_blob() {
+        let root = temp_store_root("import-duplicate");
+        let file_path = write_temp_bundle("duplicate.mcb", &fixture_bundle("a", b"ELF"));
+        let first = import_resolved(
+            &resolved_import(&file_path, &root),
+            &RealStore,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let second = import_resolved(
+            &resolved_import(&file_path, &root),
+            &RealStore,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 0);
+        assert!(stderr.is_empty());
+        let digest =
+            minicontainer_bundle::parse(&Store::new(&root).unwrap().resolve("hello").unwrap())
+                .unwrap()
+                .header
+                .digest;
+        assert_eq!(
+            stdout,
+            format!(
+                "hello sha256:{}\n",
+                minicontainer_bundle::format_digest(digest)
+            )
+            .into_bytes()
+        );
+        let blobs = std::fs::read_dir(root.join("images/sha256"))
+            .unwrap()
+            .count();
+        assert_eq!(blobs, 1);
+        std::fs::remove_file(&file_path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches losing the previous tag content or the replaced blob:
+    // retagging resolves to the new bytes while both blobs stay stored.
+    #[test]
+    fn image_import_atomically_replaces_a_tag() {
+        let root = temp_store_root("import-replace");
+        let first_path = write_temp_bundle("first.mcb", &fixture_bundle("a", b"first"));
+        let second_path = write_temp_bundle("second.mcb", &fixture_bundle("a", b"second"));
+
+        let first = import_resolved(
+            &resolved_import(&first_path, &root),
+            &RealStore,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let second = import_resolved(
+            &resolved_import(&second_path, &root),
+            &RealStore,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 0);
+        let stored = Store::new(&root).unwrap().resolve("hello").unwrap();
+        assert_eq!(stored, fixture_bundle("a", b"second"));
+        let blobs = std::fs::read_dir(root.join("images/sha256"))
+            .unwrap()
+            .count();
+        assert_eq!(blobs, 2);
+        std::fs::remove_file(&first_path).unwrap();
+        std::fs::remove_file(&second_path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches reading a bundle file larger than the 8 MiB limit into
+    // memory: the metadata length rejects it before import runs.
+    #[test]
+    fn rejects_a_bundle_larger_than_the_limit_before_importing() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let file_path = std::env::temp_dir().join(format!(
+            "minictr-test-oversized-bundle-{}-{id}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .unwrap();
+        file.set_len(minicontainer_bundle::MAX_BUNDLE_LEN + 1)
+            .unwrap();
+        drop(file);
+        let store = RecordingStore::ok([0; 32]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = import_resolved(
+            &resolved_import(&file_path, Path::new("/store")),
+            &store,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("exceeds the 8 MiB"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(store.calls.borrow().is_empty());
+        std::fs::remove_file(&file_path).unwrap();
+    }
+
+    // Catches removing the metadata pre-check: a bundle file whose
+    // metadata length already exceeds the 8 MiB limit must be rejected
+    // before the open boundary runs.
+    #[test]
+    fn rejects_an_oversized_bundle_before_opening_it() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let file_path = std::env::temp_dir().join(format!(
+            "minictr-test-unopened-oversized-bundle-{}-{id}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .unwrap();
+        file.set_len(minicontainer_bundle::MAX_BUNDLE_LEN + 1)
+            .unwrap();
+        drop(file);
+        let opened = Cell::new(false);
+
+        let result = read_bundle_with(&file_path, &|_| {
+            opened.set(true);
+            Err(std::io::Error::other("open must not run"))
+        });
+
+        assert!(matches!(result, Err(ImportError::BundleTooLarge)));
+        assert!(!opened.get(), "oversized bundle must not reach open");
+        std::fs::remove_file(&file_path).unwrap();
+    }
+
+    // Catches reporting success when the bundle file cannot be read.
+    #[test]
+    fn maps_a_missing_bundle_file_to_a_host_error() {
+        let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+        let file_path = std::env::temp_dir().join(format!(
+            "minictr-test-missing-bundle-{}-{id}.mcb",
+            std::process::id()
+        ));
+        let store = RecordingStore::ok([0; 32]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = import_resolved(
+            &resolved_import(&file_path, Path::new("/store")),
+            &store,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+        assert!(store.calls.borrow().is_empty());
+    }
+
+    // Catches importing without validating: an invalid bundle must fail
+    // before the first store call.
+    #[test]
+    fn maps_an_invalid_bundle_to_a_host_error_without_store_calls() {
+        let file_path = write_temp_bundle("invalid.mcb", b"not a bundle");
+        let store = RecordingStore::ok([0; 32]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = import_resolved(
+            &resolved_import(&file_path, Path::new("/store")),
+            &store,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("invalid MiniBundle"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(store.calls.borrow().is_empty());
+        std::fs::remove_file(&file_path).unwrap();
+    }
+
+    // Catches reporting success or exiting zero when tagging the
+    // imported bundle fails.
+    #[test]
+    fn maps_an_import_tag_failure_to_a_host_error_without_a_success_line() {
+        let file_path = write_temp_bundle("tag-fail.mcb", &fixture_bundle("a", b"ELF"));
+        let store = RecordingStore::tag_fails([0xab; 32]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = import_resolved(
+            &resolved_import(&file_path, Path::new("/store")),
+            &store,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+        assert_eq!(store.calls.borrow().as_slice(), ["import", "tag hello"]);
+        std::fs::remove_file(&file_path).unwrap();
+    }
+
+    // Catches ignoring a broken stdout pipe or flush and exiting zero.
+    #[test]
+    fn maps_import_output_failures_to_host_errors() {
+        let file_path = write_temp_bundle("output-fail.mcb", &fixture_bundle("a", b"ELF"));
+        let resolved = resolved_import(&file_path, Path::new("/store"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            import_resolved(
+                &resolved,
+                &RecordingStore::ok([0xab; 32]),
+                &mut FailingWriter {
+                    message: "import write broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            import_resolved(
+                &resolved,
+                &RecordingStore::ok([0xab; 32]),
+                &mut FlushFailingWriter {
+                    buffered: Vec::new(),
+                    message: "import flush broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to flush stdout"));
+        std::fs::remove_file(&file_path).unwrap();
+    }
+
+    // Catches panicking on an undecodable bundle file path.
+    #[test]
+    fn maps_a_non_utf8_bundle_path_to_a_host_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0xff]);
+        let file_path = Path::new(&raw).to_path_buf();
+        let store = RecordingStore::ok([0; 32]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = import_resolved(
+            &resolved_import(&file_path, Path::new("/store")),
+            &store,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("failed to read bundle input"),
+            "stderr was {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(store.calls.borrow().is_empty());
     }
 }

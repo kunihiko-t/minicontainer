@@ -129,13 +129,14 @@ exit=42
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`doctor`、`image build`、`image import`、`image list`、`image inspect`、`help`、`--version`である。
 構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
+usage: minictr image import [--store PATH] IMAGE FILE
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
 ```
@@ -145,6 +146,7 @@ usage: minictr image inspect [--store PATH] IMAGE
 
 `image build`は静的RISC-V 64 ELFからMiniBundleを構築し、指定したタグでローカルストアへ登録する。
 成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
+`image import`は配布されたMiniBundleファイルを検証してから同じ形で登録し、manifestの名前は書き換えない。
 `image list`はタグの一覧、`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
 `doctor`はQEMUのversion、kernel file、store rootを診断し、各検査の`ok`または`fail`と`summary`の4行を標準出力へ出す。全検査の成功で終了コード0、一つでも失敗したら終了コード1になり、診断自体は環境を変更しない。
 
