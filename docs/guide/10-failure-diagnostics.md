@@ -24,6 +24,7 @@ QEMU起動後の失敗では、必ず子processの回収とpayload削除を試�
 範囲外の終了codeはhost失敗として扱う。
 使い方の誤りは終了code 2、store解決失敗とruntime失敗は終了code 125である。
 timeout、QEMU失敗、guest failure、protocol破損はすべて125に写る。
+`doctor`の診断失敗は終了code 1であり、失敗項目は標準出力の`fail`行にすべて出る。
 
 失敗の診断は`minictr:`で始まる行に出る。
 まず標準エラー出力の先頭行を見る。
@@ -38,6 +39,21 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写る。
 guest stderrのbytes自体にも`minictr:`は付かない。
 ただしゲストも同じ接頭辞や終了コードを出力できるため、接頭辞だけで出所を確定できない。
 型による区別が必要な呼び出し側は、CLIの文字列解析ではなくRust APIを使う。
+
+## doctorの失敗と対処
+
+実行前に`doctor`で環境を確認し、`fail`行の`fix:`に従う。
+診断は環境を変更しないため、対処の前後で何度でも実行できる。
+`fail`行は標準出力に出るため、標準エラー出力ではなく標準出力を見る。
+
+- `qemu: fail ... is not installed`はQEMUの未導入である。macOSでは`brew install qemu`、Ubuntuでは`sudo apt-get install qemu-system-misc`で導入する。
+- `qemu: fail ... is too old`はQEMUが8.2.0未満である。行の更新手順で上げる。
+- `qemu: fail ... failed with status`と`could not parse`はQEMUの導入破損である。QEMUを再導入する。
+- `kernel: fail ... is missing`はkernel fileの不在である。固定revisionのminiOSをbuildして`--kernel`で渡す。
+- `kernel: fail ... is not a file`と`is empty`はkernel pathの指定誤りである。正しいkernel fileを`--kernel`で渡す。
+- `store: fail ... is missing`はstoreの未作成である。`image build`が作成するため、登録後に`doctor`を再実行する。
+- `store: fail ... is not a directory`はstore pathの指定誤りである。directoryを`--store`で渡す。
+- `cannot stat`はpath自体を読めない。権限とpathの綴りを確認する。
 
 ## timeoutの二層強制
 

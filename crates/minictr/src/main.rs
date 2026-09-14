@@ -16,14 +16,17 @@ use minicontainer_bundle::{
 use minicontainer_runtime::{RunOutcome, RunRequest, Runtime, RuntimeError, SystemProcessBackend};
 
 use cli::{
-    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedInspect, ResolvedList,
-    ResolvedRun, VERSION, help, parse_os, resolve, resolve_build, resolve_inspect, resolve_list,
+    Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedInspect,
+    ResolvedList, ResolvedRun, VERSION, help, parse_os, resolve, resolve_build, resolve_doctor,
+    resolve_inspect, resolve_list,
 };
 
 /// usage errorのprocess終了code。
 pub const USAGE_EXIT: i32 = 2;
 /// host側失敗のprocess終了code。
 pub const RUNTIME_EXIT: i32 = 125;
+/// 一つ以上のdoctor診断項目が失敗したときのprocess終了code。
+pub const DOCTOR_EXIT: i32 = 1;
 
 fn main() {
     let code = real_main(
@@ -69,6 +72,17 @@ pub fn real_main(
                 }
             };
             run_resolved(&resolved, &RealRunner, &RealStore, stdout, stderr)
+        }
+        Command::Doctor(args) => {
+            let resolved = match resolve_doctor(&args, env) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = writeln!(stderr, "minictr: {error}");
+                    let _ = writeln!(stderr, "{help}", help = help());
+                    return USAGE_EXIT;
+                }
+            };
+            doctor_resolved(&resolved, &RealQemuProbe, stdout, stderr)
         }
         Command::Image(command) => match command {
             ImageCommand::Build(args) => {
@@ -372,6 +386,240 @@ pub fn inspect_resolved(
         return RUNTIME_EXIT;
     }
     0
+}
+
+/// `run`と同じQEMU program。runtimeの起動commandと対にする。
+const QEMU_PROGRAM: &str = "qemu-system-riscv64";
+
+/// QEMU version確認の境界。testでは偽装で差し替える。
+pub trait QemuProbe {
+    /// `qemu-system-riscv64 --version`の標準出力を返す。
+    fn version_output(&self) -> Result<String, QemuError>;
+}
+
+/// QEMU検査が失敗した理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QemuError {
+    /// programが見つからない。
+    Missing,
+    /// version確認が非0終了した。
+    Failed { status: Option<i32> },
+    /// version行を読めない。
+    Malformed,
+    /// versionが互換性下限未満である。
+    TooOld(Version),
+}
+
+/// 実際のQEMU version確認。
+pub struct RealQemuProbe;
+
+impl QemuProbe for RealQemuProbe {
+    fn version_output(&self) -> Result<String, QemuError> {
+        let output = std::process::Command::new(QEMU_PROGRAM)
+            .arg("--version")
+            .output()
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => QemuError::Missing,
+                _ => QemuError::Failed { status: None },
+            })?;
+        if !output.status.success() {
+            return Err(QemuError::Failed {
+                status: output.status.code(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+/// 三要素のtool version。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+impl Version {
+    const fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// QEMUの互換性下限。`cargo xtask setup`の検査と対にする。
+const QEMU_FLOOR: Version = Version::new(8, 2, 0);
+
+/// QEMU version行をparseし、互換性下限を検査する。
+fn parse_qemu_version(output: &str) -> Result<Version, QemuError> {
+    let token = output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("QEMU emulator version "))
+        .and_then(|version| version.split_whitespace().next())
+        .ok_or(QemuError::Malformed)?;
+    let version = parse_numeric_version(token).ok_or(QemuError::Malformed)?;
+    if version < QEMU_FLOOR {
+        return Err(QemuError::TooOld(version));
+    }
+    Ok(version)
+}
+
+fn parse_numeric_version(token: &str) -> Option<Version> {
+    let mut components = token.split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch = components.next()?.parse().ok()?;
+    if components.next().is_some() {
+        return None;
+    }
+    Some(Version::new(major, minor, patch))
+}
+
+/// host別のQEMU導入手順。`cargo xtask setup`の案内と対にする。
+fn qemu_install_hint() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "brew install qemu";
+    #[cfg(target_os = "linux")]
+    return "sudo apt-get install qemu-system-misc";
+    #[allow(unreachable_code)]
+    "install a QEMU package that provides qemu-system-riscv64"
+}
+
+/// host別のQEMU更新手順。`cargo xtask setup`の案内と対にする。
+fn qemu_upgrade_hint() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "brew upgrade qemu";
+    #[cfg(target_os = "linux")]
+    return "sudo apt-get update && sudo apt-get install qemu-system-misc";
+    #[allow(unreachable_code)]
+    "upgrade the installed QEMU package"
+}
+
+fn qemu_failure(error: QemuError) -> String {
+    match error {
+        QemuError::Missing => format!(
+            "{QEMU_PROGRAM} is not installed; fix: {}",
+            qemu_install_hint()
+        ),
+        QemuError::Failed { status } => format!(
+            "{QEMU_PROGRAM} --version failed with status {}; fix: reinstall QEMU",
+            status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        ),
+        QemuError::Malformed => {
+            format!("could not parse {QEMU_PROGRAM} --version output; fix: reinstall QEMU")
+        }
+        QemuError::TooOld(version) => format!(
+            "QEMU {version} is too old ({QEMU_FLOOR} or newer is required); fix: {}",
+            qemu_upgrade_hint()
+        ),
+    }
+}
+
+/// QEMUの存在とversion下限を検査する。成功時は表示用のprogramとversionを返す。
+fn check_qemu(probe: &dyn QemuProbe) -> Result<String, String> {
+    let version = probe
+        .version_output()
+        .and_then(|output| parse_qemu_version(&output))
+        .map_err(qemu_failure)?;
+    Ok(format!("{QEMU_PROGRAM} {version}"))
+}
+
+/// kernel fileの存在と種別をmetadataだけで検査する。成功時は表示用の
+/// pathとbyte数を返す。環境は変更しない。
+fn check_kernel(kernel: &Path) -> Result<String, String> {
+    let path = display_path(kernel);
+    let metadata = std::fs::metadata(kernel).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "kernel file is missing at {path}; fix: build the miniOS kernel and pass --kernel PATH"
+        ),
+        _ => format!("cannot stat kernel file at {path}; fix: check the path"),
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "kernel path is not a file at {path}; fix: build the miniOS kernel and pass --kernel PATH"
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(format!(
+            "kernel file is empty at {path}; fix: rebuild the miniOS kernel and pass --kernel PATH"
+        ));
+    }
+    Ok(format!("{path} ({} bytes)", metadata.len()))
+}
+
+/// store rootの存在と種別をmetadataだけで検査する。成功時は表示用の
+/// pathを返す。`Store::new`と違い、存在しないstoreを作らない。
+fn check_store(store: &Path) -> Result<String, String> {
+    let path = display_path(store);
+    let metadata = std::fs::metadata(store).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "store root is missing at {path}; fix: run minictr image build --store {path} IMAGE ELF"
+        ),
+        _ => format!("cannot stat store root at {path}; fix: check the path"),
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "store root is not a directory at {path}; fix: pass --store PATH or set MINICTR_STORE"
+        ));
+    }
+    Ok(path)
+}
+
+/// 診断行へ載せるpath表示。非UTF-8は置換し、改行はescapeして一行を保つ。
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+/// 解決済みdoctorを実行し、process終了codeを返す。QEMU、kernel、store
+/// の検査をすべて列挙し、一つでも失敗したら1で終わる。環境は変更しない。
+pub fn doctor_resolved(
+    resolved: &ResolvedDoctor,
+    probe: &dyn QemuProbe,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let checks = [
+        ("qemu", check_qemu(probe)),
+        ("kernel", check_kernel(&resolved.kernel)),
+        ("store", check_store(&resolved.store)),
+    ];
+    let total = checks.len();
+    let mut passed = 0;
+    let mut report = String::new();
+    for (name, result) in &checks {
+        match result {
+            Ok(detail) => {
+                passed += 1;
+                report.push_str(&format!("{name}: ok {detail}\n"));
+            }
+            Err(reason) => {
+                report.push_str(&format!("{name}: fail {reason}\n"));
+            }
+        }
+    }
+    report.push_str(&format!("summary: passed {passed}/{total} checks\n"));
+    if let Err(error) = stdout.write_all(report.as_bytes()) {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    if passed == total { 0 } else { DOCTOR_EXIT }
 }
 
 /// ELFのmetadata確認、上限付きread、bundle構築、import、tagを順に行う。
@@ -1577,5 +1825,381 @@ mod tests {
         assert!(stdout.is_empty());
         assert!(!stderr.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    struct FakeQemuProbe {
+        output: Result<String, QemuError>,
+    }
+
+    impl FakeQemuProbe {
+        fn ok(output: &str) -> Self {
+            Self {
+                output: Ok(output.to_owned()),
+            }
+        }
+
+        fn err(error: QemuError) -> Self {
+            Self { output: Err(error) }
+        }
+    }
+
+    impl QemuProbe for FakeQemuProbe {
+        fn version_output(&self) -> Result<String, QemuError> {
+            self.output.clone()
+        }
+    }
+
+    /// doctor fixture用の所有つき一時path。drop時にfileもdirectoryも消す。
+    struct DoctorScratch {
+        path: std::path::PathBuf,
+    }
+
+    impl DoctorScratch {
+        fn create(prefix: &str) -> Self {
+            let id = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "minictr-test-doctor-{}-{id}-{prefix}",
+                std::process::id()
+            ));
+            Self { path }
+        }
+
+        fn missing(prefix: &str) -> Self {
+            Self::create(prefix)
+        }
+
+        fn file(prefix: &str, bytes: &[u8]) -> Self {
+            let scratch = Self::create(prefix);
+            std::fs::write(&scratch.path, bytes).unwrap();
+            scratch
+        }
+
+        fn dir(prefix: &str) -> Self {
+            let scratch = Self::create(prefix);
+            std::fs::create_dir_all(&scratch.path).unwrap();
+            scratch
+        }
+    }
+
+    impl Drop for DoctorScratch {
+        fn drop(&mut self) {
+            if std::fs::remove_dir_all(&self.path).is_err() {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    fn resolved_doctor(kernel: &Path, store: &Path) -> ResolvedDoctor {
+        ResolvedDoctor {
+            store: store.to_path_buf(),
+            kernel: kernel.to_path_buf(),
+        }
+    }
+
+    fn directory_snapshot(dir: &Path) -> Vec<OsString> {
+        let mut entries: Vec<OsString> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    // Catches drifting the all-pass doctor report or its exit code.
+    #[test]
+    fn doctor_reports_all_checks_passing_and_exits_0() {
+        let probe = FakeQemuProbe::ok("QEMU emulator version 8.2.2\n");
+        let kernel = DoctorScratch::file("kernel", b"kernel-bytes");
+        let store = DoctorScratch::dir("store");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = doctor_resolved(
+            &resolved_doctor(&kernel.path, &store.path),
+            &probe,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&stdout),
+            format!(
+                "qemu: ok qemu-system-riscv64 8.2.2\nkernel: ok {} (12 bytes)\nstore: ok {}\nsummary: passed 3/3 checks\n",
+                kernel.path.to_string_lossy(),
+                store.path.to_string_lossy(),
+            )
+        );
+        assert!(stderr.is_empty());
+    }
+
+    // Catches hiding a failing check: every failure is listed and the
+    // exit code reports the diagnosis, not success.
+    #[test]
+    fn doctor_lists_every_failure_and_exits_1() {
+        let probe = FakeQemuProbe::err(QemuError::Missing);
+        let kernel = DoctorScratch::missing("kernel");
+        let store = DoctorScratch::missing("store");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = doctor_resolved(
+            &resolved_doctor(&kernel.path, &store.path),
+            &probe,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, DOCTOR_EXIT);
+        let report = String::from_utf8_lossy(&stdout);
+        assert!(
+            report.contains(&format!(
+                "qemu: fail qemu-system-riscv64 is not installed; fix: {}",
+                qemu_install_hint()
+            )),
+            "unexpected report: {report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "kernel: fail kernel file is missing at {}",
+                kernel.path.to_string_lossy()
+            )),
+            "unexpected report: {report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "store: fail store root is missing at {}",
+                store.path.to_string_lossy()
+            )),
+            "unexpected report: {report}"
+        );
+        assert!(report.ends_with("summary: passed 0/3 checks\n"));
+        assert!(stderr.is_empty());
+    }
+
+    // Catches miscounting the summary when only some checks pass.
+    #[test]
+    fn doctor_counts_a_partial_pass() {
+        let probe = FakeQemuProbe::ok("QEMU emulator version 9.0.0\n");
+        let kernel = DoctorScratch::missing("kernel");
+        let store = DoctorScratch::missing("store");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = doctor_resolved(
+            &resolved_doctor(&kernel.path, &store.path),
+            &probe,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, DOCTOR_EXIT);
+        let report = String::from_utf8_lossy(&stdout);
+        assert!(report.contains("qemu: ok qemu-system-riscv64 9.0.0\n"));
+        assert!(report.contains("kernel: fail "));
+        assert!(report.contains("store: fail "));
+        assert!(report.ends_with("summary: passed 1/3 checks\n"));
+        assert!(stderr.is_empty());
+    }
+
+    // Catches accepting a QEMU below the 8.2.0 floor, an unreadable
+    // version line, or a probe failure without its status.
+    #[test]
+    fn qemu_check_rejects_old_malformed_and_failed_versions() {
+        assert_eq!(
+            parse_qemu_version("QEMU emulator version 8.2.0\n"),
+            Ok(Version::new(8, 2, 0))
+        );
+        assert_eq!(
+            parse_qemu_version("QEMU emulator version 11.1.0 (custom)\nCopyright"),
+            Ok(Version::new(11, 1, 0))
+        );
+        assert_eq!(
+            parse_qemu_version("QEMU emulator version 7.2.9\n"),
+            Err(QemuError::TooOld(Version::new(7, 2, 9)))
+        );
+        for output in [
+            "",
+            "qemu 8.2.0\n",
+            "QEMU emulator version 8.2\n",
+            "QEMU emulator version 8.2.0.1\n",
+            "QEMU emulator version x.y.z\n",
+        ] {
+            assert_eq!(
+                parse_qemu_version(output),
+                Err(QemuError::Malformed),
+                "output must not parse: {output:?}"
+            );
+        }
+
+        let probe = FakeQemuProbe::err(QemuError::Failed { status: Some(3) });
+        assert_eq!(
+            check_qemu(&probe),
+            Err(
+                "qemu-system-riscv64 --version failed with status 3; fix: reinstall QEMU"
+                    .to_owned()
+            )
+        );
+        let probe = FakeQemuProbe::err(QemuError::Failed { status: None });
+        assert!(
+            check_qemu(&probe)
+                .unwrap_err()
+                .contains("failed with status unknown")
+        );
+        let probe = FakeQemuProbe::ok("QEMU emulator version 7.2.0\n");
+        assert!(
+            check_qemu(&probe)
+                .unwrap_err()
+                .contains("8.2.0 or newer is required")
+        );
+    }
+
+    // Catches accepting a kernel path that run cannot use: a directory,
+    // an empty file, or an unstattable path.
+    #[test]
+    fn kernel_check_rejects_unusable_paths() {
+        let dir = DoctorScratch::dir("kernel-dir");
+        assert!(
+            check_kernel(&dir.path)
+                .unwrap_err()
+                .contains("is not a file")
+        );
+
+        let empty = DoctorScratch::file("kernel-empty", b"");
+        assert!(check_kernel(&empty.path).unwrap_err().contains("is empty"));
+
+        let reason = check_kernel(Path::new("kernel\0name")).unwrap_err();
+        assert!(reason.starts_with("cannot stat kernel file"));
+
+        let good = DoctorScratch::file("kernel-ok", b"12345");
+        assert_eq!(
+            check_kernel(&good.path),
+            Ok(format!("{} (5 bytes)", good.path.to_string_lossy()))
+        );
+    }
+
+    // Catches accepting a store root that cannot hold images, and
+    // creating a missing store as a side effect.
+    #[test]
+    fn store_check_rejects_unusable_roots_without_creating_them() {
+        let file = DoctorScratch::file("store-file", b"x");
+        assert!(
+            check_store(&file.path)
+                .unwrap_err()
+                .contains("is not a directory")
+        );
+
+        let reason = check_store(Path::new("store\0name")).unwrap_err();
+        assert!(reason.starts_with("cannot stat store root"));
+
+        let missing = DoctorScratch::missing("store-never-created");
+        assert!(
+            check_store(&missing.path)
+                .unwrap_err()
+                .contains("is missing")
+        );
+        assert!(!missing.path.exists(), "doctor must not create the store");
+    }
+
+    // Catches breaking the one-line report with undecodable or multiline paths.
+    #[test]
+    fn display_path_sanitizes_lossy_and_multiline_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0xff, 0x0a, 0x70]);
+        assert_eq!(display_path(Path::new(&raw)), "/t\u{fffd}\\np");
+        assert_eq!(display_path(Path::new("a\rb")), "a\\rb");
+    }
+
+    // Catches doctor changing the environment: a failing diagnosis must
+    // leave the filesystem exactly as it found it.
+    #[test]
+    fn doctor_changes_nothing_on_failure() {
+        let parent = DoctorScratch::dir("parent");
+        let before = directory_snapshot(&parent.path);
+        let probe = FakeQemuProbe::err(QemuError::Missing);
+        let kernel = parent.path.join("kernel");
+        let store = parent.path.join("store");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = doctor_resolved(
+            &resolved_doctor(&kernel, &store),
+            &probe,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, DOCTOR_EXIT);
+        assert_eq!(directory_snapshot(&parent.path), before);
+    }
+
+    // Catches panicking on undecodable store or kernel paths.
+    #[test]
+    fn doctor_renders_non_utf8_paths_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let probe = FakeQemuProbe::ok("QEMU emulator version 8.2.0\n");
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0xff]);
+        let kernel = Path::new(&raw).to_path_buf();
+        let store = Path::new(&raw).to_path_buf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = doctor_resolved(
+            &resolved_doctor(&kernel, &store),
+            &probe,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, DOCTOR_EXIT);
+        let report = String::from_utf8(stdout).expect("the report is UTF-8");
+        assert!(report.contains("kernel: fail kernel file is missing at /tmp\u{fffd}"));
+        assert!(report.contains("store: fail store root is missing at /tmp\u{fffd}"));
+        assert!(stderr.is_empty());
+    }
+
+    // Catches ignoring a broken stdout pipe and exiting as diagnosed.
+    #[test]
+    fn doctor_stdout_write_failure_is_a_host_error() {
+        let probe = FakeQemuProbe::ok("QEMU emulator version 8.2.0\n");
+        let kernel = DoctorScratch::file("kernel", b"bytes");
+        let store = DoctorScratch::dir("store");
+        let mut stdout = FailingWriter {
+            message: "doctor pipe",
+        };
+        let mut stderr = Vec::new();
+
+        let code = doctor_resolved(
+            &resolved_doctor(&kernel.path, &store.path),
+            &probe,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+    }
+
+    // Catches running diagnostics without resolvable paths: a missing
+    // HOME is a usage error, not a diagnosis.
+    #[test]
+    fn doctor_without_home_is_a_usage_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [OsString::from("doctor")],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, USAGE_EXIT);
+        assert!(stdout.is_empty());
+        let diagnostic = String::from_utf8_lossy(&stderr);
+        assert!(diagnostic.contains("without HOME"));
+        assert!(diagnostic.contains("usage: minictr doctor"));
     }
 }

@@ -5,10 +5,11 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image list`、`image inspect`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
+usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
@@ -32,11 +33,13 @@ optionはIMAGEとELFの前後どこに置いてもよい。
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
+`doctor`はpositionalを取らず、`--store`と`--kernel`だけを一度ずつ指定できる。
 
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
 `image build`、`image list`、`image inspect`のstore解決も同じ順序を使う。
+`doctor`も`run`と同じ順序でstoreとkernelを解決する。
 
 ## imageの登録
 
@@ -78,6 +81,26 @@ elf-bytes: 4096
 manifest引数の内容は表示せず、件数だけを表示する。
 未参照のtagは一覧に出るが、同じtagのinspectは`resolve`経由で失敗する。
 
+## 実行前の診断
+
+`doctor`は、QEMU、kernel file、store rootの三つの検査を順に行う。
+QEMUは`qemu-system-riscv64 --version`の先頭行からversionを読んで8.2.0以上を要求する。
+kernelは解決したpathが空でない通常fileであることを、storeは存在するdirectoryであることをmetadataだけで確認する。
+存在しないstoreは作らず、診断は環境を変更しない。
+
+検査結果は次の安定した4行を標準出力へ出す。
+`fail`行は原因と`fix:`の対処を同じ行に載せる。
+
+```text
+qemu: ok qemu-system-riscv64 8.2.2
+kernel: ok /store/minios-kernel (12345 bytes)
+store: ok /store
+summary: passed 3/3 checks
+```
+
+非UTF-8のpathは置換文字で表示し、改行を含むpathはescapeして一行を保つ。
+失敗行の読み方は第10章を参照する。
+
 ## 実行と入出力
 
 解決したimage tagはcontent-addressed storeから検証済みbundle bytesとして取り出す。
@@ -97,9 +120,12 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、
 `image build`では、ELFの読み取り失敗、上限超過、bundle構築失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
 `image build`のparse失敗とstore pathの既定値解決失敗は使い方の誤りとして終了code 2になる。
 `image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
+`doctor`は全検査の成功で終了code 0、一つでも失敗したら終了code 1になる。
+`doctor`のparse失敗と既定値解決失敗は終了code 2、出力失敗は終了code 125になる。
 
 ## 失敗の調べ方
 
+実行前に`doctor`で環境を確認し、`fail`行の`fix:`に従う。
 まず標準エラー出力の先頭行を見る。
 `minictr:`で始まる行がhost側の分類 (store、process、session、cleanup) を示す。
 `invalid UART control frame`を含む行はcontrol protocolの破損である。
