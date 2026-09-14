@@ -124,6 +124,56 @@ impl Store {
         Ok(bytes)
     }
 
+    /// Lists blob digests that no tag references, in byte order. Entries
+    /// that are not digest-named blobs stay untracked and untouched.
+    pub fn orphans(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        self.ensure_layout()?;
+        let mut referenced = std::collections::BTreeSet::new();
+        for record in self.list_tags()? {
+            referenced.insert(record.digest);
+        }
+        let mut entries: Vec<_> =
+            fs::read_dir(self.root.join("images/sha256"))?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut orphans = Vec::new();
+        for entry in entries {
+            let Some(digest) = blob_digest_from_name(&entry.file_name()) else {
+                continue;
+            };
+            if !referenced.contains(&digest) {
+                orphans.push(digest);
+            }
+        }
+        Ok(orphans)
+    }
+
+    /// Removes one blob after re-checking that no tag references it.
+    /// Refuses symlinks and entries that leave the store root; a missing
+    /// blob is already pruned and reports success.
+    pub fn remove_blob(&self, digest: [u8; 32]) -> Result<(), StoreError> {
+        self.ensure_layout()?;
+        for record in self.list_tags()? {
+            if record.digest == digest {
+                return Err(StoreError::BlobReferenced);
+            }
+        }
+        let path = self.image_path(digest);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(StoreError::UnsafeStorePath);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let canonical = fs::canonicalize(&path)?;
+        if !canonical.starts_with(&self.root) {
+            return Err(StoreError::UnsafeStorePath);
+        }
+        fs::remove_file(&canonical)?;
+        Ok(())
+    }
+
     /// Lists every tag by UTF-8 byte order without resolving its image.
     pub fn list_tags(&self) -> Result<Vec<TagRecord>, StoreError> {
         self.ensure_layout()?;
@@ -283,6 +333,15 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         io::ErrorKind::AlreadyExists,
         "could not allocate a unique atomic temporary file",
     ))
+}
+
+/// Reads a blob digest from a directory entry name. Anything that is
+/// not a lowercase hex digest with a `.mcb` suffix stays untracked,
+/// including undecodable names: lossy replacement never yields hex.
+fn blob_digest_from_name(name: &std::ffi::OsStr) -> Option<[u8; 32]> {
+    let text = name.to_string_lossy();
+    let hex = text.strip_suffix(".mcb")?;
+    decode_digest(hex.as_bytes())
 }
 
 pub(crate) fn decode_digest(encoded: &[u8]) -> Option<[u8; 32]> {
@@ -605,6 +664,158 @@ mod tests {
         }
         assert!(!home.path().join("escape").exists());
         assert!(!home.path().join("tags/nested").exists());
+    }
+
+    // Production break caught: orphan detection misses an unreferenced
+    // blob, reports a referenced one, or stops at stray directory entries.
+    #[test]
+    fn orphans_lists_only_unreferenced_blobs_in_order() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        assert_eq!(store.orphans().unwrap(), Vec::<[u8; 32]>::new());
+
+        let mut digests = Vec::new();
+        for elf in ["first", "second", "third"] {
+            let bytes = build(ImageSpec {
+                name: "a",
+                args: &[],
+                elf: elf.as_bytes(),
+            })
+            .unwrap();
+            digests.push(store.import(&bytes).unwrap());
+        }
+        store.tag("kept", digests[1]).unwrap();
+        let images = home.path().join("images/sha256");
+        fs::write(images.join("notes.txt"), b"stray").unwrap();
+        fs::write(images.join("deadbeef.mcb"), b"short").unwrap();
+        fs::create_dir(images.join("scratch")).unwrap();
+
+        let mut expected = vec![digests[0], digests[2]];
+        expected.sort();
+        assert_eq!(store.orphans().unwrap(), expected);
+    }
+
+    // Production break caught: an undecodable stray entry breaks orphan
+    // detection instead of being skipped. APFS rejects such names, so the
+    // filesystem half runs on Linux only.
+    #[test]
+    fn blob_names_classify_without_touching_the_filesystem() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let hex = "ab".repeat(32);
+        assert_eq!(
+            blob_digest_from_name(std::ffi::OsStr::new(&format!("{hex}.mcb"))),
+            Some([0xab; 32])
+        );
+        for stray in [
+            std::ffi::OsString::from("notes.txt"),
+            std::ffi::OsString::from("deadbeef.mcb"),
+            std::ffi::OsString::from_vec(vec![0xab, 0xff]),
+            std::ffi::OsString::from_vec([b"a".repeat(60), b".mcb".to_vec()].concat()),
+        ] {
+            assert_eq!(
+                blob_digest_from_name(&stray),
+                None,
+                "stray must stay untracked: {stray:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphans_skips_a_non_utf8_stray_on_disk() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        let stray = std::ffi::OsString::from_vec(vec![0xab, 0xff]);
+        fs::write(home.path().join("images/sha256").join(&stray), b"stray").unwrap();
+
+        assert_eq!(store.orphans().unwrap(), vec![digest]);
+    }
+
+    // Production break caught: blob removal deletes a referenced blob,
+    // follows a symlink, or fails on an already-absent blob.
+    #[test]
+    fn remove_blob_deletes_only_unreferenced_regular_files() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        store.tag("kept", digest).unwrap();
+
+        assert!(matches!(
+            store.remove_blob(digest),
+            Err(StoreError::BlobReferenced)
+        ));
+        assert!(store.resolve("kept").is_ok());
+
+        let orphan = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"orphan",
+        })
+        .unwrap();
+        let orphan_digest = store.import(&orphan).unwrap();
+        let orphan_path = home.path().join(format!(
+            "images/sha256/{}.mcb",
+            format_digest(orphan_digest)
+        ));
+        store.remove_blob(orphan_digest).unwrap();
+        assert!(!orphan_path.exists());
+        assert!(store.resolve("kept").is_ok());
+
+        store.remove_blob(orphan_digest).unwrap();
+    }
+
+    // Production break caught: blob removal follows a symlinked blob
+    // name to an outside file.
+    #[cfg(unix)]
+    #[test]
+    fn remove_blob_refuses_symlinked_blobs() {
+        use std::os::unix::fs::symlink;
+
+        let home = TempHome::new();
+        let outside = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        let bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"ELF",
+        })
+        .unwrap();
+        let digest = store.import(&bytes).unwrap();
+        let link = home
+            .path()
+            .join(format!("images/sha256/{}.mcb", format_digest(digest)));
+        fs::remove_file(&link).unwrap();
+        let target = outside.path().join("precious");
+        fs::write(&target, b"precious").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(matches!(
+            store.remove_blob(digest),
+            Err(StoreError::UnsafeStorePath)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"precious");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     // Production break caught: Store::new accepts a relative root and writes beneath the process working directory.

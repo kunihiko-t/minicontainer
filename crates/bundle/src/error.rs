@@ -64,6 +64,8 @@ pub enum StoreError {
     TagNotFound(String),
     /// The bundle stored under a digest path has a different digest.
     DigestPathMismatch,
+    /// A blob is still referenced by a tag.
+    BlobReferenced,
     /// A bundle failed construction or validation.
     Bundle(BundleError),
     /// A filesystem operation failed.
@@ -99,6 +101,7 @@ impl fmt::Display for StoreError {
             Self::DigestPathMismatch => {
                 formatter.write_str("image content digest does not match its store path")
             }
+            Self::BlobReferenced => formatter.write_str("blob is still referenced by a tag"),
             Self::Bundle(error) => write!(formatter, "invalid stored bundle: {error}"),
             Self::Io(error) => write!(formatter, "store filesystem operation failed: {error}"),
         }

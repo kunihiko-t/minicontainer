@@ -5,7 +5,7 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] IMAGE
@@ -16,6 +16,7 @@ usage: minictr image export [--store PATH] IMAGE --output PATH
 usage: minictr image list [--store PATH]
 usage: minictr image inspect [--store PATH] IMAGE
 usage: minictr image remove [--store PATH] IMAGE
+usage: minictr image prune [--store PATH] [--dry-run] [--force]
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
@@ -40,13 +41,15 @@ FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う�
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image remove`もIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
+`image prune`はpositionalを取らず、`--store`と値なしflagの`--dry-run`と`--force`だけを一度ずつ指定できる。
+`--dry-run`と`--force`の併用と、flagへの`=値`の付与は型付きerrorになる。
 `image`にsubcommandがない場合はcommand不足、未知のsubcommandは未知commandの型付きerrorになる。
 `doctor`はpositionalを取らず、`--store`と`--kernel`だけを一度ずつ指定できる。
 
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
-`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`のstore解決も同じ順序を使う。
+`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`のstore解決も同じ順序を使う。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
 
 ## imageの登録
@@ -151,6 +154,21 @@ myapp removed
 tag名の文法検査、symlinkと非fileの拒否、store外への到達検査を経てからunlinkするため、store外のpathへは到達しない。
 blobの削除は対象外であり、未参照blobの掃除は`image prune`で行う。
 
+## 未参照blobの掃除
+
+`image prune`は、どのtagからも参照されないblobを検出する。
+引数なしと`--dry-run`は候補の表示だけで削除せず、`--force`の指定時だけ削除する。
+候補も削除結果も次の安定した`sha256:`行で標準出力へ出す。
+
+```text
+sha256:<64桁の小文字16進数>
+```
+
+削除は候補ごとに参照状態を再確認し、再参照されたblobは飛ばして標準エラー出力へ記録する。
+store側も参照中blobの削除を拒否する。部分失敗はblobごとに報告し、一つでもあれば終了code 125で終わる。
+blob名でない配置物は候補に含めず、symlink名のblobは削除せず失敗として報告する。
+確認と削除の隙間は狭めるだけでなくせない。並行する攻撃者への対策ではない。
+
 ## 実行と入出力
 
 解決したimage tagはcontent-addressed storeから検証済みbundle bytesとして取り出す。
@@ -177,6 +195,8 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、
 `doctor`は全検査の成功で終了code 0、一つでも失敗したら終了code 1になる。
 `doctor`のparse失敗と既定値解決失敗は終了code 2、出力失敗は終了code 125になる。
 `image remove`では、tag不在とstore失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
+`image prune`では、候補検出失敗、再確認失敗、削除の部分失敗、出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
+再参照によるskipは失敗ではない。
 
 ## 失敗の調べ方
 
