@@ -54,6 +54,17 @@ guestのExit frame受信後に届いたsignalは結果を変えず、確定済�
 Exit前の中断は`RuntimeError::Interrupted`として報告し、転送や強制kill、後始末の失敗は中断errorへcleanup診断を添えて返す。
 `InterruptSource`を渡さないembedderのrunはsignalを観測せず、hostがsignalで死んだ場合はchildをreapできない。
 
+## instance状態の記録
+
+`RunRequest.instances`があれば、runtimeはQEMU childのspawn直後にstoreの`run/`へstate fileを作る。
+記録できないinstanceを起動したままにはしないため、登録に失敗したrunはchildを回収してpayloadを消してから`RuntimeError::Instance`で終わる。
+state fileにはQEMUのpid、process開始token、comm名、image label、作成時刻を記録する。
+
+主結果が決まった後のcleanupでは、QEMU回収とpayload削除ののちにstate fileを消す。
+削除は冪等であり、失敗はcleanup errorへ合成される。
+hostが`SIGKILL`や電源喪失で即死した場合だけstate fileが残り、`minictr ps`がpid identityを照合してliveまたはstaleとして表示する。
+file形式と照合の契約は[instance state](../reference/instance-state.md)を参照する。
+
 ## 失敗の区別
 
 呼び出し側は次の失敗を区別できる。
@@ -63,6 +74,7 @@ Exit前の中断は`RuntimeError::Interrupted`として報告し、転送や強�
 - timeout: 全体の期限切れ。
 - 出力上限超過: stdout、stderr、diagnosticsの合計が1 MiBを超えた場合のhost拒否。表示済みbyteも合計に含める。
 - consumer失敗: 逐次転送先の書き出し失敗。QEMU回収とpayload削除は行う。
+- instance登録失敗: state fileを書けないrun。QEMUは起動直後に畳まれる。
 - guest failure: `GuestError` frame。
 - protocol破損: 不正header、truncated frame、payload上限超過。
 - applicationの非0終了: guestの終了codeをそのまま返す。

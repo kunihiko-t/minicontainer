@@ -2,12 +2,16 @@
 
 mod command;
 mod error;
+mod instance;
 mod process;
 mod session;
 mod temp;
 
 pub use command::{QemuCommand, QemuResources};
 pub use error::{CleanupFailure, RuntimeError};
+pub use instance::{
+    InstanceDir, InstanceError, InstanceHandle, InstanceRow, InstanceState, InstanceStatus,
+};
 pub use process::{
     ProcessBackend, ProcessControl, ProcessError, ProcessEvent, ProcessStatus, SystemProcessBackend,
 };
@@ -33,6 +37,18 @@ pub struct RunRequest<'a> {
     /// hostへ届いたSIGINTとSIGTERMを観測する源。`None`のrunはsignalを
     /// 観測せず、hostがsignalで死んだ場合はchildをreapできない。
     pub interrupts: Option<&'a dyn InterruptSource>,
+    /// instance stateを書くdirectoryと`ps`の表示label。`None`のrunは
+    /// state fileを作らず、`minictr ps`には出ない。
+    pub instances: Option<InstanceRegistration<'a>>,
+}
+
+/// runが記録するinstance identityの入力。
+#[derive(Debug, Clone, Copy)]
+pub struct InstanceRegistration<'a> {
+    /// `<store root>/run/`に開かれたstate directory。
+    pub dir: &'a InstanceDir,
+    /// `ps`のIMAGE列に出すimage tagまたはdigest。
+    pub image: &'a str,
 }
 
 /// hostが受け取った中断signal。
@@ -182,6 +198,22 @@ impl<B: ProcessBackend> Runtime<B> {
             Ok(child) => child,
             Err(error) => return finish_without_child(Err(RuntimeError::Process(error)), &payload),
         };
+        // 起動したprocessのidentityをrunの開始時点で記録する。記録できない
+        // instanceを起動したままにはしないため、失敗時は通常cleanupを通す。
+        let instance = match &request.instances {
+            Some(registration) => match registration.dir.register(registration.image, child.id()) {
+                Ok(handle) => Some((registration.dir, handle)),
+                Err(error) => {
+                    let mut failures = Vec::new();
+                    if let Err(reap) = child.terminate_and_reap() {
+                        failures.push(CleanupFailure::Process(reap));
+                    }
+                    failures.extend(remove_payload(&payload));
+                    return finish_with_cleanup(Err(RuntimeError::Instance(error)), failures);
+                }
+            },
+            None => None,
+        };
 
         let mut session = Session::new();
         let mut signals = SignalWatch::new(request.interrupts, self.signal_grace);
@@ -224,6 +256,12 @@ impl<B: ProcessBackend> Runtime<B> {
             cleanup_failures.push(CleanupFailure::Process(error));
         }
         cleanup_failures.extend(remove_payload(&payload));
+        // state fileはinstanceが完全に畳まれてから消す。
+        if let Some((dir, handle)) = &instance
+            && let Err(error) = dir.unregister(handle)
+        {
+            cleanup_failures.push(CleanupFailure::Instance(error));
+        }
         finish_with_cleanup(primary, cleanup_failures)
     }
 }
@@ -367,9 +405,11 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         collections::VecDeque,
-        io,
+        env, fs, io,
         path::PathBuf,
+        process::{Child, Command},
         rc::Rc,
+        sync::atomic::{AtomicU64, Ordering},
         time::{Duration, Instant},
     };
 
@@ -377,9 +417,10 @@ mod tests {
     use minios_abi::control::{FrameHeader, FrameKind, ReadyPayload};
 
     use super::{
-        CleanupFailure, HostSignal, InterruptSource, OutputSink, ProcessBackend, ProcessControl,
-        ProcessError, ProcessEvent, ProcessStatus, QemuCommand, QemuResources, RunRequest, Runtime,
-        RuntimeError, SessionError, SessionEvent, SignalObservation,
+        CleanupFailure, HostSignal, InstanceDir, InstanceError, InstanceRegistration,
+        InterruptSource, OutputSink, ProcessBackend, ProcessControl, ProcessError, ProcessEvent,
+        ProcessStatus, QemuCommand, QemuResources, RunRequest, Runtime, RuntimeError, SessionError,
+        SessionEvent, SignalObservation,
     };
 
     // Catches skipping any part of the happy-path lifecycle: only a validated
@@ -405,6 +446,7 @@ mod tests {
                 deadline: Duration::from_secs(1),
                 resources: QemuResources::DEFAULT,
                 interrupts: None,
+                instances: None,
             })
             .unwrap();
 
@@ -464,6 +506,7 @@ mod tests {
                         deadline: Duration::from_secs(1),
                         resources: QemuResources::DEFAULT,
                         interrupts: None,
+                        instances: None,
                     })
                     .is_err(),
                 "{name} must fail"
@@ -504,6 +547,7 @@ mod tests {
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
                     interrupts: None,
+                    instances: None,
                 })
                 .is_err()
         );
@@ -522,6 +566,7 @@ mod tests {
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
                     interrupts: None,
+                    instances: None,
                 })
                 .is_err()
         );
@@ -571,6 +616,7 @@ mod tests {
                 deadline: Duration::from_millis(100),
                 resources: QemuResources::DEFAULT,
                 interrupts: None,
+                instances: None,
             })
             .unwrap_err();
 
@@ -599,6 +645,7 @@ mod tests {
                 deadline: Duration::MAX,
                 resources: QemuResources::DEFAULT,
                 interrupts: None,
+                instances: None,
             })
             .unwrap_err();
 
@@ -638,6 +685,7 @@ mod tests {
                 deadline: Duration::from_secs(1),
                 resources: QemuResources::DEFAULT,
                 interrupts: None,
+                instances: None,
             })
             .unwrap_err();
 
@@ -686,6 +734,7 @@ mod tests {
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
                     interrupts: None,
+                    instances: None,
                 },
                 &mut sink,
             )
@@ -739,6 +788,7 @@ mod tests {
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
                     interrupts: None,
+                    instances: None,
                 },
                 &mut sink,
             )
@@ -783,6 +833,7 @@ mod tests {
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
                     interrupts: None,
+                    instances: None,
                 },
                 &mut sink,
             )
@@ -831,6 +882,7 @@ mod tests {
                     deadline: Duration::from_millis(50),
                     resources: QemuResources::DEFAULT,
                     interrupts: None,
+                    instances: None,
                 },
                 &mut sink,
             )
@@ -882,6 +934,7 @@ mod tests {
                     deadline: Duration::from_secs(5),
                     resources: QemuResources::DEFAULT,
                     interrupts: None,
+                    instances: None,
                 },
                 &mut sink,
             )
@@ -928,6 +981,7 @@ mod tests {
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
                 interrupts: Some(&interrupts),
+                instances: None,
             })
             .unwrap_err();
 
@@ -964,6 +1018,7 @@ mod tests {
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
                 interrupts: Some(&interrupts),
+                instances: None,
             })
             .unwrap_err();
 
@@ -1008,6 +1063,7 @@ mod tests {
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
                 interrupts: Some(&interrupts),
+                instances: None,
             })
             .unwrap();
 
@@ -1055,6 +1111,7 @@ mod tests {
                     deadline: Duration::from_secs(60),
                     resources: QemuResources::DEFAULT,
                     interrupts: Some(&interrupts),
+                    instances: None,
                 },
                 &mut sink,
             )
@@ -1100,6 +1157,7 @@ mod tests {
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
                 interrupts: Some(&interrupts),
+                instances: None,
             })
             .unwrap_err();
 
@@ -1138,6 +1196,7 @@ mod tests {
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
                 interrupts: Some(&interrupts),
+                instances: None,
             })
             .unwrap_err();
 
@@ -1178,6 +1237,7 @@ mod tests {
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
                 interrupts: Some(&interrupts),
+                instances: None,
             })
             .unwrap_err();
 
@@ -1216,6 +1276,7 @@ mod tests {
                 deadline: Duration::ZERO,
                 resources: QemuResources::DEFAULT,
                 interrupts: Some(&interrupts),
+                instances: None,
             })
             .unwrap_err();
 
@@ -1229,12 +1290,227 @@ mod tests {
         );
     }
 
+    // Catches a run leaving its instance invisible: the state file must exist
+    // for the whole run and be gone after cleanup.
+    #[test]
+    fn a_run_registers_its_instance_and_removes_it_at_cleanup() {
+        let root = InstanceTemp::create();
+        let dir = InstanceDir::open(&root.0).unwrap();
+        let mut sleeper = spawn_instance_sleeper();
+        let state_path = root.0.join("run").join(format!("i-{}.state", sleeper.id()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![
+                    ProcessEvent::Uart(guest_stream(7)),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            )
+            .pid(sleeper.id()),
+        );
+        let registration = InstanceRegistration {
+            dir: &dir,
+            image: "hello",
+        };
+        let mut sink = RecordingSink::new(trace.clone()).probe(state_path);
+
+        let outcome = runtime
+            .run_with_sink(
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: "/kernel".as_ref(),
+                    deadline: Duration::from_secs(5),
+                    resources: QemuResources::DEFAULT,
+                    interrupts: None,
+                    instances: Some(registration),
+                },
+                &mut sink,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 7);
+        assert!(
+            !sink.probes.is_empty() && sink.probes.iter().all(|exists| *exists),
+            "the state file must exist for the whole run, got {:?}",
+            sink.probes
+        );
+        assert!(
+            dir.list().unwrap().is_empty(),
+            "the state file must be removed by cleanup"
+        );
+
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+    }
+
+    // Catches a run that cannot record its instance starting anyway: the
+    // child is reaped and the payload removed before the error returns.
+    #[test]
+    fn a_run_fails_before_the_loop_when_registration_fails() {
+        let root = InstanceTemp::create();
+        let dir = InstanceDir::open(&root.0).unwrap();
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        // pid_tの範囲外の値はどのplatformでも生存processを指せない。
+        let runtime =
+            Runtime::new(FakeBackend::events(trace.clone(), payload.clone(), vec![]).pid(u32::MAX));
+        let registration = InstanceRegistration {
+            dir: &dir,
+            image: "hello",
+        };
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(5),
+                resources: QemuResources::DEFAULT,
+                interrupts: None,
+                instances: Some(registration),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RuntimeError::Instance(InstanceError::UnverifiableProcess)
+            ),
+            "registration failure must be a typed instance error, got {error:?}"
+        );
+        assert_eq!(trace.borrow().as_slice(), ["spawn", "reap"]);
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+        assert!(dir.list().unwrap().is_empty());
+    }
+
+    // Catches losing the state removal error behind a clean run: the
+    // unregister failure must compose into cleanup diagnostics.
+    #[test]
+    fn an_unregister_failure_composes_into_cleanup() {
+        let root = InstanceTemp::create();
+        let dir = InstanceDir::open(&root.0).unwrap();
+        let mut sleeper = spawn_instance_sleeper();
+        let run_dir = root.0.join("run");
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![
+                    ProcessEvent::Uart(guest_stream(7)),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            )
+            .pid(sleeper.id()),
+        );
+        let registration = InstanceRegistration {
+            dir: &dir,
+            image: "hello",
+        };
+        let mut sink = RecordingSink::new(trace.clone()).on_push(move || {
+            make_read_only(&run_dir);
+        });
+
+        let error = runtime
+            .run_with_sink(
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: "/kernel".as_ref(),
+                    deadline: Duration::from_secs(5),
+                    resources: QemuResources::DEFAULT,
+                    interrupts: None,
+                    instances: Some(registration),
+                },
+                &mut sink,
+            )
+            .unwrap_err();
+
+        match error {
+            RuntimeError::CleanupOnly(failures) => {
+                assert!(
+                    matches!(failures.as_slice(), [CleanupFailure::Instance(_)]),
+                    "the instance removal failure must be reported, got {failures:?}"
+                );
+            }
+            other => panic!("expected an instance cleanup failure, got {other:?}"),
+        }
+
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn make_read_only(path: &PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o500);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    static NEXT_INSTANCE_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    /// store rootのscratch directory。dropで権限を戻してから消す。
+    struct InstanceTemp(PathBuf);
+
+    impl InstanceTemp {
+        fn create() -> Self {
+            let sequence = NEXT_INSTANCE_ROOT.fetch_add(1, Ordering::Relaxed);
+            let root = env::temp_dir().join(format!(
+                "minicontainer-run-state-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("a scratch store root must be creatable");
+            Self(root)
+        }
+    }
+
+    impl Drop for InstanceTemp {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for path in [self.0.join("run"), self.0.clone()] {
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        let mut permissions = metadata.permissions();
+                        permissions.set_mode(0o700);
+                        let _ = fs::set_permissions(&path, permissions);
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// instance記録の被写体として使う長命sleeper。`instance::tests`の
+    /// helper testを同じtest binaryの別processとして起動する。
+    fn spawn_instance_sleeper() -> Child {
+        Command::new(env::current_exe().expect("the test binary path must exist"))
+            .args([
+                "--ignored",
+                "--exact",
+                "instance::tests::instance_helper",
+                "--nocapture",
+            ])
+            .env("MINICONTAINER_INSTANCE_HELPER", "sleep")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the sleeper helper must spawn")
+    }
+
     struct RecordingSink {
         trace: Rc<RefCell<Vec<&'static str>>>,
         events: Vec<SessionEvent>,
         reaps_at_push: Vec<usize>,
         fail_after: usize,
         sleep: Duration,
+        probe: Option<PathBuf>,
+        probes: Vec<bool>,
+        on_push: Option<Box<dyn FnMut()>>,
     }
 
     impl RecordingSink {
@@ -1245,6 +1521,9 @@ mod tests {
                 reaps_at_push: Vec::new(),
                 fail_after: usize::MAX,
                 sleep: Duration::ZERO,
+                probe: None,
+                probes: Vec::new(),
+                on_push: None,
             }
         }
 
@@ -1255,6 +1534,18 @@ mod tests {
 
         fn sleep(mut self, duration: Duration) -> Self {
             self.sleep = duration;
+            self
+        }
+
+        /// 各pushで`path`の存在を記録する。run中にfileが見えるかの検査用。
+        fn probe(mut self, path: PathBuf) -> Self {
+            self.probe = Some(path);
+            self
+        }
+
+        /// 各pushの直前に呼ぶhook。runの途中で副作用を起こす検査用。
+        fn on_push(mut self, action: impl FnMut() + 'static) -> Self {
+            self.on_push = Some(Box::new(action));
             self
         }
     }
@@ -1286,11 +1577,17 @@ mod tests {
 
     impl OutputSink for RecordingSink {
         fn push(&mut self, event: &SessionEvent) -> io::Result<()> {
+            if let Some(action) = self.on_push.as_mut() {
+                action();
+            }
             if !self.sleep.is_zero() {
                 std::thread::sleep(self.sleep);
             }
             if self.events.len() >= self.fail_after {
                 return Err(io::Error::other("injected consumer failure"));
+            }
+            if let Some(probe) = &self.probe {
+                self.probes.push(probe.exists());
             }
             self.reaps_at_push.push(
                 self.trace
@@ -1310,6 +1607,7 @@ mod tests {
         result: RefCell<FakeSpawnResult>,
         reap_fails: bool,
         signal_fails: bool,
+        pid: u32,
     }
 
     impl FakeBackend {
@@ -1324,6 +1622,7 @@ mod tests {
                 result: RefCell::new(FakeSpawnResult::Events(events)),
                 reap_fails: false,
                 signal_fails: false,
+                pid: 42,
             }
         }
 
@@ -1337,6 +1636,7 @@ mod tests {
                 result: RefCell::new(FakeSpawnResult::Fails),
                 reap_fails: false,
                 signal_fails: false,
+                pid: 42,
             }
         }
 
@@ -1347,6 +1647,11 @@ mod tests {
 
         fn signal_fails(mut self) -> Self {
             self.signal_fails = true;
+            self
+        }
+
+        fn pid(mut self, pid: u32) -> Self {
+            self.pid = pid;
             self
         }
     }
@@ -1377,6 +1682,7 @@ mod tests {
                     events: events.into(),
                     reap_fails: self.reap_fails,
                     signal_fails: self.signal_fails,
+                    pid: self.pid,
                 }),
                 FakeSpawnResult::Fails => Err(ProcessError::Spawn(io::Error::other(
                     "injected spawn failure",
@@ -1397,11 +1703,12 @@ mod tests {
         events: VecDeque<ProcessEvent>,
         reap_fails: bool,
         signal_fails: bool,
+        pid: u32,
     }
 
     impl ProcessControl for FakeChild {
         fn id(&self) -> u32 {
-            42
+            self.pid
         }
 
         fn next_event(&mut self, _deadline: Instant) -> Result<ProcessEvent, ProcessError> {

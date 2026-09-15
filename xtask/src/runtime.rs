@@ -313,6 +313,16 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         terminated.elapsed.as_secs_f64()
     ));
 
+    log("e2e: crash path (a SIGKILLed minictr leaves its instance; ps reports stale)");
+    let crashed = run_orphan_path(&minictr, &kernel)?;
+    log(&format!(
+        "e2e: crash path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
+        crashed.minictr_pid,
+        crashed.qemu_before,
+        crashed.qemu_after,
+        crashed.elapsed.as_secs_f64()
+    ));
+
     Ok(transcript)
 }
 
@@ -1045,6 +1055,157 @@ fn run_signal_path(
         });
     }
     Ok(report)
+}
+
+/// host crashを真似る経路。`minictr`をSIGKILLしてcleanupを回避し、孤児に
+/// なったQEMUを殺したあと`minictr ps`がそのinstanceをstaleとして表示する
+/// ことを確認する。crashが残したpayload directoryはharnessが除去する。
+fn run_orphan_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
+    let store = prepare_store(&spin_elf_bytes())?;
+    let store_path = store.path.clone();
+    let qemu_before = qemu_pids()?;
+    let payload_before = payload_temp_leftovers();
+    let started = Instant::now();
+    let spawned = spawn_minictr(
+        minictr,
+        &store.path,
+        kernel,
+        HAPPY_PATH_TIMEOUT_MS,
+        E2E_IMAGE,
+    )?;
+    // QEMU pidを外へ返し、失敗経路でも孤児を放置しないようにする。
+    let mut qemu_pid = None;
+    let outcome = (|| {
+        let mut spawned = wait_for_qemu_boot(spawned, &qemu_before)?;
+        qemu_pid = match qemu_pids() {
+            Ok(pids) => pids.into_iter().find(|pid| !qemu_before.contains(pid)),
+            Err(error) => {
+                terminate_spawned(spawned);
+                return Err(error);
+            }
+        };
+        let Some(qemu_pid) = qemu_pid else {
+            terminate_spawned(spawned);
+            return Err(E2EError::UnexpectedRun {
+                case: "crash-path QEMU discovery",
+                expected: "a freshly booted QEMU pid".to_owned(),
+                actual: "no new QEMU process".to_owned(),
+            });
+        };
+        // run中のinstanceはliveとして見えなければならない。登録はQEMU起動
+        // 直後に行われるため、boot観測からの僅かな遅れを許す。
+        if let Err(error) = wait_for_ps_row(minictr, &store_path, qemu_pid, "live") {
+            terminate_spawned(spawned);
+            let _ = signal_process(qemu_pid, libc::SIGKILL);
+            return Err(error);
+        }
+        // hostを即死させてcleanupを回避する。QEMUは別groupで生き続ける。
+        if let Err(error) = signal_process(spawned.pid, libc::SIGKILL) {
+            let failure = E2EError::Command {
+                command: format!("send SIGKILL to minictr {}", spawned.pid),
+                message: error.to_string(),
+            };
+            terminate_spawned(spawned);
+            let _ = signal_process(qemu_pid, libc::SIGKILL);
+            return Err(failure);
+        }
+        let status = match spawned.child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let failure = E2EError::Command {
+                    command: spawned.command_line.clone(),
+                    message: error.to_string(),
+                };
+                terminate_spawned(spawned);
+                let _ = signal_process(qemu_pid, libc::SIGKILL);
+                return Err(failure);
+            }
+        };
+        let stdout = join_reader(spawned.stdout_reader, &spawned.command_line);
+        let stderr = join_reader(spawned.stderr_reader, &spawned.command_line);
+        // 孤児になったQEMUを殺し、pid死亡をpsのstale表示へ繋ぐ。
+        let _ = signal_process(qemu_pid, libc::SIGKILL);
+        wait_for_ps_row(minictr, &store_path, qemu_pid, "stale")?;
+        Ok(CompletedProcess {
+            pid: spawned.pid,
+            status,
+            stdout: stdout?,
+            stderr: stderr?,
+        })
+    })();
+    let elapsed = started.elapsed();
+    if let Some(pid) = qemu_pid {
+        let _ = signal_process(pid, libc::SIGKILL);
+    }
+    // crashが残したpayload directoryはharnessが除去してから残留検査へ。
+    remove_stray_payloads(&payload_before);
+    let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
+    let completed = outcome?;
+    Ok(CaseReport {
+        minictr_pid: completed.pid,
+        qemu_before,
+        qemu_after,
+        elapsed,
+        status: completed.status.code(),
+        stdout: completed.stdout,
+        stderr: completed.stderr,
+    })
+}
+
+/// `minictr ps`が`qemu_pid`の行を`status`で表示するまでpollする。QEMUの
+/// 登録と死亡の観測には僅かな遅れがあるため、即時確認ではなく期限付きで
+/// 待つ。
+fn wait_for_ps_row(
+    minictr: &Path,
+    store: &Path,
+    qemu_pid: u32,
+    status: &str,
+) -> Result<(), E2EError> {
+    let deadline = Instant::now() + INTERRUPT_BOOT_TIMEOUT;
+    let expected = format!("i-{qemu_pid}\t{qemu_pid}\t{E2E_IMAGE}\t{status}\t");
+    let args = [
+        OsString::from("ps"),
+        OsString::from("--store"),
+        store.as_os_str().to_owned(),
+    ];
+    loop {
+        match run_with_timeout(minictr, &args, None, &[], COMMAND_TIMEOUT) {
+            Ok(completed) if completed.status.success() => {
+                let text = String::from_utf8_lossy(&completed.stdout);
+                if text.lines().any(|line| line.starts_with(&expected)) {
+                    return Ok(());
+                }
+            }
+            Ok(completed) => {
+                return Err(E2EError::UnexpectedRun {
+                    case: "crash-path ps exit code",
+                    expected: "a successful minictr ps".to_owned(),
+                    actual: format!(
+                        "status {:?} (stderr: {})",
+                        completed.status.code(),
+                        String::from_utf8_lossy(&completed.stderr)
+                    ),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(E2EError::TimedOut {
+                command: format!("minictr ps waiting for a {status} i-{qemu_pid}"),
+            });
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// crash経路が残したpayload directoryを除去する。`before`に無かった
+/// `minicontainer-run-*`だけを消し、検査前のbaselineを汚さない。
+fn remove_stray_payloads(before: &[PathBuf]) {
+    for path in payload_temp_leftovers() {
+        if !before.contains(&path) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 fn minictr_run_args(store: &Path, kernel: &Path, timeout_ms: &str, image: &str) -> Vec<OsString> {

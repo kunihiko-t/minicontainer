@@ -24,6 +24,8 @@ pub enum Command {
     Run(RunArgs),
     /// host環境を実行前に診断する。
     Doctor(DoctorArgs),
+    /// 記録済みinstanceのlive/stale/corrupt状態を一覧する。
+    Ps(PsArgs),
     /// imageのbuildなどstore内容を操作する。
     Image(ImageCommand),
 }
@@ -91,6 +93,13 @@ pub struct ImageExportArgs {
 /// `image list`の型付き引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageListArgs {
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
+}
+
+/// `ps`の型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PsArgs {
     /// `--store`の指定値。`None`なら環境とHOMEから解決する。
     pub store: Option<PathBuf>,
 }
@@ -248,6 +257,13 @@ pub struct ResolvedExport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedList {
     /// bundle storeのroot。
+    pub store: PathBuf,
+}
+
+/// `ps`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPs {
+    /// bundle storeのroot。instance stateはその`run/`以下にある。
     pub store: PathBuf,
 }
 
@@ -475,7 +491,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
 }
 
 /// OS引数からcommandをparseする。
@@ -488,6 +504,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         "--version" => return parse_bare_command(arguments, Command::Version),
         "run" => {}
         "doctor" => return parse_doctor(arguments),
+        "ps" => return parse_ps(arguments),
         "image" => {
             let subcommand = arguments.next().ok_or(CliError::MissingCommand)?;
             let subcommand = subcommand
@@ -832,6 +849,42 @@ fn parse_image_list(arguments: impl IntoIterator<Item = OsString>) -> Result<Com
     }
 
     Ok(Command::Image(ImageCommand::List(ImageListArgs { store })))
+}
+
+/// `ps`の引数をparseする。`--store`だけを取り、positionalは取らない。
+fn parse_ps(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut store: Option<PathBuf> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        return Err(CliError::UnexpectedArgument(text));
+    }
+
+    Ok(Command::Ps(PsArgs { store }))
 }
 
 /// `image inspect`の引数をparseする。optionはIMAGEの前後どこに置いてもよい。
@@ -1404,6 +1457,18 @@ pub fn resolve_list(args: &ImageListArgs, env: &dyn Environ) -> Result<ResolvedL
         },
     };
     Ok(ResolvedList { store })
+}
+
+/// parse済み`ps`引数と環境からstore pathを解決する。
+pub fn resolve_ps(args: &PsArgs, env: &dyn Environ) -> Result<ResolvedPs, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedPs { store })
 }
 
 /// parse済み`image inspect`引数と環境からstore pathを解決する。
@@ -2038,7 +2103,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
         );
     }
 
@@ -2903,6 +2968,84 @@ mod tests {
         };
         assert_eq!(resolve_list(&list, &env), Err(CliError::MissingHome));
         assert_eq!(resolve_inspect(&inspect, &env), Err(CliError::MissingHome));
+    }
+
+    // Catches drifting from the ps acceptance syntax: `ps` takes only an
+    // optional store and no positional argument.
+    #[test]
+    fn parses_ps_with_defaults() {
+        assert_eq!(parse(["ps"]), Ok(Command::Ps(PsArgs { store: None })));
+        assert_eq!(
+            parse(["ps", "--store", "/data/store"]),
+            Ok(Command::Ps(PsArgs {
+                store: Some(PathBuf::from("/data/store")),
+            }))
+        );
+        assert_eq!(
+            parse(["ps", "--store=/data/store"]),
+            Ok(Command::Ps(PsArgs {
+                store: Some(PathBuf::from("/data/store")),
+            }))
+        );
+    }
+
+    // Catches accepting malformed ps options or a positional argument.
+    #[test]
+    fn rejects_invalid_ps_arguments() {
+        assert_eq!(
+            parse(["ps", "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+        assert_eq!(
+            parse(["ps", "--volume", "data"]),
+            Err(CliError::UnknownOption("--volume".to_owned()))
+        );
+        assert_eq!(
+            parse(["ps", "--store", "/a", "--store", "/b"]),
+            Err(CliError::DuplicateOption("--store"))
+        );
+        assert_eq!(
+            parse(["ps", "--store"]),
+            Err(CliError::MissingValue("--store"))
+        );
+    }
+
+    // Catches resolving the ps store from anything but the documented
+    // explicit option, environment, and HOME order.
+    #[test]
+    fn resolves_ps_store_from_the_documented_environment() {
+        let ps = PsArgs { store: None };
+        assert_eq!(
+            resolve_ps(&ps, &home_env()).unwrap(),
+            ResolvedPs {
+                store: PathBuf::from("/home/test/.minicontainer"),
+            }
+        );
+
+        let env = FakeEnv {
+            store: Some(OsString::from("/env/store")),
+            kernel: None,
+            home: Some(OsString::from("/home/test")),
+        };
+        assert_eq!(
+            resolve_ps(&ps, &env).unwrap().store,
+            PathBuf::from("/env/store")
+        );
+
+        let explicit = PsArgs {
+            store: Some(PathBuf::from("/cli/store")),
+        };
+        assert_eq!(
+            resolve_ps(&explicit, &env).unwrap().store,
+            PathBuf::from("/cli/store")
+        );
+
+        let env = FakeEnv {
+            store: None,
+            kernel: None,
+            home: None,
+        };
+        assert_eq!(resolve_ps(&ps, &env), Err(CliError::MissingHome));
     }
 
     // Catches drifting from the remove acceptance syntax: `image remove`
