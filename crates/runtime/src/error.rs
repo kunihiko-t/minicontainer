@@ -2,7 +2,7 @@ use std::{error::Error, fmt, io, path::PathBuf};
 
 use minicontainer_bundle::BundleError;
 
-use crate::{HostSignal, ProcessError, SessionError};
+use crate::{HostSignal, InstanceError, ProcessError, SessionError};
 
 /// runの後始末中に追加で起きた失敗。
 #[derive(Debug)]
@@ -11,6 +11,8 @@ pub enum CleanupFailure {
     Process(ProcessError),
     /// temporary payloadの削除に失敗した。
     Payload(io::Error),
+    /// instance state fileの削除に失敗した。
+    Instance(InstanceError),
 }
 
 impl fmt::Display for CleanupFailure {
@@ -18,6 +20,7 @@ impl fmt::Display for CleanupFailure {
         match self {
             Self::Process(error) => write!(formatter, "process cleanup failed: {error}"),
             Self::Payload(error) => write!(formatter, "payload cleanup failed: {error}"),
+            Self::Instance(error) => write!(formatter, "instance cleanup failed: {error}"),
         }
     }
 }
@@ -27,6 +30,7 @@ impl Error for CleanupFailure {
         match self {
             Self::Process(error) => Some(error),
             Self::Payload(error) => Some(error),
+            Self::Instance(error) => Some(error),
         }
     }
 }
@@ -42,6 +46,8 @@ pub enum RuntimeError {
     UnsafePayloadPath(PathBuf),
     /// 一時fileやdirectoryの操作が失敗した。
     Io(io::Error),
+    /// instance stateの登録に失敗した。QEMUは起動前に畳まれる。
+    Instance(InstanceError),
     /// QEMU processの操作に失敗した。
     Process(ProcessError),
     /// QEMU UART sessionを復元できなかった。
@@ -77,6 +83,7 @@ impl fmt::Display for RuntimeError {
                 path.display()
             ),
             Self::Io(error) => write!(formatter, "runtime io failed: {error}"),
+            Self::Instance(error) => write!(formatter, "instance state failed: {error}"),
             Self::Process(error) => write!(formatter, "runtime process failed: {error}"),
             Self::Session(error) => write!(formatter, "runtime session failed: {error}"),
             Self::Consumer(error) => {
@@ -110,6 +117,7 @@ impl Error for RuntimeError {
             Self::InvalidDeadline => None,
             Self::UnsafePayloadPath(_) => None,
             Self::Io(error) | Self::Consumer(error) => Some(error),
+            Self::Instance(error) => Some(error),
             Self::Interrupted(_) => None,
             Self::Process(error) => Some(error),
             Self::Session(error) => Some(error),

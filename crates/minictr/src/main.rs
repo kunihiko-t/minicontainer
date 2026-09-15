@@ -15,17 +15,18 @@ use minicontainer_bundle::{
     ImageSpec, MAX_BUNDLE_LEN, Store, TagRecord, build, format_digest, parse, parse_digest,
 };
 use minicontainer_runtime::{
-    HostSignal, InterruptSource, OutputSink, QemuResources, RunOutcome, RunRequest, Runtime,
-    RuntimeError, SessionEvent, SignalObservation, SystemProcessBackend,
+    HostSignal, InstanceDir, InstanceRegistration, InstanceRow, InterruptSource, OutputSink,
+    QemuResources, RunOutcome, RunRequest, Runtime, RuntimeError, SessionEvent, SignalObservation,
+    SystemProcessBackend,
 };
 
 use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
     ResolvedExportOci, ResolvedImport, ResolvedImportOci, ResolvedInspect, ResolvedList,
-    ResolvedPrune, ResolvedPullOci, ResolvedRemove, ResolvedRun, VERSION, help, parse_os, resolve,
-    resolve_build, resolve_doctor, resolve_export, resolve_export_oci, resolve_import,
-    resolve_import_oci, resolve_inspect, resolve_list, resolve_prune, resolve_pull_oci,
-    resolve_remove,
+    ResolvedPrune, ResolvedPs, ResolvedPullOci, ResolvedRemove, ResolvedRun, VERSION, help,
+    parse_os, resolve, resolve_build, resolve_doctor, resolve_export, resolve_export_oci,
+    resolve_import, resolve_import_oci, resolve_inspect, resolve_list, resolve_prune, resolve_ps,
+    resolve_pull_oci, resolve_remove,
 };
 
 /// usage errorのprocess終了code。
@@ -90,6 +91,17 @@ pub fn real_main(
                 }
             };
             doctor_resolved(&resolved, &RealQemuProbe, stdout, stderr)
+        }
+        Command::Ps(args) => {
+            let resolved = match resolve_ps(&args, env) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = writeln!(stderr, "minictr: {error}");
+                    let _ = writeln!(stderr, "{help}", help = help());
+                    return USAGE_EXIT;
+                }
+            };
+            ps_resolved(&resolved, stdout, stderr)
         }
         Command::Image(command) => match command {
             ImageCommand::Build(args) => {
@@ -409,18 +421,31 @@ impl From<minicontainer_bundle::BundleError> for ExportError {
     }
 }
 
+/// `Runner::run`と`execute`へ渡すrunの不変入力。`RunRequest`のCLI側の形。
+pub struct RunSpec<'a> {
+    /// 実行するMiniBundle bytes。
+    pub bundle: &'a [u8],
+    /// QEMUが起動するminiOS kernel。
+    pub kernel: &'a Path,
+    /// UART control eventを待つ全体の期限。
+    pub timeout: Duration,
+    /// QEMUへ渡すguest resource量。
+    pub resources: QemuResources,
+    /// instance stateを書くdirectoryと`ps`の表示label。`None`なら記録しない。
+    pub instances: Option<InstanceRegistration<'a>>,
+}
+
 /// guest実行の境界。testではQEMUなしの偽装で差し替える。
 pub trait Runner {
     /// bundleをQEMU上で実行し、guest出力を書き出しながらoutcomeを返す。
     ///
     /// guestのstdout chunkは`stdout`へ、stderr chunkは`stderr`へ、runの終了を
     /// 待たず書き出す。書き出し失敗はrunを中断する型付きerrorとして返す。
+    /// `spec.instances`があれば、runtimeはQEMU起動直後にinstance stateを
+    /// 記録し、終了時に消す。
     fn run(
         &self,
-        bundle: &[u8],
-        kernel: &Path,
-        timeout: Duration,
-        resources: QemuResources,
+        spec: RunSpec<'_>,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError>;
@@ -493,10 +518,7 @@ extern "C" fn record_signal(signal: libc::c_int) {
 impl Runner for RealRunner {
     fn run(
         &self,
-        bundle: &[u8],
-        kernel: &Path,
-        timeout: Duration,
-        resources: QemuResources,
+        spec: RunSpec<'_>,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError> {
@@ -519,11 +541,12 @@ impl Runner for RealRunner {
         let runtime = Runtime::new(SystemProcessBackend::new());
         runtime.run_with_sink(
             RunRequest {
-                bundle,
-                kernel,
-                deadline: timeout,
-                resources,
+                bundle: spec.bundle,
+                kernel: spec.kernel,
+                deadline: spec.timeout,
+                resources: spec.resources,
                 interrupts: Some(&interrupts),
+                instances: spec.instances,
             },
             &mut CliSink::new(stdout, stderr),
         )
@@ -545,13 +568,28 @@ pub fn run_resolved(
             return RUNTIME_EXIT;
         }
     };
+    // instance stateを書けないstoreではrunを始めない。追跡できないQEMUを
+    // 起動したままにしないため、runnerへ渡す前にdirectoryの開放を確認する。
+    let instances_dir = match InstanceDir::open(&resolved.store) {
+        Ok(dir) => dir,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
     execute(
-        &bundle,
-        &resolved.kernel,
-        resolved.timeout,
-        QemuResources {
-            memory_mib: resolved.memory_mib,
-            cpus: resolved.cpus,
+        RunSpec {
+            bundle: &bundle,
+            kernel: &resolved.kernel,
+            timeout: resolved.timeout,
+            resources: QemuResources {
+                memory_mib: resolved.memory_mib,
+                cpus: resolved.cpus,
+            },
+            instances: Some(InstanceRegistration {
+                dir: &instances_dir,
+                image: &resolved.image,
+            }),
         },
         runner,
         stdout,
@@ -680,6 +718,67 @@ pub fn list_resolved(
             name = record.name,
             digest = format_digest(record.digest),
         ) {
+            let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+            return RUNTIME_EXIT;
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "minictr: failed to flush stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    0
+}
+
+/// `ps`のAGE列の表示。記録時刻からの経過秒を最短の単位へ畳む。
+fn format_age(seconds: u64) -> String {
+    if seconds < 120 {
+        format!("{seconds}s")
+    } else if seconds < 7_200 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 172_800 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+/// 解決済み`ps`を実行し、process終了codeを返す。
+pub fn ps_resolved(resolved: &ResolvedPs, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
+    let dir = match InstanceDir::open(&resolved.store) {
+        Ok(dir) => dir,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    let rows = match dir.list() {
+        Ok(rows) => rows,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if let Err(error) = writeln!(stdout, "INSTANCE\tPID\tIMAGE\tSTATE\tAGE") {
+        let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
+        return RUNTIME_EXIT;
+    }
+    for row in &rows {
+        let line = match row {
+            InstanceRow::Known { id, state, status } => format!(
+                "{id}\t{pid}\t{image}\t{status}\t{age}",
+                pid = state.pid,
+                image = state.image,
+                status = status.name(),
+                age = format_age(now.saturating_sub(state.started)),
+            ),
+            // parse不能なfileは識別子だけを残し、残りの列を欠損として出す。
+            InstanceRow::Corrupt { id } => format!("{id}\t-\t-\tcorrupt\t-"),
+        };
+        if let Err(error) = writeln!(stdout, "{line}") {
             let _ = writeln!(stderr, "minictr: failed to write stdout: {error}");
             return RUNTIME_EXIT;
         }
@@ -1400,17 +1499,14 @@ fn atomic_write_file(destination: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// 取得済みbundleを実行し、guest入出力をhostへ接続する。
 pub fn execute(
-    bundle: &[u8],
-    kernel: &Path,
-    timeout: Duration,
-    resources: QemuResources,
+    spec: RunSpec<'_>,
     runner: &dyn Runner,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
     // Guest bytes are already streamed to stdout and stderr while the run
     // is in progress; only the exit code mapping and the final flush remain.
-    let outcome = match runner.run(bundle, kernel, timeout, resources, stdout, stderr) {
+    let outcome = match runner.run(spec, stdout, stderr) {
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = writeln!(stderr, "minictr: {error}");
@@ -1488,13 +1584,22 @@ mod tests {
         }
     }
 
+    /// `execute`呼び出しの既定入力。`kernel`はfake runnerが触れないため
+    /// 実在しないpathでよい。
+    fn spec(bundle: &[u8]) -> RunSpec<'_> {
+        RunSpec {
+            bundle,
+            kernel: Path::new("/kernel"),
+            timeout: Duration::from_secs(5),
+            resources: QemuResources::DEFAULT,
+            instances: None,
+        }
+    }
+
     impl Runner for FakeRunner {
         fn run(
             &self,
-            _bundle: &[u8],
-            _kernel: &Path,
-            _timeout: Duration,
-            _resources: QemuResources,
+            _spec: RunSpec<'_>,
             stdout: &mut dyn Write,
             stderr: &mut dyn Write,
         ) -> Result<RunOutcome, RuntimeError> {
@@ -1714,10 +1819,12 @@ mod tests {
         }
     }
 
+    /// `run`の解決済み入力。`store`はrunがinstance stateを書くため、
+    /// 実在するscratch rootを指す。呼び出し側が`config.store`を消す。
     fn resolved() -> ResolvedRun {
         ResolvedRun {
             image: "hello".to_owned(),
-            store: Path::new("/store").to_path_buf(),
+            store: temp_store_root("resolved-run"),
             kernel: Path::new("/kernel").to_path_buf(),
             timeout: Duration::from_secs(5),
             memory_mib: 128,
@@ -1784,14 +1891,16 @@ mod tests {
         let store = FakeStore {
             result: Ok(vec![1, 2, 3]),
         };
+        let config = resolved();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = run_resolved(&resolved(), &runner, &store, &mut stdout, &mut stderr);
+        let code = run_resolved(&config, &runner, &store, &mut stdout, &mut stderr);
 
         assert_eq!(code, 42);
         assert_eq!(stdout, b"out");
         assert_eq!(stderr, b"err");
+        std::fs::remove_dir_all(&config.store).unwrap();
     }
 
     // Catches dropping configured resource limits between resolve and run:
@@ -1805,14 +1914,11 @@ mod tests {
         impl Runner for RecordingRunner {
             fn run(
                 &self,
-                _bundle: &[u8],
-                _kernel: &Path,
-                _timeout: Duration,
-                resources: QemuResources,
+                spec: RunSpec<'_>,
                 _stdout: &mut dyn Write,
                 _stderr: &mut dyn Write,
             ) -> Result<RunOutcome, RuntimeError> {
-                *self.seen.borrow_mut() = Some(resources);
+                *self.seen.borrow_mut() = Some(spec.resources);
                 Ok(outcome(b"", b"", 0))
             }
         }
@@ -1839,6 +1945,92 @@ mod tests {
                 cpus: 2,
             })
         );
+        std::fs::remove_dir_all(&config.store).unwrap();
+    }
+
+    // Catches a run reaching the runner without its instance registration:
+    // the runner must see the state directory and the image label so the
+    // runtime can record the QEMU process before the loop starts.
+    #[test]
+    fn run_passes_the_instance_registration_to_the_runner() {
+        struct CapturingRunner {
+            seen: RefCell<Option<String>>,
+        }
+
+        impl Runner for CapturingRunner {
+            fn run(
+                &self,
+                spec: RunSpec<'_>,
+                _stdout: &mut dyn Write,
+                _stderr: &mut dyn Write,
+            ) -> Result<RunOutcome, RuntimeError> {
+                *self.seen.borrow_mut() = spec
+                    .instances
+                    .map(|registration| registration.image.to_owned());
+                Ok(outcome(b"", b"", 0))
+            }
+        }
+
+        let root = temp_store_root("run-instances");
+        let runner = CapturingRunner {
+            seen: RefCell::new(None),
+        };
+        let store = FakeStore {
+            result: Ok(vec![1, 2, 3]),
+        };
+        let mut config = resolved();
+        let unused = std::mem::replace(&mut config.store, root.clone());
+        std::fs::remove_dir_all(&unused).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_resolved(&config, &runner, &store, &mut stdout, &mut stderr);
+
+        assert_eq!(code, 0);
+        assert_eq!(*runner.seen.borrow(), Some("hello".to_owned()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches a run starting without a usable state directory: an unsafe
+    // store must stop the run before the runner is invoked, not degrade to
+    // an untracked QEMU.
+    #[test]
+    #[cfg(unix)]
+    fn run_fails_when_instance_state_is_unavailable() {
+        use std::os::unix::fs::symlink;
+
+        struct NeverRunner;
+
+        impl Runner for NeverRunner {
+            fn run(
+                &self,
+                _spec: RunSpec<'_>,
+                _stdout: &mut dyn Write,
+                _stderr: &mut dyn Write,
+            ) -> Result<RunOutcome, RuntimeError> {
+                panic!("the runner must not run without a state directory")
+            }
+        }
+
+        let target = temp_store_root("run-instances-target");
+        let link = temp_store_root("run-instances-link");
+        std::fs::remove_dir_all(&link).unwrap();
+        symlink(&target, &link).unwrap();
+        let store = FakeStore {
+            result: Ok(vec![1, 2, 3]),
+        };
+        let mut config = resolved();
+        let unused = std::mem::replace(&mut config.store, link.clone());
+        std::fs::remove_dir_all(&unused).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_resolved(&config, &NeverRunner, &store, &mut stdout, &mut stderr);
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(String::from_utf8_lossy(&stderr).contains("instance state"));
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
     }
 
     // Catches mapping a nonzero guest exit to success or to a host error.
@@ -1848,15 +2040,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = execute(
-            b"bundle",
-            Path::new("/kernel"),
-            Duration::from_secs(5),
-            QemuResources::DEFAULT,
-            &runner,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = execute(spec(b"bundle"), &runner, &mut stdout, &mut stderr);
 
         assert_eq!(code, 3);
         assert!(stderr.is_empty());
@@ -1869,15 +2053,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = execute(
-            b"bundle",
-            Path::new("/kernel"),
-            Duration::from_secs(5),
-            QemuResources::DEFAULT,
-            &runner,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = execute(spec(b"bundle"), &runner, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert_eq!(stdout, b"out");
@@ -1891,15 +2067,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = execute(
-            b"bundle",
-            Path::new("/kernel"),
-            Duration::from_secs(5),
-            QemuResources::DEFAULT,
-            &runner,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = execute(spec(b"bundle"), &runner, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert!(String::from_utf8_lossy(&stderr).contains("minictr:"));
@@ -1914,15 +2082,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = execute(
-            b"bundle",
-            Path::new("/kernel"),
-            Duration::from_secs(5),
-            QemuResources::DEFAULT,
-            &runner,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = execute(spec(b"bundle"), &runner, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert!(
@@ -1971,15 +2131,7 @@ mod tests {
         };
         let mut stderr = Vec::new();
 
-        let code = execute(
-            b"bundle",
-            Path::new("/kernel"),
-            Duration::from_secs(5),
-            QemuResources::DEFAULT,
-            &runner,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = execute(spec(b"bundle"), &runner, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert!(
@@ -1998,15 +2150,7 @@ mod tests {
             message: "stderr broken",
         };
 
-        let code = execute(
-            b"bundle",
-            Path::new("/kernel"),
-            Duration::from_secs(5),
-            QemuResources::DEFAULT,
-            &runner,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = execute(spec(b"bundle"), &runner, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert_eq!(stdout, b"");
@@ -2023,15 +2167,7 @@ mod tests {
         };
         let mut stderr = Vec::new();
 
-        let code = execute(
-            b"bundle",
-            Path::new("/kernel"),
-            Duration::from_secs(5),
-            QemuResources::DEFAULT,
-            &runner,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = execute(spec(b"bundle"), &runner, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert!(
@@ -2051,15 +2187,7 @@ mod tests {
             message: "stderr flush broken",
         };
 
-        let code = execute(
-            b"bundle",
-            Path::new("/kernel"),
-            Duration::from_secs(5),
-            QemuResources::DEFAULT,
-            &runner,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = execute(spec(b"bundle"), &runner, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert_eq!(stdout, b"");
@@ -2190,19 +2318,15 @@ mod tests {
         }
 
         let runner = FakeRunner::ok(outcome(b"", b"", 0));
+        let config = resolved();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = run_resolved(
-            &resolved(),
-            &runner,
-            &FailingStore,
-            &mut stdout,
-            &mut stderr,
-        );
+        let code = run_resolved(&config, &runner, &FailingStore, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert!(String::from_utf8_lossy(&stderr).contains("minictr:"));
+        std::fs::remove_dir_all(&config.store).unwrap();
     }
 
     // Catches exiting nonzero without telling the operator how to invoke us.
@@ -2301,13 +2425,15 @@ mod tests {
         let store = FakeStore {
             result: Err("no such image".to_owned()),
         };
+        let config = resolved();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = run_resolved(&resolved(), &runner, &store, &mut stdout, &mut stderr);
+        let code = run_resolved(&config, &runner, &store, &mut stdout, &mut stderr);
 
         assert_eq!(code, RUNTIME_EXIT);
         assert!(!stderr.is_empty());
+        std::fs::remove_dir_all(&config.store).unwrap();
     }
 
     // Catches reordering build, import, and tag, or printing anything but
@@ -2581,6 +2707,181 @@ mod tests {
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
         assert_eq!(stdout, b"TAG\tDIGEST\n");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches the AGE column drifting between units: boundaries must fold
+    // seconds into minutes, hours, and days without dropping or duplicating.
+    #[test]
+    fn ps_age_folds_into_the_shortest_unit() {
+        assert_eq!(format_age(0), "0s");
+        assert_eq!(format_age(59), "59s");
+        assert_eq!(format_age(119), "119s");
+        assert_eq!(format_age(120), "2m");
+        assert_eq!(format_age(7_199), "119m");
+        assert_eq!(format_age(7_200), "2h");
+        assert_eq!(format_age(172_799), "47h");
+        assert_eq!(format_age(172_800), "2d");
+        assert_eq!(format_age(30_000_000), "347d");
+    }
+
+    // Catches `ps` printing phantom rows or failing for an empty store
+    // instead of the header alone.
+    #[test]
+    fn ps_prints_header_only_for_an_empty_store() {
+        let root = temp_store_root("ps-empty");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("ps"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout, b"INSTANCE\tPID\tIMAGE\tSTATE\tAGE\n");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches `ps` hiding state or reordering columns: a known row prints
+    // its identity and status, a corrupt row keeps only its id, and every
+    // row stays on the documented five-column layout.
+    #[test]
+    fn ps_lists_live_stale_and_corrupt_rows() {
+        let root = temp_store_root("ps-rows");
+        let dir = InstanceDir::open(&root).unwrap();
+        let own = std::process::id();
+        dir.register("hello", own).unwrap();
+        std::fs::write(
+            root.join("run").join("i-4294967294.state"),
+            b"minicontainer-state-v1\npid=4294967294\ntoken=1\ncomm=dead\nimage=gone\nstarted=0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("run").join("i-junk.state"), b"\x00\xffnope").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("ps"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        let text = String::from_utf8(stdout).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "INSTANCE\tPID\tIMAGE\tSTATE\tAGE");
+        assert_eq!(lines.len(), 4);
+        let live = format!("i-{own}\t{own}\thello\tlive");
+        for line in &lines[1..] {
+            let columns: Vec<&str> = line.split('\t').collect();
+            assert_eq!(columns.len(), 5, "a ps row must keep five columns: {line}");
+            if line.starts_with(&live) {
+                assert!(columns[4].ends_with('s'), "a fresh row ages in seconds");
+            } else if line.starts_with("i-4294967294") {
+                assert_eq!(
+                    &columns[..4],
+                    ["i-4294967294", "4294967294", "gone", "stale"]
+                );
+            } else {
+                assert_eq!(*line, "i-junk\t-\t-\tcorrupt\t-");
+            }
+        }
+        assert!(text.contains(&live));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches `ps` treating an unsafe store as success or as a usage error.
+    #[test]
+    #[cfg(unix)]
+    fn ps_fails_for_an_unsafe_store() {
+        use std::os::unix::fs::symlink;
+
+        let target = temp_store_root("ps-target");
+        let link = temp_store_root("ps-link");
+        std::fs::remove_dir_all(&link).unwrap();
+        symlink(&target, &link).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("ps"),
+                OsString::from("--store"),
+                link.clone().into_os_string(),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8_lossy(&stderr).contains("instance state"));
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+    }
+
+    // Catches a missing HOME reaching the `ps` table as a store failure.
+    #[test]
+    fn ps_maps_a_missing_default_store_to_usage_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main([OsString::from("ps")], &UnusedEnv, &mut stdout, &mut stderr);
+
+        assert_eq!(code, USAGE_EXIT);
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8_lossy(&stderr).contains("usage: minictr run"));
+    }
+
+    // Catches ps output write or flush failures being reported as success.
+    #[test]
+    fn ps_maps_output_failures_to_host_error() {
+        let root = temp_store_root("ps-writes");
+        let resolved = ResolvedPs {
+            store: root.clone(),
+        };
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            ps_resolved(
+                &resolved,
+                &mut FailingWriter {
+                    message: "ps write broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to write stdout"));
+
+        let mut stderr = Vec::new();
+        assert_eq!(
+            ps_resolved(
+                &resolved,
+                &mut FlushFailingWriter {
+                    buffered: Vec::new(),
+                    message: "ps flush broken",
+                },
+                &mut stderr,
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("failed to flush stdout"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

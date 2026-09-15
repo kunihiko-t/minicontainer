@@ -5,10 +5,11 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`ps`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
+usage: minictr ps [--store PATH]
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image import [--store PATH] IMAGE FILE
@@ -50,6 +51,7 @@ FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う�
 `image export`はIMAGEを一つ取り、`--store`と必須の`--output`を前後どこに置いてもよい。
 `--output`の値は`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
+`ps`もpositionalを取らず、`--store`だけを一度だけ指定できる。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image remove`もIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image prune`はpositionalを取らず、`--store`と値なしflagの`--dry-run`と`--force`だけを一度ずつ指定できる。
@@ -66,6 +68,7 @@ DIRもOS pathとして非UTF-8 byteを透過的に扱う。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
 `image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`のstore解決も同じ順序を使う。
+`ps`も同じ順序でstoreを解決する。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
 
 ## imageの登録
@@ -136,6 +139,24 @@ elf-bytes: 4096
 
 manifest引数の内容は表示せず、件数だけを表示する。
 未参照のtagは一覧に出るが、同じtagのinspectは`resolve`経由で失敗する。
+
+## instanceの確認
+
+`run`はQEMU起動直後にstoreの`run/`へinstance stateを記録し、終了時に消す。
+`ps`は残っているstate fileを読み、次のようにheaderと5列の一覧を出す。
+instanceがなければheaderだけを出す。
+
+```text
+INSTANCE	PID	IMAGE	STATE	AGE
+i-40231	40231	myapp	live	12s
+```
+
+`INSTANCE`は`i-<pid>`の形の公開名であり、`PID`は記録されたQEMU childのprocess ID、`IMAGE`はrunに使ったtag、`AGE`は記録からの経過時間を`s`、`m`、`h`、`d`へ畳んだ値である。
+`STATE`は`live` (記録pidが同じprocessとして生存)、`stale` (pidの死亡または再利用)、`corrupt` (parse不能またはsymlinkのfile) のいずれかである。
+corrupt行は識別子だけを出し、残りの列を`-`で埋める。
+一覧はid順であり、観測だけを行い、staleやcorruptのfileを削除しない。
+削除は次のrunが通常cleanupで行うか、利用者がfileを直接消す。
+file形式とpid identityの照合は[instance state](../reference/instance-state.md)を参照する。
 
 ## 実行前の診断
 
@@ -230,6 +251,8 @@ run途中の書き込みやフラッシュ失敗はconsumer失敗としてrunを
 ランタイムがエラーを返した場合、中断前に書き出した分は残るが、残りの出力は届かない。
 実行中のSIGINT (Ctrl-Cを含む) とSIGTERMは`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののち必要ならgroup全体へSIGKILLで回収する。
 grace中の2回目以降のsignalは即座に強制回収へ進み、guestのExit受信後に届いたsignalは確定済みのguest結果を返す。
+runはQEMU起動直後にinstance stateをstoreへ記録し、終了時のcleanupで消す。state directoryを開けないstoreではrunを始めない。
+crashで残ったinstanceは`ps`で確認できる。
 E2Eのhappy pathは同梱ゲストを`image build`、`image inspect`、`run`へ一続きで通し、このflow全体を公開CLIで検証する。
 割り込み経路はgroup宛のSIGINTと`minictr`のPIDだけへのSIGTERMを別々に検査し、どちらも125終了とQEMU・一時領域の非残留を確認する。
 
@@ -246,6 +269,7 @@ timeout、QEMU失敗、guest failure、protocol破損、実行中のSIGINT/SIGTE
 `image export`では、image解決失敗、digest検証失敗、出力先の存在、書き出し失敗が終了code 125になり、成功表示は出さない。
 `image export`のparse失敗、`--output`の不足、store pathの既定値解決失敗は終了code 2になる。
 `image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
+`ps`では、instance stateのopen・一覧失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
 `doctor`は全検査の成功で終了code 0、一つでも失敗したら終了code 1になる。
 `doctor`のparse失敗と既定値解決失敗は終了code 2、出力失敗は終了code 125になる。
 `image remove`では、tag不在とstore失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。

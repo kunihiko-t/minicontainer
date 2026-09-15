@@ -34,6 +34,7 @@ timeout、QEMU失敗、guest failure、protocol破損、実行中のSIGINT/SIGTE
 - `guest reported an error`を含む行はguest自身の実行失敗である。
 - `runtime session failed: QEMU exited unsuccessfully`を含む行はExit後のQEMU非0終了である。
 - `run interrupted by SIGINT`または`run interrupted by SIGTERM`を含む行はhostが受け取ったsignalによる中断である。
+- `instance state failed`を含む行はinstance stateの記録または削除の失敗である。storeの`run/`の権限とsymlinkを確認する。
 - `guest output exceeds 1 MiB`を含む行は出力合計の上限超過である。
 - `guest output consumer failed`を含む行は、run途中の標準出力・標準エラー出力への書き出し失敗である。QEMU回収とpayload削除は行われる。
 - `; cleanup also failed`を含む行は、主操作に加えて後始末も失敗したことを示す。
@@ -89,6 +90,10 @@ QEMUは`minictr`とは別のprocess groupにいるため、端末のCtrl-Cや`mi
 guestのExit受信後に届いたsignalは確定済みのguest結果を返し、Exit前の中断は`run interrupted by`診断と終了code 125で終わる。
 中断経路の検証では、125終了と診断に加えてQEMUと一時領域の残留がないことを確認する。
 `SIGKILL`は捕捉できないため、強制終了されたrunの後始末は保証しない。
+
+強制終了で残ったinstanceはstoreの`run/`にstate fileが残り、孤児になったQEMUが生きていれば`minictr ps`でlive、死んでいればstaleと表示される。
+`ps`は観測だけを行い削除しないため、残ったfileとQEMUは利用者が片付ける。
+crash経路の検証では、`minictr`のSIGKILLとQEMUのkillのあと`ps`がstaleを表示することを確認する。
 
 ## 出力合計の上限
 
