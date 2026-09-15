@@ -18,6 +18,9 @@ Ubuntu CIの`check`とmacOS CIの`check-host`も同じcommitで成功させる�
 Ubuntu CIは配布archiveのsmokeも実行するため、その成功も確認する。
 tag、Cargo package version、archive名のversionは一致させる。
 
+releaseに含まれる契約変更は、release notesでbreakingと互換に分類して記載する。
+分類の基準は[互換性と移行の方針](compatibility.md)に従い、Ubuntu CIの互換性fixture検証が同じcommitで成功していることを確認する。
+
 ## 配布内容
 
 matrixは`macos-15`と`ubuntu-24.04`であり、成果物名のtargetは`aarch64-apple-darwin`と`x86_64-unknown-linux-gnu`である。

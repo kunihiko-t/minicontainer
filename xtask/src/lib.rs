@@ -445,6 +445,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compatibility_fixture_remains_accepted_at_its_pinned_digest() {
+        let fixture = workspace_root().join("tests/fixtures/compat/minibundle-abi-v1.0.mcb");
+        let bytes = std::fs::read(&fixture).expect("compat fixture must be checked in");
+        let bundle = minicontainer_bundle::parse(&bytes)
+            .expect("a bundle built under ABI v1.0 must stay importable");
+        assert_eq!(
+            minicontainer_bundle::format_digest(bundle.header.digest),
+            "f8200f06e25dcb0f36a744b780c0fa1b40030c9a6bb9786b122cad44cad221ff"
+        );
+        assert_eq!(bundle.manifest.name(), "hello");
+    }
+
+    #[test]
     fn check_runs_reproducible_release_gate_in_order() {
         assert_eq!(
             check_phases(),

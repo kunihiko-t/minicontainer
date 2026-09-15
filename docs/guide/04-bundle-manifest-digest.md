@@ -9,6 +9,7 @@ MiniBundle v1は、96 byte header、UTF-8 manifest、zero padding、静的RISC-V
 headerはmagic `MINICTR\0`、ABI version 1.2、全体長、manifest範囲、ELF範囲、SHA-256 digestを持つ。
 manifestはheader直後のoffset 96から始まり、ELFは8 byte境界に揃える。
 bundle全体の上限は6 MiBである。
+旧minorでbuildされたbundleの受理とdigestの扱いは[互換性と移行の方針](../reference/compatibility.md)に従う。
 
 `build`は同じ入力から同じbytesを作る。
 `parse`はheader、申告長と実長の一致、digest、paddingのzero、manifestを順に検証する。

@@ -307,6 +307,8 @@ processを止めたか既に居なかったかにかかわらず、残骸の回�
 `image prune`では、候補検出失敗、再確認失敗、削除の部分失敗、出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
 再参照によるskipは失敗ではない。
 
+subcommandとflag、stdout契約行、終了codeの変更規則は[互換性と移行の方針](../reference/compatibility.md)に従う。
+
 ## 失敗の調べ方
 
 実行前に`doctor`で環境を確認し、`fail`行の`fix:`に従う。

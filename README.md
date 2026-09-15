@@ -244,6 +244,7 @@ gh attestation verify 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz' 
 設計の全体像は[アーキテクチャ](docs/design/architecture.md)に記載している。
 学習の入口は[ガイド索引](docs/guide/README.md)である。
 ゲストとの境界と制約は[脅威モデル](docs/reference/threat-model.md)で確認できる。
+公開契約の変更ルールは[互換性と移行の方針](docs/reference/compatibility.md)が定める。
 実装済みの節目と次の実装順は[ロードマップ](docs/reference/roadmap.md)に記載している。
 
 ## 制約とセキュリティー
