@@ -56,6 +56,35 @@ impl QemuCommand {
         payload: impl AsRef<Path>,
         resources: QemuResources,
     ) -> Result<Self, RuntimeError> {
+        Self::build(kernel, payload, resources, OsStr::new("stdio"))
+    }
+
+    /// detached run用のcommand。serialはpipeではなく`uart`のfileへ書き、
+    /// 戻った後のhostが観測しないstdoutをQEMUが握り続けないようにする。
+    ///
+    /// `uart`は`-serial file:...`へ展開されるため、`,`を含むpathはpayloadと
+    /// 同じ理由で拒否する。
+    pub fn new_detached(
+        kernel: impl AsRef<Path>,
+        payload: impl AsRef<Path>,
+        resources: QemuResources,
+        uart: impl AsRef<Path>,
+    ) -> Result<Self, RuntimeError> {
+        let uart = uart.as_ref();
+        if uart.as_os_str().to_string_lossy().contains(',') {
+            return Err(RuntimeError::UnsafePayloadPath(uart.to_path_buf()));
+        }
+        let mut serial = OsString::from("file:");
+        serial.push(uart.as_os_str());
+        Self::build(kernel, payload, resources, &serial)
+    }
+
+    fn build(
+        kernel: impl AsRef<Path>,
+        payload: impl AsRef<Path>,
+        resources: QemuResources,
+        serial: &OsStr,
+    ) -> Result<Self, RuntimeError> {
         let payload = payload.as_ref();
         if payload.as_os_str().to_string_lossy().contains(',') {
             return Err(RuntimeError::UnsafePayloadPath(payload.to_path_buf()));
@@ -80,7 +109,7 @@ impl QemuCommand {
             OsStr::new("-device"),
             loader.as_os_str(),
             OsStr::new("-serial"),
-            OsStr::new("stdio"),
+            serial,
             OsStr::new("-monitor"),
             OsStr::new("none"),
             OsStr::new("-display"),

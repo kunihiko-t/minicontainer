@@ -2,7 +2,7 @@ use std::{error::Error, fmt, io, path::PathBuf};
 
 use minicontainer_bundle::BundleError;
 
-use crate::{HostSignal, InstanceError, ProcessError, SessionError};
+use crate::{HostSignal, InstanceError, ProcessError, ProcessStatus, SessionError};
 
 /// runの後始末中に追加で起きた失敗。
 #[derive(Debug)]
@@ -54,6 +54,14 @@ pub enum RuntimeError {
     Session(SessionError),
     /// 逐次転送先のconsumerがchunkの受け取りに失敗した。
     Consumer(io::Error),
+    /// detached起動のhandshake中に、guest Readyを観測する前にQEMUが
+    /// 終了した。instanceは成立せず、残骸は回収済みである。
+    DetachedBoot {
+        /// QEMUが報告した終了状態。
+        status: ProcessStatus,
+        /// `qemu.log`末尾の診断。空のこともある。
+        diagnostics: String,
+    },
     /// hostがSIGINTまたはSIGTERMを受け取り、runを中断した。
     Interrupted(HostSignal),
     /// 主操作の失敗を維持したまま、後始末でも失敗した。
@@ -89,6 +97,20 @@ impl fmt::Display for RuntimeError {
             Self::Consumer(error) => {
                 write!(formatter, "guest output consumer failed: {error}")
             }
+            Self::DetachedBoot {
+                status,
+                diagnostics,
+            } => {
+                write!(
+                    formatter,
+                    "QEMU exited before the guest was ready (code {:?})",
+                    status.code
+                )?;
+                if !diagnostics.is_empty() {
+                    write!(formatter, "; qemu: {diagnostics}")?;
+                }
+                Ok(())
+            }
             Self::Interrupted(signal) => {
                 write!(formatter, "run interrupted by {}", signal.name())
             }
@@ -118,7 +140,7 @@ impl Error for RuntimeError {
             Self::UnsafePayloadPath(_) => None,
             Self::Io(error) | Self::Consumer(error) => Some(error),
             Self::Instance(error) => Some(error),
-            Self::Interrupted(_) => None,
+            Self::DetachedBoot { .. } | Self::Interrupted(_) => None,
             Self::Process(error) => Some(error),
             Self::Session(error) => Some(error),
             Self::Cleanup { primary, .. } => Some(primary),

@@ -144,12 +144,13 @@ cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/r
 
 ## 現在の機能と制限
 
-`minictr`が実装するコマンドは`run`、`ps`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`ps`、`stop`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
-usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
+usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
 usage: minictr ps [--store PATH]
+usage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image import [--store PATH] IMAGE FILE
@@ -172,6 +173,8 @@ usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 `image export`はタグまたは`sha256:`付きdigestで解決したbundleを検証して`--output`へ書き出す。出力先の上書きはしない。
 `image list`はタグの一覧、`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
 `ps`はrunが記録したinstanceを`live`、`stale`、`corrupt`の状態つきで一覧する。形式は[instance state](docs/reference/instance-state.md)を参照する。
+`run --detach`はguestの`Ready`を確認してinstance idだけを出して終わり、QEMUをsupervisorなしで残す。guest出力はpayload directoryの`uart.log`へ落ち、guestの終了は誰も観測しないため`ps`は`stop`まで`live`を出し続ける。
+`stop`はpid identityを照合してからQEMUのprocess groupへSIGTERMを送り、2秒のgrace (既定値、`--timeout-ms`で変更) の後も残ればSIGKILLし、payload directoryとstate fileを回収してinstance idを標準出力へ出す。
 `doctor`はQEMUのversion、kernel file、store rootを診断し、各検査の`ok`または`fail`と`summary`の4行を標準出力へ出す。全検査の成功で終了コード0、一つでも失敗したら終了コード1になり、診断自体は環境を変更しない。
 `image remove`は指定タグだけを削除して`IMAGE removed`と出し、blobと他のタグは保持する。存在しないタグは型付きエラーで失敗する。
 `image prune`は未参照blobの検出だけが既定動作であり、`--force`の指定時だけ削除する。削除前に参照を再確認し、部分失敗は個別に報告する。

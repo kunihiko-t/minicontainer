@@ -323,6 +323,16 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         crashed.elapsed.as_secs_f64()
     ));
 
+    log("e2e: detached path (run -d prints an id, stop collects it)");
+    let detached = run_detached_path(&minictr, &kernel)?;
+    log(&format!(
+        "e2e: detached path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
+        detached.minictr_pid,
+        detached.qemu_before,
+        detached.qemu_after,
+        detached.elapsed.as_secs_f64()
+    ));
+
     Ok(transcript)
 }
 
@@ -1154,6 +1164,120 @@ fn run_orphan_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError
         let _ = signal_process(pid, libc::SIGKILL);
     }
     // crashが残したpayload directoryはharnessが除去してから残留検査へ。
+    remove_stray_payloads(&payload_before);
+    let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
+    let completed = outcome?;
+    Ok(CaseReport {
+        minictr_pid: completed.pid,
+        qemu_before,
+        qemu_after,
+        elapsed,
+        status: completed.status.code(),
+        stdout: completed.stdout,
+        stderr: completed.stderr,
+    })
+}
+
+/// detached runの契約: `run --detach`はguest Readyを確認してからinstance
+/// idだけを出力して終了し、QEMUはhostの後も生き続ける。`stop`はそのidを
+/// echoし、QEMUとpayloadとstate fileを回収する。
+fn run_detached_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
+    let store = prepare_store(&spin_elf_bytes())?;
+    let store_path = store.path.clone();
+    let qemu_before = qemu_pids()?;
+    let payload_before = payload_temp_leftovers();
+    let started = Instant::now();
+    let mut qemu_pid = None;
+    let outcome = (|| {
+        let completed = run_minictr_with_extra_args(
+            minictr,
+            &store.path,
+            kernel,
+            HAPPY_PATH_TIMEOUT_MS,
+            E2E_IMAGE,
+            &[OsString::from("--detach")],
+        )?;
+        if !completed.status.success() {
+            return Err(E2EError::UnexpectedRun {
+                case: "detached run exit",
+                expected: "exit 0 with an instance id".to_owned(),
+                actual: format!(
+                    "status {:?} (stderr: {})",
+                    completed.status.code(),
+                    String::from_utf8_lossy(&completed.stderr)
+                ),
+            });
+        }
+        // stdoutはid一行だけである。`i-<pid>`の形と、psがliveを示すことを
+        // 検査する。
+        let id = String::from_utf8_lossy(&completed.stdout).trim().to_owned();
+        let pid = id
+            .strip_prefix("i-")
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .filter(|pid| id == format!("i-{pid}"));
+        let Some(pid) = pid else {
+            return Err(E2EError::UnexpectedRun {
+                case: "detached run output",
+                expected: "a bare i-<pid> instance id".to_owned(),
+                actual: format!(
+                    "stdout: {:?}, stderr: {}",
+                    String::from_utf8_lossy(&completed.stdout),
+                    String::from_utf8_lossy(&completed.stderr)
+                ),
+            });
+        };
+        qemu_pid = Some(pid);
+        wait_for_ps_row(minictr, &store_path, pid, "live")?;
+        // `stop`はidをechoして0で終わる。QEMUはorphanとしてlaunchdに
+        // reapされるため、stop内の消失待ちは実経路どおりに動く。
+        let stop_args = [
+            OsString::from("stop"),
+            OsString::from("--store"),
+            store_path.as_os_str().to_owned(),
+            OsString::from(&id),
+        ];
+        let stopped = run_with_timeout(minictr, &stop_args, None, &[], COMMAND_TIMEOUT)?;
+        if !stopped.status.success() || String::from_utf8_lossy(&stopped.stdout).trim() != id {
+            return Err(E2EError::UnexpectedRun {
+                case: "detached stop",
+                expected: format!("exit 0 echoing {id}"),
+                actual: format!(
+                    "status {:?} (stdout: {:?}, stderr: {})",
+                    stopped.status.code(),
+                    String::from_utf8_lossy(&stopped.stdout),
+                    String::from_utf8_lossy(&stopped.stderr)
+                ),
+            });
+        }
+        // state fileが消えた後はps行も消える。QEMU自体はstopがESRCHまで
+        // 待った時点で既に死んでいる。
+        let ps = run_with_timeout(
+            minictr,
+            &[
+                OsString::from("ps"),
+                OsString::from("--store"),
+                store_path.as_os_str().to_owned(),
+            ],
+            None,
+            &[],
+            COMMAND_TIMEOUT,
+        )?;
+        if String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .any(|line| line.starts_with(&id))
+        {
+            return Err(E2EError::UnexpectedRun {
+                case: "detached post-stop ps",
+                expected: "no instance rows".to_owned(),
+                actual: format!("ps output: {}", String::from_utf8_lossy(&ps.stdout)),
+            });
+        }
+        Ok(completed)
+    })();
+    let elapsed = started.elapsed();
+    if let Some(pid) = qemu_pid {
+        let _ = signal_process(pid, libc::SIGKILL);
+    }
     remove_stray_payloads(&payload_before);
     let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
     let completed = outcome?;

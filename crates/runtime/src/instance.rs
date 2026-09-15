@@ -21,9 +21,9 @@ const STATE_VERSION: &[u8] = b"minicontainer-state-v1\n";
 /// state fileの上限。version行と4行のfieldを超える正当な内容は存在しない。
 const MAX_STATE_LEN: u64 = 1024;
 /// instance file名の接頭辞。
-const INSTANCE_PREFIX: &str = "i-";
+pub(crate) const INSTANCE_PREFIX: &str = "i-";
 /// instance file名の接尾辞。
-const STATE_SUFFIX: &str = ".state";
+pub(crate) const STATE_SUFFIX: &str = ".state";
 /// image labelの上限byte数。
 const MAX_IMAGE_LEN: usize = 128;
 /// comm名の上限byte数。kernelの`comm`は15byteへ切り詰められるため、
@@ -61,6 +61,10 @@ pub struct InstanceState {
     pub image: String,
     /// state作成時点のunix epoch秒。`ps`のAGE列の起点。
     pub started: u64,
+    /// run用に作られたpayload一時directory。`stop`が回収する対象であり、
+    /// `minicontainer-run-*`のbasenameとTMPDIR直下という形状を検査して
+    /// からでないと削除に使えない。
+    pub payload: PathBuf,
 }
 
 /// `minictr ps`が表示する一行。
@@ -211,6 +215,10 @@ impl InstanceDir {
     /// 繰り返す。fork直後のchildはexec完了まで親のcommを引き継ぐため、
     /// この確認を省くと消えてしまう名前を記録して永久にstaleと誤判定する。
     ///
+    /// `payload`はこのrun用の一時directoryであり、後の`stop`が回収対象を
+    /// 知るために記録する。改行を含む・非UTF-8・相対pathはstate fileへ
+    /// 書けないため`UnsafePath`で拒否する。
+    ///
     /// process identityを取得できないplatform、既に死亡したprocess、期限
     /// 内に期待するcommへexecしなかったprocessは`UnverifiableProcess`で
     /// 拒否する。fileはatomicに置き換わるため、再利用されたpidのstale
@@ -220,8 +228,13 @@ impl InstanceDir {
         image: &str,
         pid: u32,
         program: &OsStr,
+        payload: &Path,
     ) -> Result<InstanceHandle, InstanceError> {
         validate_image(image)?;
+        let payload_text = payload.to_str().filter(|text| !text.contains('\n'));
+        let payload = payload_text
+            .and_then(validate_payload)
+            .ok_or(InstanceError::UnsafePath)?;
         let expected = expected_comm(program).ok_or(InstanceError::UnverifiableProcess)?;
         let deadline = Instant::now() + EXEC_PROBE_BUDGET;
         let identity = loop {
@@ -247,6 +260,7 @@ impl InstanceDir {
             comm: identity.comm,
             image: image.to_owned(),
             started: epoch_secs(),
+            payload,
         };
         let id = format!("{INSTANCE_PREFIX}{pid}");
         let path = self.root.join(format!("{id}{STATE_SUFFIX}"));
@@ -278,37 +292,79 @@ impl InstanceDir {
             }
             // 公開名は`i-<pid>`で、file名から`.state`を除いた部分である。
             let id = name[..name.len() - STATE_SUFFIX.len()].to_owned();
-            let path = entry.path();
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            // symlinkのfileは追従せずcorruptとして見せる。
-            if metadata.file_type().is_symlink() || metadata.len() > MAX_STATE_LEN {
-                rows.push(InstanceRow::Corrupt { id });
-                continue;
+            if let Some(row) = read_row(id, &entry.path())? {
+                rows.push(row);
             }
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => {
-                    rows.push(InstanceRow::Corrupt { id });
-                    continue;
-                }
-            };
-            rows.push(match InstanceState::parse(&bytes) {
-                Some(state) => InstanceRow::Known {
-                    id,
-                    status: status_of(&state),
-                    state,
-                },
-                None => InstanceRow::Corrupt { id },
-            });
         }
         rows.sort_by(|left, right| row_id(left).cmp(row_id(right)));
         Ok(rows)
     }
+
+    /// 一つのinstance idのstate fileを読む。登録のないid、`i-<pid>`の
+    /// 形を持たないid、listとの間で消えたfileは`None`であり、corruptな
+    /// fileは`Corrupt`行として返す。
+    pub fn lookup(&self, id: &str) -> Result<Option<InstanceRow>, InstanceError> {
+        let Some(path) = self.state_path(id) else {
+            return Ok(None);
+        };
+        read_row(id.to_owned(), &path)
+    }
+
+    /// idが`i-<pid>`のcanonicalな形を持つときだけstate fileのpathを返す。
+    /// この形以外のfile名はinstance stateとして存在し得ないため、lookup
+    /// の対象にもpath escapeの入口にもならない。
+    pub(crate) fn state_path(&self, id: &str) -> Option<PathBuf> {
+        let digits = id.strip_prefix(INSTANCE_PREFIX)?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        // `i-042`やu32に収まらない値はcanonicalなidではない。
+        let pid = digits.parse::<u32>().ok()?;
+        if id != format!("{INSTANCE_PREFIX}{pid}") {
+            return None;
+        }
+        Some(self.root.join(format!("{id}{STATE_SUFFIX}")))
+    }
+
+    /// idのstate fileを消す。handleを持たない停止経路 (例: `stop`) が
+    /// 使い、既に無いfileの削除は成功として扱う。
+    pub(crate) fn remove_state(&self, id: &str) -> Result<(), InstanceError> {
+        let Some(path) = self.state_path(id) else {
+            return Ok(());
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// 一つのstate fileを行へ読み上げる。fileが無い・読み取り中に消えた場合は
+/// `None`、symlinkや上限超過・parse不能は`Corrupt`行として返す。
+pub(crate) fn read_row(id: String, path: &Path) -> Result<Option<InstanceRow>, InstanceError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // symlinkのfileは追従せずcorruptとして見せる。
+    if metadata.file_type().is_symlink() || metadata.len() > MAX_STATE_LEN {
+        return Ok(Some(InstanceRow::Corrupt { id }));
+    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(Some(InstanceRow::Corrupt { id })),
+    };
+    Ok(Some(match InstanceState::parse(&bytes) {
+        Some(state) => InstanceRow::Known {
+            id,
+            status: status_of(&state),
+            state,
+        },
+        None => InstanceRow::Corrupt { id },
+    }))
 }
 
 fn row_id(row: &InstanceRow) -> &str {
@@ -321,7 +377,7 @@ fn row_id(row: &InstanceRow) -> &str {
 /// commが記録と一致するprocessだけがliveであり、死亡も再利用もstaleである。
 /// exec途中のprocessは一瞬identityを読めないため、transientな失敗は短く
 /// 再試行してからstaleへ倒す。
-fn status_of(state: &InstanceState) -> InstanceStatus {
+pub(crate) fn status_of(state: &InstanceState) -> InstanceStatus {
     let deadline = Instant::now() + STATUS_PROBE_BUDGET;
     loop {
         match probe_identity(state.pid) {
@@ -368,10 +424,22 @@ fn epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// state fileの`payload=`行に書けるpathかを検査する。絶対pathで上限内で
+/// あることだけを要求し、実際に削除してよいかの判断は`stop`がbasenameと
+/// 親dirで別途行う。
+fn validate_payload(text: &str) -> Option<PathBuf> {
+    const MAX_PAYLOAD_LEN: usize = 1024;
+    if text.is_empty() || text.len() > MAX_PAYLOAD_LEN {
+        return None;
+    }
+    let path = PathBuf::from(text);
+    path.is_absolute().then_some(path)
+}
+
 impl InstanceState {
     /// canonical text形式へ書き出す。行の順序はparse側が要求する順序と
     /// 常に一致する。
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(STATE_VERSION);
         bytes.extend_from_slice(format!("pid={}\n", self.pid).as_bytes());
@@ -379,6 +447,7 @@ impl InstanceState {
         bytes.extend_from_slice(format!("comm={}\n", self.comm).as_bytes());
         bytes.extend_from_slice(format!("image={}\n", self.image).as_bytes());
         bytes.extend_from_slice(format!("started={}\n", self.started).as_bytes());
+        bytes.extend_from_slice(format!("payload={}\n", self.payload.to_string_lossy()).as_bytes());
         bytes
     }
 
@@ -396,6 +465,7 @@ impl InstanceState {
             validate_image(text).ok().map(|()| text.to_owned())
         })?;
         let started = parse_field(lines.next(), b"started=", |text| text.parse::<u64>().ok())?;
+        let payload = parse_field(lines.next(), b"payload=", validate_payload)?;
         // 最後の改行の後に残るもの、または余分な行は受け付けない。
         if lines.next() != Some(b"") || lines.next().is_some() {
             return None;
@@ -406,6 +476,7 @@ impl InstanceState {
             comm,
             image,
             started,
+            payload,
         })
     }
 }
@@ -422,16 +493,16 @@ fn parse_field<'a, T>(
 }
 
 /// 同じpidのprocessを再利用と区別するための記録。
-struct ProcessIdentity {
+pub(crate) struct ProcessIdentity {
     /// process開始時刻のopaque値。単位はplatformごとに異なり、同じplatform
     /// の記録どうしの一致だけを見る。
-    token: u64,
+    pub(crate) token: u64,
     /// 実行file名。kernelが15byteへ切り詰めた値。
-    comm: String,
+    pub(crate) comm: String,
 }
 
 /// identity probe一回分の結果。
-enum Probe {
+pub(crate) enum Probe {
     /// pidが存在し、identityを読めた。
     Found(ProcessIdentity),
     /// pidのprocessは存在しない。再試行しても回復しない。
@@ -451,7 +522,7 @@ fn expected_comm(program: &OsStr) -> Option<&[u8]> {
 
 /// identityの一回分の読み取り。読めなかった理由は呼び出し側がpidの生死で
 /// 分けるため、失敗は`None`に畳む。
-fn probe_identity(pid: u32) -> Probe {
+pub(crate) fn probe_identity(pid: u32) -> Probe {
     match platform_identity(pid) {
         Some(identity) => Probe::Found(identity),
         // 読み取り失敗がexec途中のtransientか本当の死亡かはpidの存在で
@@ -464,7 +535,7 @@ fn probe_identity(pid: u32) -> Probe {
 /// pidのprocessが存在するか。`kill(pid, 0)`はsignalを送らず存否だけを
 /// 返し、ESRCHが不存在、成功とEPERMが存在を示す。
 #[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     // SAFETY: signal 0は配送されず、pidの存否確認だけに使う。
     if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
         return true;
@@ -473,7 +544,7 @@ fn process_exists(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_exists(_pid: u32) -> bool {
+pub(crate) fn process_exists(_pid: u32) -> bool {
     false
 }
 
@@ -658,6 +729,12 @@ mod tests {
         env::current_exe().expect("the test binary path must exist")
     }
 
+    /// state fileへ記録するpayload dirの形だけを持つpath。registerは中身を
+    /// 見ずtextとして書くだけなので、実在しなくてよい。
+    fn payload_dir() -> PathBuf {
+        env::temp_dir().join("minicontainer-run-test-0")
+    }
+
     fn spawn_sleeper() -> Child {
         Command::new(env::current_exe().expect("the test binary path must exist"))
             .args([
@@ -684,12 +761,13 @@ mod tests {
             comm: "qemu-system-ris".to_owned(),
             image: "hello".to_owned(),
             started: 1_726_531_200,
+            payload: PathBuf::from("/tmp/minicontainer-run-4242-0"),
         };
 
         let text = String::from_utf8(state.encode()).unwrap();
         assert_eq!(
             text,
-            "minicontainer-state-v1\npid=4242\ntoken=9999999\ncomm=qemu-system-ris\nimage=hello\nstarted=1726531200\n"
+            "minicontainer-state-v1\npid=4242\ntoken=9999999\ncomm=qemu-system-ris\nimage=hello\nstarted=1726531200\npayload=/tmp/minicontainer-run-4242-0\n"
         );
         assert_eq!(InstanceState::parse(text.as_bytes()), Some(state));
     }
@@ -704,6 +782,7 @@ mod tests {
             comm: "qemu".to_owned(),
             image: "img".to_owned(),
             started: 3,
+            payload: PathBuf::from("/tmp/run"),
         }
         .encode();
 
@@ -719,24 +798,24 @@ mod tests {
             ),
             (
                 "extra line",
-                b"minicontainer-state-v1\npid=1\ntoken=2\ncomm=q\nimage=i\nstarted=3\nx=y\n"
+                b"minicontainer-state-v1\npid=1\ntoken=2\ncomm=q\nimage=i\nstarted=3\npayload=/r\nx=y\n"
                     .as_slice(),
             ),
             (
                 "bad pid",
-                b"minicontainer-state-v1\npid=x\ntoken=2\ncomm=q\nimage=i\nstarted=3\n".as_slice(),
+                b"minicontainer-state-v1\npid=x\ntoken=2\ncomm=q\nimage=i\nstarted=3\npayload=/r\n".as_slice(),
             ),
             (
                 "swapped order",
-                b"minicontainer-state-v1\ntoken=2\npid=1\ncomm=q\nimage=i\nstarted=3\n".as_slice(),
+                b"minicontainer-state-v1\ntoken=2\npid=1\ncomm=q\nimage=i\nstarted=3\npayload=/r\n".as_slice(),
             ),
             (
                 "empty image",
-                b"minicontainer-state-v1\npid=1\ntoken=2\ncomm=q\nimage=\nstarted=3\n".as_slice(),
+                b"minicontainer-state-v1\npid=1\ntoken=2\ncomm=q\nimage=\nstarted=3\npayload=/r\n".as_slice(),
             ),
             (
                 "no trailing newline",
-                b"minicontainer-state-v1\npid=1\ntoken=2\ncomm=q\nimage=i\nstarted=3".as_slice(),
+                b"minicontainer-state-v1\npid=1\ntoken=2\ncomm=q\nimage=i\nstarted=3\npayload=/r".as_slice(),
             ),
         ] {
             assert!(
@@ -777,7 +856,7 @@ mod tests {
         let root = TempRoot::create();
         let dir = open_dir(&root);
         assert!(matches!(
-            dir.register("img", u32::MAX - 1, OsStr::new("sleep")),
+            dir.register("img", u32::MAX - 1, OsStr::new("sleep"), &payload_dir()),
             Err(InstanceError::UnverifiableProcess)
         ));
         assert!(dir.list().unwrap().is_empty());
@@ -803,7 +882,7 @@ mod tests {
             .expect("the delayed-exec helper must spawn");
 
         let handle = dir
-            .register("hello", child.id(), OsStr::new("sleep"))
+            .register("hello", child.id(), OsStr::new("sleep"), &payload_dir())
             .unwrap();
 
         let rows = dir.list().unwrap();
@@ -831,7 +910,12 @@ mod tests {
         let dir = open_dir(&root);
         let mut sleeper = spawn_sleeper();
 
-        let result = dir.register("hello", sleeper.id(), OsStr::new("not-the-helper"));
+        let result = dir.register(
+            "hello",
+            sleeper.id(),
+            OsStr::new("not-the-helper"),
+            &payload_dir(),
+        );
 
         assert!(matches!(result, Err(InstanceError::UnverifiableProcess)));
         assert!(dir.list().unwrap().is_empty());
@@ -848,7 +932,12 @@ mod tests {
         let dir = open_dir(&root);
         let mut sleeper = spawn_sleeper();
         let handle = dir
-            .register("hello", sleeper.id(), helper_program().as_os_str())
+            .register(
+                "hello",
+                sleeper.id(),
+                helper_program().as_os_str(),
+                &payload_dir(),
+            )
             .unwrap();
 
         let rows = dir.list().unwrap();
@@ -875,8 +964,13 @@ mod tests {
         let root = TempRoot::create();
         let dir = open_dir(&root);
         let mut sleeper = spawn_sleeper();
-        dir.register("hello", sleeper.id(), helper_program().as_os_str())
-            .unwrap();
+        dir.register(
+            "hello",
+            sleeper.id(),
+            helper_program().as_os_str(),
+            &payload_dir(),
+        )
+        .unwrap();
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
 
@@ -901,6 +995,7 @@ mod tests {
             comm: "not-the-real-comm".to_owned(),
             image: "hello".to_owned(),
             started: 0,
+            payload: payload_dir(),
         };
         fs::write(
             root.0
@@ -971,6 +1066,7 @@ mod tests {
                     comm: "qemu".to_owned(),
                     image: "img".to_owned(),
                     started: counter,
+                    payload: PathBuf::from("/tmp/run"),
                 };
                 super::atomic_write(&writer_path, &state.encode()).unwrap();
                 counter += 1;
@@ -999,7 +1095,12 @@ mod tests {
         let dir = open_dir(&root);
         let mut sleeper = spawn_sleeper();
         let handle = dir
-            .register("hello", sleeper.id(), helper_program().as_os_str())
+            .register(
+                "hello",
+                sleeper.id(),
+                helper_program().as_os_str(),
+                &payload_dir(),
+            )
             .unwrap();
 
         dir.unregister(&handle).unwrap();
@@ -1027,7 +1128,12 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    dir.register(label, sleeper.id(), helper_program().as_os_str()),
+                    dir.register(
+                        label,
+                        sleeper.id(),
+                        helper_program().as_os_str(),
+                        &payload_dir()
+                    ),
                     Err(InstanceError::UnsafeImage)
                 ),
                 "{label:?} must be rejected"

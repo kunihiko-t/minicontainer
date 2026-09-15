@@ -5,11 +5,12 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`ps`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`ps`、`stop`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 
 ```text
-usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
+usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
 usage: minictr ps [--store PATH]
+usage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
 usage: minictr image import [--store PATH] IMAGE FILE
@@ -52,6 +53,9 @@ FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う�
 `--output`の値は`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う。
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
 `ps`もpositionalを取らず、`--store`だけを一度だけ指定できる。
+`run`の`--detach`は値を取らないflagであり、`--detach=値`の付与と重複指定は型付きerrorになる。
+`stop`は`i-<pid>`の形のinstance idを一つ取り、`--store`と`--timeout-ms`を一度ずつ指定できる。
+idの形が合わない引数は型付きerrorであり、state fileを引く前に拒否する。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image remove`もIMAGEを一つ取り、`--store`を前後どこに置いてもよい。
 `image prune`はpositionalを取らず、`--store`と値なしflagの`--dry-run`と`--force`だけを一度ずつ指定できる。
@@ -69,6 +73,7 @@ DIRもOS pathとして非UTF-8 byteを透過的に扱う。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
 `image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`のstore解決も同じ順序を使う。
 `ps`も同じ順序でstoreを解決する。
+`stop`も同じ順序でstoreを解決し、`--timeout-ms`は`run`と同じ検証を受ける。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
 
 ## imageの登録
@@ -155,8 +160,24 @@ i-40231	40231	myapp	live	12s
 `STATE`は`live` (記録pidが同じprocessとして生存)、`stale` (pidの死亡または再利用)、`corrupt` (parse不能またはsymlinkのfile) のいずれかである。
 corrupt行は識別子だけを出し、残りの列を`-`で埋める。
 一覧はid順であり、観測だけを行い、staleやcorruptのfileを削除しない。
-削除は次のrunが通常cleanupで行うか、利用者がfileを直接消す。
+削除は次のrunが通常cleanupで行うか、`stop`が回収する。
 file形式とpid identityの照合は[instance state](../reference/instance-state.md)を参照する。
+
+`run --detach`で起きたinstanceは、hostの`minictr`が終わった後もstate fileを残すため、いつでも`ps`に出る。
+detached QEMUにはsupervisorが居ないため、guestが終了しても行は`stop`まで`live`のままである。
+
+## instanceの停止
+
+`stop`はinstance idを受け取り、記録されたpid identityを照合してからQEMUのprocess groupへSIGTERMを送る。
+既定2秒 (`--timeout-ms`で変更) のgraceの後も残ればSIGKILLし、processが消えるまで待ってからpayload directoryとstate fileを消す。
+成功するとinstance idの一行だけを標準出力へ出して終了code 0になる。
+
+```text
+i-40231
+```
+
+記録されたprocessが既に居ない場合はsignalを送らず、残骸だけを回収して`was already gone`を標準エラー出力へ出して0で終わる。
+state fileが無いidは終了code 125、corruptなfileはprocessにもfileにも触れず125で終わる。
 
 ## 実行前の診断
 
@@ -252,7 +273,8 @@ run途中の書き込みやフラッシュ失敗はconsumer失敗としてrunを
 実行中のSIGINT (Ctrl-Cを含む) とSIGTERMは`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののち必要ならgroup全体へSIGKILLで回収する。
 grace中の2回目以降のsignalは即座に強制回収へ進み、guestのExit受信後に届いたsignalは確定済みのguest結果を返す。
 runはQEMU起動直後にinstance stateをstoreへ記録し、終了時のcleanupで消す。state directoryを開けないstoreではrunを始めない。
-crashで残ったinstanceは`ps`で確認できる。
+crashで残ったinstanceは`ps`で確認でき、`stop`で回収できる。
+`--detach`を付けたrunはguestの`Ready`を確認してからinstance idだけを出して終わり、QEMU・state file・payload directoryを残す。guestの出力はpayload directory内の`uart.log`と`qemu.log`へ落ち、標準出力・標準エラー出力には何も流れない。
 E2Eのhappy pathは同梱ゲストを`image build`、`image inspect`、`run`へ一続きで通し、このflow全体を公開CLIで検証する。
 割り込み経路はgroup宛のSIGINTと`minictr`のPIDだけへのSIGTERMを別々に検査し、どちらも125終了とQEMU・一時領域の非残留を確認する。
 
@@ -270,6 +292,8 @@ timeout、QEMU失敗、guest failure、protocol破損、実行中のSIGINT/SIGTE
 `image export`のparse失敗、`--output`の不足、store pathの既定値解決失敗は終了code 2になる。
 `image list`と`image inspect`では、store失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
 `ps`では、instance stateのopen・一覧失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
+`stop`では、登録の無いid、corruptなstate、signal失敗、SIGKILL後の残留、cleanup失敗が終了code 125になり、idの形式違いやoptionの誤りは終了code 2になる。
+processを止めたか既に居なかったかにかかわらず、残骸の回収まで済めば終了code 0である。
 `doctor`は全検査の成功で終了code 0、一つでも失敗したら終了code 1になる。
 `doctor`のparse失敗と既定値解決失敗は終了code 2、出力失敗は終了code 125になる。
 `image remove`では、tag不在とstore失敗と出力失敗が終了code 125になり、parse失敗とstore pathの既定値解決失敗は終了code 2になる。
@@ -285,6 +309,8 @@ timeout、QEMU失敗、guest failure、protocol破損、実行中のSIGINT/SIGTE
 `guest reported an error`を含む行はguest自身の実行失敗である。
 `deadline elapsed`を含む行は全体のtimeoutである。
 `run interrupted by`を含む行はhostが受け取ったSIGINTまたはSIGTERMによる中断であり、signal名を行に示す。
+`QEMU exited before the guest was ready`を含む行はdetached runのhandshake失敗であり、`qemu:`以降に`qemu.log`の末尾が続くことがある。
+`is not registered`を含む行は`stop`がstate fileを見つけられなかったことを示し、`state is corrupt`は照合を信頼できないため何も触らなかったことを示す。
 ゲスト自身も2や125を返せるため、終了コードだけでは使い方の誤りやホスト側の失敗と区別できない。
 `minictr:`という文字列もゲストが出力できるので、接頭辞は調査の手掛かりとして使う。
 プログラムから失敗を厳密に区別する場合は、Rust APIの`Result`とエラー型を使う。

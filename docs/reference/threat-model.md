@@ -53,7 +53,13 @@ symlink検査とstore内到達検査は、誤操作と破損への防御であ�
 
 instance stateもstoreの`run/`以下のlocal fileであり、同じ前提に立つ。
 `ps`が表示するlive判定はpid、process開始token、comm名の照合に基づく観測であり、pid再利用への防御であって敵対的processの検知ではない。
+`stop`は同じ照合を経てからsignalを送るため、再利用されたpidの無関係なprocessを止めることはない。
+state fileの`payload=`行は信頼しない入力として扱い、basenameと親directoryの形状を検査したpathだけを削除対象にする。
 crashで残ったstate fileや孤児QEMUは`ps`が報告するだけであり、自動では回収しない。
+
+detached runはsupervisorを持たない。
+guestが書いた`Exit` frameは誰も読まず、`uart.log`と`qemu.log`には合計量の上限もないため、多弁なguestはdiskを消費し続けられる。
+回収は`stop`の責任であり、detached QEMUの寿命は利用者の管理下にある。
 
 ## 保証しない範囲
 
