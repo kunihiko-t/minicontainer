@@ -23,7 +23,7 @@ QEMU起動後の失敗では、必ず子processの回収とpayload削除を試�
 `minictr`はguest終了codeを0から255の範囲でそのままprocess終了codeにする。
 範囲外の終了codeはhost失敗として扱う。
 使い方の誤りは終了code 2、store解決失敗とruntime失敗は終了code 125である。
-timeout、QEMU失敗、guest failure、protocol破損はすべて125に写る。
+timeout、QEMU失敗、guest failure、protocol破損、実行中のSIGINT/SIGTERMによる中断はすべて125に写る。
 `doctor`の診断失敗は終了code 1であり、失敗項目は標準出力の`fail`行にすべて出る。
 
 失敗の診断は`minictr:`で始まる行に出る。
@@ -33,6 +33,7 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写る。
 - `invalid UART control frame`を含む行はprotocol破損である。
 - `guest reported an error`を含む行はguest自身の実行失敗である。
 - `runtime session failed: QEMU exited unsuccessfully`を含む行はExit後のQEMU非0終了である。
+- `run interrupted by SIGINT`または`run interrupted by SIGTERM`を含む行はhostが受け取ったsignalによる中断である。
 - `guest output exceeds 1 MiB`を含む行は出力合計の上限超過である。
 - `guest output consumer failed`を含む行は、run途中の標準出力・標準エラー出力への書き出し失敗である。QEMU回収とpayload削除は行われる。
 - `; cleanup also failed`を含む行は、主操作に加えて後始末も失敗したことを示す。
@@ -79,6 +80,15 @@ event loopの先頭で毎回時計を見て、期限を過ぎたらtimeoutで終
 CLI利用者が通常のタイムアウト時に別途停止コマンドを実行する必要はない。
 この期限はOSの入出力や終了後の後始末までを厳密に打ち切る時間制限ではない。
 timeout経路の検証では、125終了に加えてQEMUと一時領域の残留がないことを確認する。
+
+## signalによる中断
+
+`minictr`はSIGINTとSIGTERMを捕捉し、最初のsignalをQEMUのprocess groupへ転送する。
+QEMUは`minictr`とは別のprocess groupにいるため、端末のCtrl-Cや`minictr`宛のsignalはQEMUへ直接届かず、host転送だけが到達経路になる。
+転送から2秒のgrace内にQEMUが終了しなければgroup全体へSIGKILLを送り、grace中の2回目以降のsignalは即座に強制回収する。
+guestのExit受信後に届いたsignalは確定済みのguest結果を返し、Exit前の中断は`run interrupted by`診断と終了code 125で終わる。
+中断経路の検証では、125終了と診断に加えてQEMUと一時領域の残留がないことを確認する。
+`SIGKILL`は捕捉できないため、強制終了されたrunの後始末は保証しない。
 
 ## 出力合計の上限
 

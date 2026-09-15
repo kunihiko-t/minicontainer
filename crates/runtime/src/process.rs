@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::QemuCommand;
+use crate::{HostSignal, QemuCommand};
 
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -34,7 +34,12 @@ pub trait ProcessControl {
     /// [`Self::terminate_and_reap`]を明示的に呼び出す。
     fn next_event(&mut self, deadline: Instant) -> Result<ProcessEvent, ProcessError>;
 
-    /// childを停止し、終了を回収する。
+    /// hostが受け取ったsignalをchildのprocess group全体へ転送する。
+    ///
+    /// 既に全員が終了したgroupへの転送は何もしない成功として扱う。
+    fn send_signal(&mut self, signal: HostSignal) -> Result<(), ProcessError>;
+
+    /// childとそのprocess groupを停止し、終了を回収する。
     fn terminate_and_reap(&mut self) -> Result<ProcessStatus, ProcessError>;
 }
 
@@ -71,6 +76,8 @@ pub enum ProcessError {
     Wait(io::Error),
     /// childへ停止要求を送れなかった。
     Terminate(io::Error),
+    /// childのprocess groupへsignalを転送できなかった。
+    Signal(io::Error),
     /// テスト用の待機操作がdeadlineを超えた。
     TimedOut,
 }
@@ -82,6 +89,7 @@ impl fmt::Display for ProcessError {
             Self::Read(error) => write!(formatter, "process output read failed: {error}"),
             Self::Wait(error) => write!(formatter, "process wait failed: {error}"),
             Self::Terminate(error) => write!(formatter, "process termination failed: {error}"),
+            Self::Signal(error) => write!(formatter, "process signal forward failed: {error}"),
             Self::TimedOut => write!(formatter, "process deadline elapsed"),
         }
     }
@@ -90,9 +98,11 @@ impl fmt::Display for ProcessError {
 impl Error for ProcessError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Spawn(error) | Self::Read(error) | Self::Wait(error) | Self::Terminate(error) => {
-                Some(error)
-            }
+            Self::Spawn(error)
+            | Self::Read(error)
+            | Self::Wait(error)
+            | Self::Terminate(error)
+            | Self::Signal(error) => Some(error),
             Self::TimedOut => None,
         }
     }
@@ -131,6 +141,14 @@ pub struct SystemProcess {
 
 impl SystemProcess {
     fn spawn(mut command: Command) -> Result<Self, ProcessError> {
+        // QEMUは自process groupのleaderとして起動する。端末のCtrl-Cはgroup
+        // 全体ではなくhostだけへ届くため、hostが最初のsignalをgroup宛に
+        // 転送し、grace後のSIGKILLもgroup宛に送れば子孫まで回収できる。
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn().map_err(ProcessError::Spawn)?;
         let stdout = child
@@ -200,6 +218,35 @@ impl SystemProcess {
         self.open_readers = 0;
         Ok(())
     }
+
+    /// childのprocess group全体へsignalを送る。
+    ///
+    /// childは`process_group(0)`で起動するため、PIDがそのままPGIDであり
+    /// 子孫processまで届く。
+    fn signal_group(&mut self, signal: libc::c_int) -> io::Result<()> {
+        let target = -(self.child.id() as libc::pid_t);
+        // SAFETY: `kill(2)`の第一引数が負のときはprocess groupを指定する。
+        // `id`はspawn直後の子のPIDで`pid_t`に収まる。
+        let result = unsafe { libc::kill(target, signal) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// process group全体へSIGKILLを送る。groupが既に消えていれば直接の
+    /// 子へのkillへ落とし、それもESRCHなら成功として扱う。
+    fn kill_group(&mut self) -> Result<(), ProcessError> {
+        match self.signal_group(libc::SIGKILL) {
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => match self.child.kill() {
+                Ok(()) => Ok(()),
+                Err(direct) if direct.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+                Err(direct) => Err(ProcessError::Terminate(direct)),
+            },
+            result => result.map_err(ProcessError::Terminate),
+        }
+    }
 }
 
 impl ProcessControl for SystemProcess {
@@ -256,6 +303,14 @@ impl ProcessControl for SystemProcess {
         }
     }
 
+    fn send_signal(&mut self, signal: HostSignal) -> Result<(), ProcessError> {
+        match self.signal_group(signal.signo()) {
+            // 全員が既に終了したgroupへの転送は何もしない成功である。
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            result => result.map_err(ProcessError::Signal),
+        }
+    }
+
     fn terminate_and_reap(&mut self) -> Result<ProcessStatus, ProcessError> {
         if let Some(status) = self.reaped_status {
             return Ok(status);
@@ -263,11 +318,11 @@ impl ProcessControl for SystemProcess {
 
         let status = match self.child.try_wait().map_err(ProcessError::Wait)? {
             Some(status) => process_status(status),
-            None => match self.child.kill() {
+            None => match self.kill_group() {
                 Ok(()) => process_status(self.child.wait().map_err(ProcessError::Wait)?),
                 Err(kill_error) => match self.child.try_wait().map_err(ProcessError::Wait)? {
                     Some(status) => process_status(status),
-                    None => return Err(ProcessError::Terminate(kill_error)),
+                    None => return Err(kill_error),
                 },
             },
         };
@@ -352,6 +407,7 @@ fn process_status(status: ExitStatus) -> ProcessStatus {
 #[cfg(test)]
 mod tests {
     use super::{ProcessControl, ProcessError, ProcessEvent, ProcessStatus, SystemProcess};
+    use crate::HostSignal;
     use std::{
         env,
         io::{self, Read, Write},
@@ -376,6 +432,35 @@ mod tests {
             }
             Ok("sleep") => std::thread::sleep(Duration::from_secs(5)),
             Ok("exit") => std::process::exit(23),
+            Ok("sleep-long") => std::thread::sleep(Duration::from_secs(30)),
+            Ok("grandchild") => {
+                // 同じprocess groupに属する孫をspawnしてから寝る。group宛の
+                // signalが直接の子だけを殺さないかを検査する経路になる。
+                // 孫のstdioはnullへ向け、pipeを握ったまま回収側を停滞させ
+                // ない。
+                let executable = env::current_exe().expect("the test binary path must exist");
+                // 孫はあえてwaitしない。親より長く生きる孤児を残すことが
+                // group宛signalの検査対象そのものである。
+                #[allow(clippy::zombie_processes)]
+                let grandchild = Command::new(executable)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "process::tests::process_helper",
+                        "--nocapture",
+                    ])
+                    .env(HELPER_ENV, "sleep-long")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("the grandchild helper must spawn");
+                io::stdout()
+                    .write_all(format!("grandchild {}\n", grandchild.id()).as_bytes())
+                    .unwrap();
+                io::stdout().flush().unwrap();
+                std::thread::sleep(Duration::from_secs(5));
+            }
             mode => panic!("unknown process helper mode: {mode:?}"),
         }
     }
@@ -488,6 +573,48 @@ mod tests {
         }
     }
 
+    // Catches forwarding only to the direct child: a forwarded host signal
+    // must reach the child's whole process group or QEMU's own children
+    // survive as orphans.
+    #[test]
+    fn send_signal_reaches_the_whole_process_group() {
+        let mut child = spawn_helper("grandchild").unwrap();
+        let grandchild = read_grandchild_pid(&mut child);
+
+        child.send_signal(HostSignal::Terminate).unwrap();
+
+        let dead = wait_for_death(grandchild, Duration::from_secs(3));
+        let _ = signal_pid(grandchild, libc::SIGKILL);
+        child.terminate_and_reap().unwrap();
+        assert!(dead, "the forwarded signal must reach the grandchild");
+    }
+
+    // Catches a forced cleanup that kills only the direct child: the final
+    // reap must also stop processes the child spawned.
+    #[test]
+    fn terminate_and_reap_kills_the_whole_process_group() {
+        let mut child = spawn_helper("grandchild").unwrap();
+        let grandchild = read_grandchild_pid(&mut child);
+
+        child.terminate_and_reap().unwrap();
+
+        let dead = wait_for_death(grandchild, Duration::from_secs(3));
+        let _ = signal_pid(grandchild, libc::SIGKILL);
+        assert!(dead, "the forced reap must reach the grandchild");
+    }
+
+    // Catches reporting an error when the forwarded signal lands on a group
+    // whose members already exited: a finished child makes forwarding a no-op.
+    #[test]
+    fn send_signal_to_a_finished_group_is_a_no_op() {
+        let mut child = spawn_helper("exit").unwrap();
+        child
+            .wait_until(Duration::from_secs(1))
+            .expect("the helper must exit before the deadline");
+
+        child.send_signal(HostSignal::Interrupt).unwrap();
+    }
+
     // Catches collapsing an OS spawn failure into a timeout or a generic
     // reader error, which would hide a missing QEMU executable.
     #[test]
@@ -513,6 +640,53 @@ mod tests {
             super::reader_event(receiver.recv().expect("reader must send its failure")),
             Err(ProcessError::Read(_))
         ));
+    }
+
+    /// helperがprintした`grandchild <pid>`行をUART eventから読み取る。
+    fn read_grandchild_pid(child: &mut SystemProcess) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut text = String::new();
+        loop {
+            match child.next_event(deadline).unwrap() {
+                ProcessEvent::Uart(bytes) => {
+                    text.push_str(&String::from_utf8_lossy(&bytes));
+                    // libtestのbannerが`grandchild`行より先にstdoutへ来る
+                    // ため、全体ではなく行単位で照合する。
+                    if let Some(pid) = text.lines().find_map(|line| {
+                        line.strip_prefix("grandchild ")
+                            .and_then(|field| field.trim().parse().ok())
+                    }) {
+                        return pid;
+                    }
+                }
+                ProcessEvent::Diagnostic(_) => {}
+                ProcessEvent::Exited(_) => panic!("the grandchild helper exited early"),
+                ProcessEvent::TimedOut => panic!("the grandchild pid never arrived"),
+            }
+        }
+    }
+
+    /// processが`deadline`までに死ねばtrueを返す。pollだけ行い、killしない。
+    fn wait_for_death(pid: u32, deadline: Duration) -> bool {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if !pid_is_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        !pid_is_alive(pid)
+    }
+
+    /// 一つのprocessへsignalを送る。group宛ではない直接指定である。
+    fn signal_pid(pid: u32, signal: libc::c_int) -> io::Result<()> {
+        // SAFETY: `kill(2)`に正のPIDを渡す呼び出しは対象processだけへ送る。
+        let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     fn spawn_helper(mode: &str) -> Result<SystemProcess, ProcessError> {

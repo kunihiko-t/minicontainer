@@ -54,8 +54,8 @@ symlink検査とstore内到達検査は、誤操作と破損への防御であ�
 ## 保証しない範囲
 
 ホストの停止やランタイムの強制終了時に、子プロセスの停止と一時ファイルの削除が完了することは保証しない。
-実行中のCtrl-Cは保証の対象であり、`minictr`がSIGINTを無視してQEMU終了をhost失敗として回収し、後始末を経て125で終わる。
-一方`SIGKILL`と`SIGTERM`は捕捉対象外のため、後始末なしに停止し子processや一時fileが残り得る。
+実行中のSIGINTとSIGTERMは保証の対象であり、`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののちSIGKILLで回収してから後始末を経て125で終わる。
+`SIGKILL`だけは捕捉対象外のため、後始末なしに停止し子processや一時fileが残り得る。
 
 MiniContainerは本番用のセキュリティー境界ではありません。
 未信頼コードを扱うマルチテナント環境、guest escapeの防止、Linuxアプリケーション互換、ネットワーク隔離、永続ボリューム隔離、OCI互換、性能SLAは保証しない。
