@@ -41,9 +41,9 @@ use crate::tools;
 /// E2Eがbuildして起動するminiOS sourceの公開URL。
 pub const MINIOS_REPO_URL: &str = "https://github.com/kunihiko-t/minios.git";
 /// E2EがbuildするminiOS kernelのpin留めrevision (M1統合のmerge commit)。
-pub const MINIOS_KERNEL_REV: &str = "9be99255a59d58d19db25b835af0e28a8d2a4036";
+pub const MINIOS_KERNEL_REV: &str = "4865f9be97a6cdcd77c71e36b1ba426b49bd73d7";
 /// E2E kernelが実装するGuest ABI tag。変更時は別承認のABI更新が必要である。
-pub const MINIOS_ABI_TAG: &str = "minios-abi-v0.1.1";
+pub const MINIOS_ABI_TAG: &str = "minios-abi-v0.2.0";
 /// E2Eが解決するimage tag。
 pub const E2E_IMAGE: &str = "hello";
 /// hello guestが報告する終了code。
@@ -58,6 +58,10 @@ const GUEST_HELLO_ELF: &str = "target/guest-hello/riscv64gc-unknown-none-elf/rel
 const GUEST_HELLO_STDOUT: &[u8] = b"hello from guest\n";
 /// 同梱guest例の標準エラー出力。
 const GUEST_HELLO_STDERR: &[u8] = b"guest stderr\n";
+/// stdin echoの同梱guest例のrelease ELF。GuestEchoBuild位相の成果物。
+const GUEST_ECHO_ELF: &str = "target/guest-echo/riscv64gc-unknown-none-elf/release/guest-echo";
+/// echo guestを登録するE2Eのimage tag。
+const E2E_ECHO_IMAGE: &str = "echo";
 
 const RISCV_TARGET: &str = "riscv64gc-unknown-none-elf";
 const KERNEL_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
@@ -65,6 +69,9 @@ const QEMU_RUN_TIMEOUT: Duration = Duration::from_secs(180);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(120);
 const HAPPY_PATH_TIMEOUT_MS: &str = "30000";
+/// output-cap経路は1 MiB超を実UART速度 (~77 KiB/s) で流すため、happy path
+/// より長い期限が要る。
+const OUTPUT_CAP_TIMEOUT_MS: &str = "90000";
 const SPIN_TIMEOUT_MS: &str = "800";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// 割り込み経路でQEMU出現を待つ上限。`minictr`自体の30秒期限より短くし、
@@ -331,6 +338,16 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         detached.qemu_before,
         detached.qemu_after,
         detached.elapsed.as_secs_f64()
+    ));
+
+    log("e2e: stdin echo path (piped bytes echo back, EOF exits 42)");
+    let echoed = run_stdin_echo_path(&minictr, &kernel, workspace)?;
+    log(&format!(
+        "e2e: stdin echo path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
+        echoed.minictr_pid,
+        echoed.qemu_before,
+        echoed.qemu_after,
+        echoed.elapsed.as_secs_f64()
     ));
 
     Ok(transcript)
@@ -821,7 +838,7 @@ fn run_malformed_frame_path(minictr: &Path) -> Result<CaseReport, E2EError> {
 }
 
 fn run_output_cap_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
-    let report = run_case(minictr, &chatty_elf_bytes(), kernel, HAPPY_PATH_TIMEOUT_MS)?;
+    let report = run_case(minictr, &chatty_elf_bytes(), kernel, OUTPUT_CAP_TIMEOUT_MS)?;
 
     if report.status != Some(125) {
         return Err(E2EError::UnexpectedRun {
@@ -1292,6 +1309,117 @@ fn run_detached_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EErr
     })
 }
 
+/// stdin転送経路。`guest-echo`へpipeしたbinary入力がそのままstdoutへ戻り、
+/// EOF後にguestが42で終わることを検証する。入力はkernel stagingの4 KiBを
+/// 跨ぐ長さにして、複数`STDIN` frameへの分割を兼ねて検査する。二回目の
+/// 実行では空入力だけを送り、即座のEOFでも同じ終了codeになることを見る。
+fn run_stdin_echo_path(
+    minictr: &Path,
+    kernel: &Path,
+    workspace: &Path,
+) -> Result<CaseReport, E2EError> {
+    let elf = workspace.join(GUEST_ECHO_ELF);
+    if !elf.is_file() {
+        return Err(E2EError::MissingGuestElf(elf));
+    }
+    let store = TempStore::empty();
+    let args = minictr_build_args(&store.path, E2E_ECHO_IMAGE, &elf);
+    run_checked(minictr, &args, None, &[], COMMAND_TIMEOUT)?;
+
+    // 0x00-0xFAを一周するbinary byte列。UTF-8としては不正な並びを含み、
+    // テキスト扱いされないことも同時に確認する。
+    let mut input = vec![0_u8; 10 * 1024 + 7];
+    for (index, byte) in input.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let report = run_case_stdin(minictr, store, kernel, HAPPY_PATH_TIMEOUT_MS, &input)?;
+
+    if report.status != Some(E2E_EXIT_CODE) {
+        return Err(E2EError::UnexpectedRun {
+            case: "stdin echo exit code",
+            expected: format!("exit {}", E2E_EXIT_CODE),
+            actual: format!(
+                "status {:?} (stderr: {})",
+                report.status,
+                String::from_utf8_lossy(&report.stderr)
+            ),
+        });
+    }
+    if report.stdout != input {
+        return Err(E2EError::UnexpectedRun {
+            case: "stdin echo stdout",
+            expected: format!("{} echoed bytes", input.len()),
+            actual: format!(
+                "{} bytes {:?}",
+                report.stdout.len(),
+                &report.stdout[..report.stdout.len().min(64)]
+            ),
+        });
+    }
+    if !report.stderr.is_empty() {
+        return Err(E2EError::UnexpectedRun {
+            case: "stdin echo stderr",
+            expected: "no stderr output".to_owned(),
+            actual: format!("{:?}", report.stderr),
+        });
+    }
+
+    // 空入力のEOFだけでも同じ終了codeへ辿り着くことを確認する。
+    let store = TempStore::empty();
+    let args = minictr_build_args(&store.path, E2E_ECHO_IMAGE, &elf);
+    run_checked(minictr, &args, None, &[], COMMAND_TIMEOUT)?;
+    let empty = run_case_stdin(minictr, store, kernel, HAPPY_PATH_TIMEOUT_MS, &[])?;
+    if empty.status != Some(E2E_EXIT_CODE) || !empty.stdout.is_empty() {
+        return Err(E2EError::UnexpectedRun {
+            case: "stdin echo empty input",
+            expected: format!("exit {} with no output", E2E_EXIT_CODE),
+            actual: format!(
+                "status {:?}, {} stdout bytes (stderr: {})",
+                empty.status,
+                empty.stdout.len(),
+                String::from_utf8_lossy(&empty.stderr)
+            ),
+        });
+    }
+    Ok(report)
+}
+
+/// stdin bytesを`minictr run`へpipeし、cleanupまで検証する`run_case_in_store`
+/// のstdin版。
+fn run_case_stdin(
+    minictr: &Path,
+    store: TempStore,
+    kernel: &Path,
+    timeout_ms: &str,
+    input: &[u8],
+) -> Result<CaseReport, E2EError> {
+    let store_path = store.path.clone();
+    let qemu_before = qemu_pids()?;
+    let payload_before = payload_temp_leftovers();
+    let started = Instant::now();
+    let args = minictr_run_args(&store.path, kernel, timeout_ms, E2E_ECHO_IMAGE);
+    let outcome = run_with_timeout_stdin(
+        minictr,
+        &args,
+        None,
+        &[],
+        Some(input.to_vec()),
+        QEMU_RUN_TIMEOUT,
+    );
+    let elapsed = started.elapsed();
+    let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
+    let completed = outcome?;
+    Ok(CaseReport {
+        minictr_pid: completed.pid,
+        qemu_before,
+        qemu_after,
+        elapsed,
+        status: completed.status.code(),
+        stdout: completed.stdout,
+        stderr: completed.stderr,
+    })
+}
+
 /// `minictr ps`が`qemu_pid`の行を`status`で表示するまでpollする。QEMUの
 /// 登録と死亡の観測には僅かな遅れがあるため、即時確認ではなく期限付きで
 /// 待つ。
@@ -1403,6 +1531,7 @@ fn spawn_minictr(
         &minictr_run_args(store, kernel, timeout_ms, image),
         None,
         &[],
+        None,
     )
 }
 
@@ -1480,11 +1609,17 @@ struct SpawnedChild {
 
 /// commandを自前のprocess groupのleaderとして起動し、両pipeのdrainを
 /// 始める。group宛のsignalはharnessへ届かず、子の子孫まで届く。
+///
+/// `stdin_data`があるときは子のstdinをpipeへ向け、writer threadがbytesを
+/// 書き切ってから閉じる (guest側EOF)。`None`ではstdinを`/dev/null`へ向け、
+/// 非TTY入力として即座にEOFが届く — xtaskのstdin継承に依存しない決定的な
+/// 入力にするためである。
 fn spawn_in_own_group(
     program: impl AsRef<OsStr>,
     args: &[OsString],
     current_dir: Option<&Path>,
     extra_env: &[(&str, &str)],
+    stdin_data: Option<Vec<u8>>,
 ) -> Result<SpawnedChild, E2EError> {
     use std::process::Stdio;
 
@@ -1503,6 +1638,10 @@ fn spawn_in_own_group(
         command.process_group(0);
     }
     let mut child = command
+        .stdin(match &stdin_data {
+            Some(_) => Stdio::piped(),
+            None => Stdio::null(),
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1510,6 +1649,18 @@ fn spawn_in_own_group(
             command: command_line.clone(),
             message: error.to_string(),
         })?;
+    if let Some(bytes) = stdin_data {
+        use std::io::Write as _;
+        let mut pipe = child
+            .stdin
+            .take()
+            .expect("piped stdin must be available after spawn");
+        // 子の早期終了でpipeが閉じてもharnessは失敗にしない。書き込み側の
+        // threadがdropでpipeを閉じるまでがEOFの区切りである。
+        thread::spawn(move || {
+            let _ = pipe.write_all(&bytes);
+        });
+    }
     let pid = child.id();
     let stdout_pipe = child
         .stdout
@@ -1537,13 +1688,25 @@ fn run_with_timeout(
     extra_env: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<CompletedProcess, E2EError> {
+    run_with_timeout_stdin(program, args, current_dir, extra_env, None, timeout)
+}
+
+/// `run_with_timeout`にstdin bytesを供給する版。`None`は`/dev/null`。
+fn run_with_timeout_stdin(
+    program: impl AsRef<OsStr>,
+    args: &[OsString],
+    current_dir: Option<&Path>,
+    extra_env: &[(&str, &str)],
+    stdin_data: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<CompletedProcess, E2EError> {
     let SpawnedChild {
         mut child,
         pid,
         stdout_reader,
         stderr_reader,
         command_line,
-    } = spawn_in_own_group(program, args, current_dir, extra_env)?;
+    } = spawn_in_own_group(program, args, current_dir, extra_env, stdin_data)?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -2214,7 +2377,7 @@ mod tests {
     fn pinned_inputs_stay_documented() {
         assert_eq!(MINIOS_REPO_URL, "https://github.com/kunihiko-t/minios.git");
         assert_eq!(MINIOS_KERNEL_REV.len(), 40);
-        assert_eq!(MINIOS_ABI_TAG, "minios-abi-v0.1.1");
+        assert_eq!(MINIOS_ABI_TAG, "minios-abi-v0.2.0");
     }
 
     const HELPER_ENV: &str = "MINICTR_E2E_OUTPUT_HELPER";
@@ -2320,8 +2483,14 @@ mod tests {
     #[test]
     fn spawned_group_receives_sigint_without_touching_the_runner() {
         let program = std::env::current_exe().expect("the test binary path must exist");
-        let spawned = spawn_in_own_group(&program, &helper_args(), None, &[(HELPER_ENV, "sleep")])
-            .expect("the sleep helper must spawn");
+        let spawned = spawn_in_own_group(
+            &program,
+            &helper_args(),
+            None,
+            &[(HELPER_ENV, "sleep")],
+            None,
+        )
+        .expect("the sleep helper must spawn");
         std::thread::sleep(Duration::from_millis(500));
         signal_process_group(spawned.pid, libc::SIGINT)
             .expect("SIGINT must reach the spawned process group");

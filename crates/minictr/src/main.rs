@@ -5,7 +5,7 @@ mod cli;
 use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
     time::Duration,
@@ -315,7 +315,7 @@ impl ImageStore for RealStore {
 pub enum BuildError {
     /// ELF入力の読み取りが失敗した。
     ElfIo(std::io::Error),
-    /// ELF入力が8 MiB上限を超えた。
+    /// ELF入力が6 MiB上限を超えた。
     ElfTooLarge,
     /// MiniBundleの構築が失敗した。
     Bundle(minicontainer_bundle::BundleError),
@@ -327,7 +327,7 @@ impl std::fmt::Display for BuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ElfIo(error) => write!(formatter, "failed to read ELF input: {error}"),
-            Self::ElfTooLarge => formatter.write_str("ELF input exceeds the 8 MiB payload limit"),
+            Self::ElfTooLarge => formatter.write_str("ELF input exceeds the 6 MiB payload limit"),
             Self::Bundle(error) => write!(formatter, "invalid MiniBundle: {error}"),
             Self::Store(error) => write!(formatter, "{error}"),
         }
@@ -353,7 +353,7 @@ impl From<StoreError> for BuildError {
 pub enum ImportError {
     /// bundle fileの読み取りが失敗した。
     BundleIo(std::io::Error),
-    /// bundle fileが8 MiB上限を超えた。
+    /// bundle fileが6 MiB上限を超えた。
     BundleTooLarge,
     /// MiniBundleの検証が失敗した。
     Bundle(minicontainer_bundle::BundleError),
@@ -366,7 +366,7 @@ impl std::fmt::Display for ImportError {
         match self {
             Self::BundleIo(error) => write!(formatter, "failed to read bundle input: {error}"),
             Self::BundleTooLarge => {
-                formatter.write_str("bundle input exceeds the 8 MiB bundle limit")
+                formatter.write_str("bundle input exceeds the 6 MiB bundle limit")
             }
             Self::Bundle(error) => write!(formatter, "invalid MiniBundle: {error}"),
             Self::Store(error) => write!(formatter, "{error}"),
@@ -445,6 +445,9 @@ pub struct RunSpec<'a> {
     pub resources: QemuResources,
     /// instance stateを書くdirectoryと`ps`の表示label。`None`なら記録しない。
     pub instances: Option<InstanceRegistration<'a>>,
+    /// guestへ転送するstdin stream。`None`のrunは`STDIN` frameを送らない。
+    /// TTYでは`io::empty()` (即EOF)、非TTYでは実stdinを渡す。
+    pub input: Option<Box<dyn Read + Send>>,
 }
 
 /// guest実行の境界。testではQEMUなしの偽装で差し替える。
@@ -547,6 +550,7 @@ impl Runner for RealRunner {
                 kernel: spec.kernel,
                 deadline: spec.timeout,
                 resources: spec.resources,
+                input: spec.input,
                 interrupts: Some(&interrupts),
                 instances: spec.instances,
             },
@@ -620,6 +624,15 @@ pub fn run_resolved(
             return RUNTIME_EXIT;
         }
     };
+    // 非TTYのstdinだけをguestへ転送する。TTYでは対話入力を待たずEOFだけを
+    // 送り、detached runはstdin経路を持たない。
+    let input: Option<Box<dyn Read + Send>> = if resolved.detach {
+        None
+    } else if io::stdin().is_terminal() {
+        Some(Box::new(io::empty()))
+    } else {
+        Some(Box::new(io::stdin()))
+    };
     let spec = RunSpec {
         bundle: &bundle,
         kernel: &resolved.kernel,
@@ -633,6 +646,7 @@ pub fn run_resolved(
             image: &resolved.image,
             program: OsStr::new(QEMU_PROGRAM),
         }),
+        input,
     };
     if resolved.detach {
         return match runner.detach(spec) {
@@ -1416,7 +1430,7 @@ fn build_and_store(
     Ok(digest)
 }
 
-/// ELF入力をmetadata確認つきの上限付きで読む。本体を読む前に8 MiBを
+/// ELF入力をmetadata確認つきの上限付きで読む。本体を読む前に6 MiBを
 /// 超える入力を拒否し、metadata確認後に伸びた入力もsentinelで拒否する。
 fn read_elf(path: &Path) -> Result<Vec<u8>, BuildError> {
     read_elf_with(path, &|path| File::open(path))
@@ -1435,7 +1449,7 @@ fn read_elf_with(
 }
 
 /// bundle file入力をmetadata確認つきの上限付きで読む。本体を読む前に
-/// 8 MiBを超える入力を拒否し、metadata確認後に伸びた入力もsentinelで拒否する。
+/// 6 MiBを超える入力を拒否し、metadata確認後に伸びた入力もsentinelで拒否する。
 fn read_bundle(path: &Path) -> Result<Vec<u8>, ImportError> {
     read_bundle_with(path, &|path| File::open(path))
 }
@@ -1457,7 +1471,7 @@ fn read_bundle_with(
 enum BoundedReadError {
     /// 入力の読み取りが失敗した。
     Io(std::io::Error),
-    /// 入力が8 MiB上限を超えた。
+    /// 入力が6 MiB上限を超えた。
     TooLarge,
 }
 
@@ -1697,6 +1711,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             resources: QemuResources::DEFAULT,
             instances: None,
+            input: None,
         }
     }
 
@@ -2763,7 +2778,7 @@ mod tests {
         std::fs::remove_file(&elf_path).unwrap();
     }
 
-    // Catches reading an ELF larger than the 8 MiB boot window into memory:
+    // Catches reading an ELF larger than the 6 MiB boot window into memory:
     // the metadata length rejects it before import runs.
     #[test]
     fn rejects_an_elf_larger_than_the_bundle_limit_before_importing() {
@@ -2789,7 +2804,7 @@ mod tests {
         assert_eq!(code, RUNTIME_EXIT);
         assert!(stdout.is_empty());
         assert!(
-            String::from_utf8_lossy(&stderr).contains("exceeds the 8 MiB"),
+            String::from_utf8_lossy(&stderr).contains("exceeds the 6 MiB"),
             "stderr was {:?}",
             String::from_utf8_lossy(&stderr)
         );
@@ -2798,7 +2813,7 @@ mod tests {
     }
 
     // Catches removing the metadata pre-check: an ELF whose metadata length
-    // already exceeds the 8 MiB limit must be rejected before the open
+    // already exceeds the 6 MiB limit must be rejected before the open
     // boundary runs. A sentinel-only read returns the same error, so this
     // test observes the open boundary directly instead of the result alone.
     #[test]
@@ -4019,7 +4034,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // Catches reading a bundle file larger than the 8 MiB limit into
+    // Catches reading a bundle file larger than the 6 MiB limit into
     // memory: the metadata length rejects it before import runs.
     #[test]
     fn rejects_a_bundle_larger_than_the_limit_before_importing() {
@@ -4050,7 +4065,7 @@ mod tests {
         assert_eq!(code, RUNTIME_EXIT);
         assert!(stdout.is_empty());
         assert!(
-            String::from_utf8_lossy(&stderr).contains("exceeds the 8 MiB"),
+            String::from_utf8_lossy(&stderr).contains("exceeds the 6 MiB"),
             "stderr was {:?}",
             String::from_utf8_lossy(&stderr)
         );
@@ -4059,7 +4074,7 @@ mod tests {
     }
 
     // Catches removing the metadata pre-check: a bundle file whose
-    // metadata length already exceeds the 8 MiB limit must be rejected
+    // metadata length already exceeds the 6 MiB limit must be rejected
     // before the open boundary runs.
     #[test]
     fn rejects_an_oversized_bundle_before_opening_it() {
@@ -5408,11 +5423,11 @@ mod tests {
         assert!(stderr.is_empty());
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
-            "hello oci-layout sha256:29dd36cc92562f77bb648ee0ad74d4fe3cde3330f723fadd0f514c15309ceb54\n"
+            "hello oci-layout sha256:f1eaff19e582d40560022d45a8819cfd28a657bd9f88c318008ef46f1759634c\n"
         );
         let layer =
             std::fs::read(output.join(
-                "blobs/sha256/6c710671215c4929fa600956d236ae82df1f3a9f05f0b125c3fb0feed9096136",
+                "blobs/sha256/5b5bfa03d58cf705f1e4b2b25c7deff040dacd6d07c9530bb413af759873b07d",
             ))
             .unwrap();
         assert_eq!(layer, bytes, "the layer blob is the stored bundle");
@@ -5524,7 +5539,7 @@ mod tests {
         assert!(stderr.is_empty());
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
-            "restored sha256:f8200f06e25dcb0f36a744b780c0fa1b40030c9a6bb9786b122cad44cad221ff\n"
+            "restored sha256:a3a75769783c1925c0577edfb63476e053cc4e6535e0a09feb0f97e5aeb7b771\n"
         );
         let store = Store::new(&root).unwrap();
         assert_eq!(store.resolve("restored").unwrap(), bytes);

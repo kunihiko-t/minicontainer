@@ -8,7 +8,7 @@
 ### バンドルとGuest ABI
 
 Cargo workspaceは公開に必要な文書とlocal linkを検査し、公開前の文書条件をgateに含めている。
-MiniContainerは固定したminiOS Guest ABI (`minios-abi-v0.1.1`) を依存として取得し、BootHeader、manifest、UART control frameの定義をhost側の実装で消費している。
+MiniContainerは固定したminiOS Guest ABI (`minios-abi-v0.2.0`) を依存として取得し、BootHeader、manifest、UART control frameの定義をhost側の実装で消費している。
 system call番号と呼び出し規約もGuest ABIに定義済みであり、runtimeは`write`と`exit`の結果をUART control frameで受け取る。
 
 MiniBundleはcanonicalなbundleを構築してparseし、digestとmanifestを検証してcontent-addressed storeへimport、tag、resolveできる。

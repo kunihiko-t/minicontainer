@@ -6,9 +6,9 @@ boot payloadへの配置は第5章、storeからの解決は第9章を参照す�
 ## layout
 
 MiniBundle v1は、96 byte header、UTF-8 manifest、zero padding、静的RISC-V 64 ELFを一つのfileへ格納する。
-headerはmagic `MINICTR\0`、ABI version 1.0、全体長、manifest範囲、ELF範囲、SHA-256 digestを持つ。
+headerはmagic `MINICTR\0`、ABI version 1.2、全体長、manifest範囲、ELF範囲、SHA-256 digestを持つ。
 manifestはheader直後のoffset 96から始まり、ELFは8 byte境界に揃える。
-bundle全体の上限は8 MiBである。
+bundle全体の上限は6 MiBである。
 
 `build`は同じ入力から同じbytesを作る。
 `parse`はheader、申告長と実長の一致、digest、paddingのzero、manifestを順に検証する。
@@ -46,7 +46,7 @@ tag fileの内容は検証しないため、壊れた内容のtagも削除でき
 `remove_blob`は参照の再確認、symlinkと非fileの拒否、store内到達検査を経てからunlinkする。
 存在しないblobの削除は成功とし、参照中blobの削除は型付きerrorで拒否する。
 
-bundle全体の上限8 MiBは`minicontainer_bundle::MAX_BUNDLE_LEN`として公開し、`minictr image build`のELF読み取りと`minictr image import`のfile読み取りも同じ上限を使う。
+bundle全体の上限6 MiBは`minicontainer_bundle::MAX_BUNDLE_LEN`として公開し、`minictr image build`のELF読み取りと`minictr image import`のfile読み取りも同じ上限を使う。
 配布されたbundle fileは`image import`で取り込む。検証してからstoreへ書き込むため、不正なfileではstoreを変更しない。取り込みでmanifestのnameは書き換えず、store側のtagだけを付ける。
 digestの小文字hex64桁への変換は`minicontainer_bundle::format_digest`として公開し、store path、tag、CLIの成功表示で共有する。
 逆変換は`minicontainer_bundle::parse_digest`として公開し、tag fileとCLIのdigest指定で形式を共有する。

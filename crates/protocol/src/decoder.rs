@@ -1,4 +1,4 @@
-use minios_abi::control::{FRAME_HEADER_LEN, FrameHeader, FrameKind};
+use minios_abi::control::{FRAME_HEADER_LEN, FRAME_MAX_PAYLOAD_LEN, FrameHeader, FrameKind};
 
 use crate::ProtocolError;
 
@@ -63,6 +63,20 @@ impl Decoder {
             Err(ProtocolError::TruncatedFrame)
         }
     }
+}
+
+/// host→guestのframeをcanonical bytesへ組み立てる。
+///
+/// `payload`がABIの上限を超えるときは`None`を返す。呼び出し側がchunkへ
+/// 分ける責任を持つ (例: `STDIN`はguestのstaging上限である4 KiB以下)。
+pub fn encode_frame(kind: FrameKind, payload: &[u8]) -> Option<Vec<u8>> {
+    let payload_len = u32::try_from(payload.len()).ok()?;
+    if payload_len > FRAME_MAX_PAYLOAD_LEN {
+        return None;
+    }
+    let mut bytes = FrameHeader { kind, payload_len }.encode().to_vec();
+    bytes.extend_from_slice(payload);
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -340,6 +354,28 @@ mod tests {
         );
     }
 
+    // Golden contract: the host-to-guest Stdin frame and its EOF sentinel must
+    // keep the exact ABI byte layout so the kernel staging can decode them.
+    #[test]
+    fn encodes_stdin_and_eof_frames_with_exact_bytes() {
+        let data = super::encode_frame(FrameKind::Stdin, b"hi").unwrap();
+        assert_eq!(
+            data,
+            vec![b'M', b'C', b'F', b'1', 7, 0, 0, 0, 2, 0, 0, 0, b'h', b'i']
+        );
+        let eof = super::encode_frame(FrameKind::Stdin, b"").unwrap();
+        assert_eq!(eof, vec![b'M', b'C', b'F', b'1', 7, 0, 0, 0, 0, 0, 0, 0]);
+        // 自分のdecoderで往復してkindとpayloadが一致することも確認する。
+        let frames = Decoder::new().push(&data).unwrap();
+        assert_eq!(
+            frames,
+            vec![Frame {
+                kind: FrameKind::Stdin,
+                payload: b"hi".to_vec(),
+            }]
+        );
+    }
+
     // Catches treating EOF with a partial header or payload as a valid stream,
     // which lets a caller report success after silently dropping control data.
     #[test]
@@ -368,6 +404,8 @@ mod tests {
             FrameKind::Exit => 4,
             FrameKind::GuestError => 5,
             FrameKind::Diagnostic => 6,
+            FrameKind::Stdin => 7,
+            FrameKind::ProcExit => 8,
         };
         let mut encoded = Vec::with_capacity(12);
         encoded.extend_from_slice(b"MCF1");

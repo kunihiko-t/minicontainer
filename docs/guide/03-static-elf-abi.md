@@ -12,17 +12,18 @@ Linux application互換は提供しない。
 
 ## Guest ABIの固定
 
-MiniContainerはtagで固定したminios-abi (`minios-abi-v0.1.1`) を利用する。
+MiniContainerはtagで固定したminios-abi (`minios-abi-v0.2.0`) を利用する。
 boot header、manifest、UART control frame、system call番号をhostとguestで共有する。
 実行kernelはminiOSの固定revisionからbuildする。
 ABIを更新する場合は、タグとカーネルリビジョンの対応を確認し、ホストとゲストを組み合わせた検証を行う。
 
 ## system callの条件
 
-Guest ABIが定義するsystem callは二つである。
-`Write`は番号1、`Exit`は番号2である。
-file descriptorは標準出力が1、標準エラー出力が2であり、一回の`write`上限は4096 byteである。
+Guest ABIが定義するsystem callは三つである。
+`Write`は番号1、`Exit`は番号2、`Read`は番号3である。
+file descriptorは標準入力が0、標準出力が1、標準エラー出力が2であり、一回の`write`と`read`の上限は4096 byteである。
 `write`の結果は`Stdout`と`Stderr`のcontrol frame、`exit`の結果は`Exit` frameとしてUARTへ届く。
+`read`はhostから届いた`Stdin` frameのpayloadを返し、長さ0のframeはEOFとして0を返す。
 frameの復元は第7章、run全体の確定は第8章を参照する。
 
 ## 同梱ゲスト例の読み方
@@ -34,7 +35,10 @@ system call番号とfile descriptorは`minios_abi::syscall`の定義だけを参
 
 生の呼び出し規約は、番号を`a7`、引数を`a0`から`a2`、戻り値を`a0`で渡す。
 `write`は順にfile descriptor、buffer address、byte数を受け取り、書けたbyte数か負のerrorを返す。
+`read`も同じ引数形であり、標準入力に読めるbyteがなければ待ち合わせる。
 `exit`は`a0`の終了codeで終わり、戻らない。
+
+[guest-echo](../../examples/guest-echo/README.md)は`read`を使う二番目の例であり、stdinをechoして42で終わる。
 
 ## 同梱ゲスト例のlinkとbuild
 

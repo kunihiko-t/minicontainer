@@ -85,7 +85,7 @@ DIRもOS pathとして非UTF-8 byteを透過的に扱う。
 myapp sha256:<64桁の小文字16進数>
 ```
 
-8 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
+6 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
 実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
 ELFの中身はhostでは検証せず、guestのloaderが検証する。
 tag名とゲスト引数の文法はbundle構築時に検証し、不正な入力はhost側の失敗として終わる。
@@ -270,6 +270,13 @@ pipe越しでも進行が見えるよう、chunkごとにflushする。
 二つのストリームは区別して書き出すが、ホスト側の二出力間の到達順序は保証しない。
 run途中の書き込みやフラッシュ失敗はconsumer失敗としてrunを中断し、QEMU回収とpayload削除を経てホスト側の失敗で終わる。
 ランタイムがエラーを返した場合、中断前に書き出した分は残るが、残りの出力は届かない。
+標準入力が端末でなければ、`minictr`はその内容を`Stdin` frameへ切り分けてguestへ転送し、末尾でEOF frameを送る。
+端末から直接起動したrunはEOF frameだけを送り、guestの`read`は直ちに0を返す。
+guestへの転送は1 frameあたり4096 byteに区切られ、入力量に上限はない。
+guest側の受け取りが詰まるとQEMUのstdin pipeが満杯になり、転送はそこで止まる。入力を読み尽くすまで`minictr`は戻らない。
+入力の読み取りまたは書き込みの失敗はrunを中断し、QEMU回収とpayload削除を経てホスト側の失敗で終わる。
+guestが先に終了した場合、転送中の残り入力は捨てられ、書き込み先の消失による失敗はguestの結果を返す側へ吸収される。
+`--detach`を付けたrunには入力経路がなく、guestが`read`で待つ場合は`stop`されるまで止まったままである。
 実行中のSIGINT (Ctrl-Cを含む) とSIGTERMは`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののち必要ならgroup全体へSIGKILLで回収する。
 grace中の2回目以降のsignalは即座に強制回収へ進み、guestのExit受信後に届いたsignalは確定済みのguest結果を返す。
 runはQEMU起動直後にinstance stateをstoreへ記録し、終了時のcleanupで消す。state directoryを開けないstoreではrunを始めない。

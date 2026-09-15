@@ -1,4 +1,4 @@
-//! Reads one OCI Image Layout directory back into canonical MiniBundle bytes.
+//! Reads one OCI Image Layout directory back into verified MiniBundle bytes.
 //!
 //! Verification order is size, digest, JSON parse, semantic checks, then
 //! bundle parse. The caller writes to the store only after this function
@@ -9,7 +9,7 @@ use crate::{
     OciError,
     parse::{JsonValue, parse_json},
 };
-use minicontainer_bundle::{ImageSpec, format_digest};
+use minicontainer_bundle::format_digest;
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
@@ -25,9 +25,9 @@ pub(crate) struct Blob {
     pub(crate) digest: String,
 }
 
-/// Imports one layout directory into canonical MiniBundle bytes. The layer
-/// is rebuilt from its parsed fields so the store always receives canonical
-/// bytes, even if the ABI layout checks ever relax.
+/// Imports one layout directory into MiniBundle bytes. The verified layer
+/// bytes pass through unchanged so the store preserves the published artifact
+/// and re-export reproduces the same layer blob.
 pub fn import_bundle(dir: &Path) -> Result<Vec<u8>, OciError> {
     let root = canonical_root(dir)?;
     let layout = read_layout_file(dir, &root, Path::new("oci-layout"), MAX_JSON_LEN)?;
@@ -65,25 +65,19 @@ pub fn import_bundle(dir: &Path) -> Result<Vec<u8>, OciError> {
         "layer",
     )?;
 
-    assemble_bundle(&config.bytes, &layer)
+    assemble_bundle(&config.bytes, layer)
 }
 
-/// Assembles canonical MiniBundle bytes from verified config and layer
-/// blobs. Both blobs must already match their manifest descriptors; this
-/// function parses the config, cross-checks it against the bundle, and
-/// rebuilds canonical bytes. Registry pulls share this core.
-pub(crate) fn assemble_bundle(config: &[u8], layer: &Blob) -> Result<Vec<u8>, OciError> {
+/// Assembles MiniBundle bytes from verified config and layer blobs. Both
+/// blobs must already match their manifest descriptors; this function parses
+/// the config, cross-checks it against the bundle, and returns the layer
+/// bytes unchanged so the store preserves the published artifact byte-exactly.
+/// Registry pulls share this core.
+pub(crate) fn assemble_bundle(config: &[u8], layer: Blob) -> Result<Vec<u8>, OciError> {
     let config_value = parse_json(config)?;
     let bundle = minicontainer_bundle::parse(&layer.bytes).map_err(OciError::Bundle)?;
     require_config_match(&config_value, &layer.digest, &bundle)?;
-    let args: Vec<&str> = bundle.manifest.args().collect();
-    let canonical = minicontainer_bundle::build(ImageSpec {
-        name: bundle.manifest.name(),
-        args: &args,
-        elf: bundle.elf,
-    })
-    .map_err(OciError::Bundle)?;
-    Ok(canonical)
+    Ok(layer.bytes)
 }
 
 /// Canonicalizes the layout root and requires a directory.
@@ -383,10 +377,10 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    const LAYER_DIGEST: &str = "6c710671215c4929fa600956d236ae82df1f3a9f05f0b125c3fb0feed9096136";
-    const CONFIG_DIGEST: &str = "3f19ea537fd3b4cdee56a34be0d9c7f90b1472d3e12c0e7aff3a505f7dfac98e";
+    const LAYER_DIGEST: &str = "5b5bfa03d58cf705f1e4b2b25c7deff040dacd6d07c9530bb413af759873b07d";
+    const CONFIG_DIGEST: &str = "883d7fa4996b5ab067214dd9b4d64a83805f61bbef9ff30912067d88e9247835";
     const MANIFEST_DIGEST: &str =
-        "f095c9356a85036bc3e4a08e562e6826321aedd3569aaa15e076a9639170995b";
+        "64287f614ec08171127db4f9e411767d2ea1d635b9ec560377e0cdbed7367eeb";
 
     /// The golden fixture: name `hello`, no arguments, ELF `0x00..0x0f`.
     fn golden_bundle() -> Vec<u8> {
@@ -462,6 +456,25 @@ mod tests {
                 "{relative}"
             );
         }
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn import_preserves_a_layer_built_with_an_older_abi_minor() {
+        let root = fixture_root();
+        let mut legacy = golden_bundle();
+        legacy[10..12].copy_from_slice(&0_u16.to_le_bytes());
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &legacy[..56]);
+        sha2::Digest::update(&mut hasher, [0_u8; 32]);
+        sha2::Digest::update(&mut hasher, &legacy[88..]);
+        legacy[56..88].copy_from_slice(&sha2::Digest::finalize(hasher));
+        let dest = root.join("legacy-layout");
+        export_bundle(&legacy, &dest).expect("export legacy layout");
+
+        let restored = import_bundle(&dest).expect("import legacy layout");
+
+        assert_eq!(restored, legacy);
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

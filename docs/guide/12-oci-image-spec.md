@@ -58,7 +58,7 @@ manifest自体のdigestはpinと照合し、不一致は取得の失敗にする
 - schemeはHTTPSだけを使う。loopbackへのHTTPはfixture testだけの例外である。
 - redirectは1 blobにつき5回まで追い、HTTPS以外への転送は取得前に拒否する。
 - timeoutは接続10秒、1 blobの要求全体で60秒である。
-- size上限はmanifestとconfigが64 KiB、layerが8 MiBであり、宣言と実測の両方で検査する。
+- size上限はmanifestとconfigが64 KiB、layerが6 MiBであり、宣言と実測の両方で検査する。
 
 blobはmemoryに読み、検証が通るまでstoreを変更しない。
 失敗時は一時fileを作らず、storeにtagもblobも残さない。

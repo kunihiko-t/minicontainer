@@ -3,7 +3,7 @@
 use std::{
     error::Error,
     fmt,
-    io::{self, Read},
+    io::{self, Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread::{self, JoinHandle},
@@ -33,6 +33,12 @@ pub trait ProcessControl {
     /// deadlineを過ぎてもchildは停止しない。呼び出し側は必要に応じて
     /// [`Self::terminate_and_reap`]を明示的に呼び出す。
     fn next_event(&mut self, deadline: Instant) -> Result<ProcessEvent, ProcessError>;
+
+    /// childのstdin writerを一度だけ取り出す。stdin経路を持たないbackend
+    /// は`None`を返し、入力の転送が要求されたrunは`RuntimeError`になる。
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send + 'static>> {
+        None
+    }
 
     /// hostが受け取ったsignalをchildのprocess group全体へ転送する。
     ///
@@ -149,7 +155,12 @@ impl SystemProcess {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // stdinは常にpipeへ向ける。hostの入力byteがUARTへrawで流れてframe
+        // decodeを壊すことを防ぎ、`take_stdin`で転送側へ渡せる形にする。
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(ProcessError::Spawn)?;
         let stdout = child
             .stdout
@@ -252,6 +263,13 @@ impl SystemProcess {
 impl ProcessControl for SystemProcess {
     fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn Write + Send + 'static>> {
+        self.child
+            .stdin
+            .take()
+            .map(|stdin| Box::new(stdin) as Box<dyn Write + Send + 'static>)
     }
 
     fn next_event(&mut self, deadline: Instant) -> Result<ProcessEvent, ProcessError> {

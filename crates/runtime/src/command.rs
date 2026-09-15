@@ -28,8 +28,8 @@ impl QemuResources {
     pub const DEFAULT_MEMORY_MIB: u32 = 128;
     /// 既定のguest vCPU数。
     pub const DEFAULT_CPUS: u32 = 1;
-    /// 公開する最小のguest memory量 (MiB)。予約窓`0x8780_0000`がRAMに
-    /// 載る下限であり、既定値と一致する。
+    /// 公開する最小のguest memory量 (MiB)。FDT予約とpayload予約窓の合計
+    /// 8 MiBがRAMに載る下限であり、既定値と一致する。
     pub const MIN_MEMORY_MIB: u32 = 128;
     /// 公開する最大のguest memory量 (MiB)。
     pub const MAX_MEMORY_MIB: u32 = 8192;
@@ -37,6 +37,22 @@ impl QemuResources {
     pub const MIN_CPUS: u32 = 1;
     /// 公開する最大のguest vCPU数。
     pub const MAX_CPUS: u32 = 8;
+}
+
+/// QEMU `virt`のDRAM開始address。kernelはDTBから同じRAM範囲を導く。
+const RAM_BASE: u64 = 0x8000_0000;
+
+/// QEMU `virt`がDRAM上端に予約するFDT領域の長さ。kernelの
+/// `fdt::MachineSpec::payload_window`はこの直下へbundle窓を置く。
+const FDT_RESERVED_LEN: u64 = 2 * 1024 * 1024;
+
+/// `-device loader`がpayloadを置く物理address。kernelはFDTから
+/// `ram_end - FDT予約 - BUNDLE_MAX_LEN`を窓として導くため、host側も
+/// memory量から同じaddressを計算する必要がある。
+fn payload_addr(resources: QemuResources) -> u64 {
+    RAM_BASE + u64::from(resources.memory_mib) * 1024 * 1024
+        - FDT_RESERVED_LEN
+        - minios_abi::boot::BUNDLE_MAX_LEN
 }
 
 /// payload実行のための、引数順まで決定的なQEMU起動command。
@@ -92,7 +108,10 @@ impl QemuCommand {
 
         let mut loader = OsString::from("loader,file=");
         loader.push(payload.as_os_str());
-        loader.push(",addr=0x87800000,force-raw=on");
+        loader.push(format!(
+            ",addr=0x{:x},force-raw=on",
+            payload_addr(resources)
+        ));
         let memory = format!("{}M", resources.memory_mib);
         let cpus = format!("{}", resources.cpus);
         let args = [
@@ -175,6 +194,31 @@ mod tests {
 
         assert!(command.contains_pair("-m", "256M"));
         assert!(command.contains_pair("-smp", "2"));
+        assert!(command.contains_pair(
+            "-device",
+            "loader,file=/tmp/run/payload.mcb,addr=0x8f800000,force-raw=on"
+        ));
+    }
+
+    // Catches a payload address that stays fixed when memory grows: the
+    // kernel derives the bundle window from the FDT-reported RAM end, so a
+    // larger -m must move the loader address the same distance.
+    #[test]
+    fn loader_address_tracks_the_memory_size() {
+        let command = QemuCommand::new(
+            "/kernel",
+            "/tmp/run/payload.mcb",
+            QemuResources {
+                memory_mib: 512,
+                cpus: 1,
+            },
+        )
+        .unwrap();
+
+        assert!(command.contains_pair(
+            "-device",
+            "loader,file=/tmp/run/payload.mcb,addr=0x9f800000,force-raw=on"
+        ));
     }
 
     // Catches a QEMU invocation that drifts away from the single-hart, 128 MiB,

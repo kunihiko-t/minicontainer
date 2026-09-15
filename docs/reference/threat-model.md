@@ -7,6 +7,9 @@ MiniContainerは、信頼できる開発者が作成したRISC-V 64アプリケ�
 多弁なゲストによるホストメモリーの枯渇は、出力合計の1 MiB上限で抑える。
 上限は終了前に表示したbyteも含めた合計であり、逐次転送しても緩まない。
 表示先の停滞はevent loopへbackpressureをかけるが、全体の期限でrunを打ち切るため、遅いconsumerがQEMUを延命させることはない。
+標準入力は呼び出し側が供給する信頼する入力であり、guestへは4096 byte単位の`Stdin` frameとして届く。
+`read`を呼ばないguestはQEMUのstdin pipe経由で転送threadを止められるが、これも全体の期限で打ち切られるためQEMUを延命させない。
+入力の総量に上限はなく、flow controlが唯一の制限である。
 
 ## 信頼する入力
 
@@ -29,7 +32,7 @@ OCI Image Layoutのdirectoryとregistryの応答は、検証が通るまで信�
 検証が一つでも失敗したらstoreを変更せず、tagも付けない。
 
 layout内の参照pathはrootの内側だけに解決し、symlinkは追従しない。
-JSON文書は64 KiB、MiniBundle layerは8 MiBの上限で読み、超過は拒否する。
+JSON文書は64 KiB、MiniBundle layerは6 MiBの上限で読み、超過は拒否する。
 registry pullはhttpsだけを使い、redirectは5回までとし、認証情報は扱わない。
 loopbackへのhttpはfixture testだけの例外であり、CLIのpullはhttpsだけを使う。
 接続10秒、1 blobの要求全体で60秒のtimeoutを付け、失敗時はstoreを変更しない。

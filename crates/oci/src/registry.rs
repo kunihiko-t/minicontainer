@@ -1,8 +1,8 @@
 //! Anonymous OCI registry pulls pinned by manifest digest.
 //!
 //! Pulls fetch the manifest, config, and layer blobs over HTTPS, verify
-//! every descriptor, and assemble canonical MiniBundle bytes through the
-//! shared [`crate::import`] core. No credentials are ever sent: a registry
+//! every descriptor, and pass verified MiniBundle bytes through the shared
+//! [`crate::import`] core. No credentials are ever sent: a registry
 //! that answers 401 is reported, not authenticated against.
 
 use crate::{
@@ -81,7 +81,7 @@ pub fn parse_reference(text: &str) -> Result<Reference, OciError> {
     })
 }
 
-/// Pulls one pinned manifest and assembles canonical MiniBundle bytes.
+/// Pulls one pinned manifest and returns the verified MiniBundle layer bytes.
 pub fn pull_bundle(reference: &Reference, options: &PullOptions) -> Result<Vec<u8>, OciError> {
     pull_from(reference, options, "https")
 }
@@ -154,7 +154,7 @@ fn pull_from(
         scheme,
     )?;
 
-    assemble_bundle(&config.bytes, &layer)
+    assemble_bundle(&config.bytes, layer)
 }
 
 /// Builds the pull agent: no automatic redirects, no status errors, bounded
@@ -461,10 +461,10 @@ mod tests {
         },
     };
 
-    const LAYER_DIGEST: &str = "6c710671215c4929fa600956d236ae82df1f3a9f05f0b125c3fb0feed9096136";
-    const CONFIG_DIGEST: &str = "3f19ea537fd3b4cdee56a34be0d9c7f90b1472d3e12c0e7aff3a505f7dfac98e";
+    const LAYER_DIGEST: &str = "5b5bfa03d58cf705f1e4b2b25c7deff040dacd6d07c9530bb413af759873b07d";
+    const CONFIG_DIGEST: &str = "883d7fa4996b5ab067214dd9b4d64a83805f61bbef9ff30912067d88e9247835";
     const MANIFEST_DIGEST: &str =
-        "f095c9356a85036bc3e4a08e562e6826321aedd3569aaa15e076a9639170995b";
+        "64287f614ec08171127db4f9e411767d2ea1d635b9ec560377e0cdbed7367eeb";
 
     /// One scripted route: status, extra headers, body, an optional
     /// pre-response delay, and an optional truncation point with a declared

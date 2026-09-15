@@ -153,7 +153,7 @@ import後にstoreが持つdigestは、bundle検証から得たbundle digestで�
 
 ## Size上限と安全性
 
-- MiniBundle layerは8 MiB（`MAX_BUNDLE_LEN`）以内にする。
+- MiniBundle layerは6 MiB（`MAX_BUNDLE_LEN`）以内にする。
 - config、manifest、indexの各JSONは64 KiB以内にする。
 - importの検証順序は、size、digest、JSON parse、意味検証、MiniBundle parse、store書き込みの順にする。
 - 検証がすべて通るまでstoreを変更しない。

@@ -43,6 +43,8 @@ timeout、QEMU失敗、guest failure、protocol破損、実行中のSIGINT/SIGTE
 - `instance was ... but cleanup failed`を含む行は停止自体は完了したが残骸の回収に失敗したことを示す。
 - `guest output exceeds 1 MiB`を含む行は出力合計の上限超過である。
 - `guest output consumer failed`を含む行は、run途中の標準出力・標準エラー出力への書き出し失敗である。QEMU回収とpayload削除は行われる。
+- `guest stdin forwarding failed`を含む行は、標準入力の読み取りまたはQEMUのstdinへの書き込み失敗である。QEMU回収とpayload削除は行われる。
+- `does not support stdin forwarding`を含む行は、stdinを渡したのにguest ABIが古かったことを示す。入力は捨てられず、runは開始しない。
 - `; cleanup also failed`を含む行は、主操作に加えて後始末も失敗したことを示す。
 
 guest stderrのbytes自体にも`minictr:`は付かない。

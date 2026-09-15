@@ -79,7 +79,7 @@ pub fn build(spec: ImageSpec<'_>) -> Result<Vec<u8>, BundleError> {
     bytes[BOOT_HEADER_LEN..manifest_end].copy_from_slice(&manifest);
     bytes.extend_from_slice(spec.elf);
 
-    header.digest = digest_for(&header, &bytes[BOOT_HEADER_LEN..]);
+    header.digest = digest_for(&header.encode(), &bytes[BOOT_HEADER_LEN..]);
     bytes[..BOOT_HEADER_LEN].copy_from_slice(&header.encode());
     Ok(bytes)
 }
@@ -98,7 +98,9 @@ pub fn parse(bytes: &[u8]) -> Result<Bundle<'_>, BundleError> {
         });
     }
 
-    let actual_digest = digest_for(&header, &bytes[BOOT_HEADER_LEN..]);
+    // digestは保存されたheader bytes自身に対して計算する。decode→encodeは旧minorを
+    // 現行値へ書き換えるため再エンコード結果ではなくwire bytesを使う。
+    let actual_digest = digest_for(header_bytes, &bytes[BOOT_HEADER_LEN..]);
     if actual_digest != header.digest {
         return Err(BundleError::DigestMismatch);
     }
@@ -133,9 +135,13 @@ pub fn parse(bytes: &[u8]) -> Result<Bundle<'_>, BundleError> {
     })
 }
 
-fn digest_for(header: &BootHeader, variable_bytes: &[u8]) -> [u8; 32] {
+fn digest_for(header_bytes: &[u8], variable_bytes: &[u8]) -> [u8; 32] {
+    let mut canonical = [0_u8; BOOT_HEADER_LEN];
+    canonical.copy_from_slice(header_bytes);
+    // digestフィールドはheader bytesの56..88 (abi/src/boot.rsのencode参照)。
+    canonical[56..88].fill(0);
     let mut hasher = Sha256::new();
-    hasher.update(header.encode_with_zero_digest());
+    hasher.update(canonical);
     hasher.update(variable_bytes);
     hasher.finalize().into()
 }
@@ -168,6 +174,26 @@ mod tests {
         assert_eq!(bundle.manifest.args().collect::<Vec<_>>(), args);
         assert_eq!(bundle.elf, elf);
         assert_eq!(bytes.len() % 8, elf.len() % 8);
+    }
+
+    // Production break caught: digest verification re-encodes the decoded header,
+    // upgrading an older ABI minor byte and rejecting a valid legacy bundle.
+    #[test]
+    fn parses_a_bundle_built_with_an_older_abi_minor() {
+        let mut bytes = build(ImageSpec {
+            name: "a",
+            args: &[],
+            elf: b"elf",
+        })
+        .unwrap();
+        bytes[10..12].copy_from_slice(&0_u16.to_le_bytes());
+        let digest = digest_for(&bytes[..BOOT_HEADER_LEN], &bytes[BOOT_HEADER_LEN..]);
+        bytes[56..88].copy_from_slice(&digest);
+
+        let bundle = parse(&bytes).unwrap();
+
+        assert_eq!(bundle.manifest.name(), "a");
+        assert_eq!(bundle.elf, b"elf");
     }
 
     // Production break caught: digest validation omits the header, manifest, padding, or ELF region.
@@ -213,7 +239,7 @@ mod tests {
         assert_eq!(
             &bytes[..56],
             &[
-                b'M', b'I', b'N', b'I', b'C', b'T', b'R', 0, 1, 0, 0, 0, 96, 0, 0, 0, 120, 0, 0, 0,
+                b'M', b'I', b'N', b'I', b'C', b'T', b'R', 0, 1, 0, 2, 0, 96, 0, 0, 0, 120, 0, 0, 0,
                 0, 0, 0, 0, 96, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 104, 0, 0, 0, 0, 0, 0,
                 0, 16, 0, 0, 0, 0, 0, 0, 0,
             ],
@@ -234,16 +260,16 @@ mod tests {
         assert_eq!(
             &bytes[56..88],
             &[
-                0xd2, 0xe0, 0xc6, 0x02, 0xac, 0xbf, 0x71, 0x1b, 0x5d, 0x1c, 0xb7, 0xa2, 0xae, 0x07,
-                0xdd, 0x19, 0xd9, 0xed, 0xa0, 0xf6, 0x8c, 0xb7, 0x36, 0xa5, 0x07, 0xb9, 0x7a, 0x73,
-                0x9e, 0xa9, 0x7d, 0x48,
+                0x4b, 0xda, 0x85, 0x82, 0x9b, 0x64, 0x0f, 0x03, 0x6e, 0x35, 0xe7, 0x3c, 0x33, 0x0f,
+                0x18, 0x69, 0xc3, 0x5f, 0x12, 0xbd, 0x66, 0xde, 0x71, 0x14, 0x17, 0xfb, 0xa8, 0xcb,
+                0xae, 0x92, 0xe0, 0xd4,
             ],
         );
         assert_eq!(&bytes[96..113], b"version=1\nname=a\n");
         assert_eq!(&bytes[113..120], &[0; 7]);
     }
 
-    // Production break caught: builder rejects the largest payload that still fits the 8 MiB boot window.
+    // Production break caught: builder rejects the largest payload that still fits the 6 MiB boot window.
     #[test]
     fn accepts_the_maximum_total_bundle_length() {
         let elf = vec![0x5a; BUNDLE_MAX_LEN as usize - 120];
@@ -255,11 +281,11 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(bytes.len(), 8 * 1024 * 1024);
-        assert_eq!(parse(&bytes).unwrap().elf.len(), 8 * 1024 * 1024 - 120);
+        assert_eq!(bytes.len(), 6 * 1024 * 1024);
+        assert_eq!(parse(&bytes).unwrap().elf.len(), 6 * 1024 * 1024 - 120);
     }
 
-    // Production break caught: builder writes an ELF larger than the entire 8 MiB boot window.
+    // Production break caught: builder writes an ELF larger than the entire 6 MiB boot window.
     #[test]
     fn rejects_an_elf_one_byte_larger_than_the_boot_window() {
         let elf = vec![0; BUNDLE_MAX_LEN as usize + 1];
@@ -285,9 +311,9 @@ mod tests {
         .unwrap();
         bytes[113] = 1;
         bytes[56..88].copy_from_slice(&[
-            0x10, 0x74, 0x58, 0xc1, 0xd1, 0x6f, 0x33, 0xe1, 0x58, 0x45, 0xe3, 0x3e, 0x00, 0xf7,
-            0xb7, 0x9c, 0x5e, 0xd6, 0xb0, 0x9b, 0x35, 0xd2, 0xe5, 0x84, 0x9d, 0xf9, 0x4d, 0xff,
-            0x3b, 0xca, 0xa0, 0xfd,
+            0x5c, 0xd6, 0x66, 0xed, 0x09, 0xee, 0xf0, 0x55, 0xde, 0x99, 0xc3, 0xee, 0xb6, 0x8a,
+            0xb8, 0x0d, 0x73, 0xb0, 0xa8, 0xfa, 0x36, 0x10, 0xa9, 0xcb, 0x5c, 0xa2, 0x63, 0x68,
+            0x7e, 0x5e, 0xbd, 0x87,
         ]);
 
         assert!(matches!(parse(&bytes), Err(BundleError::NonZeroPadding)));
@@ -353,9 +379,9 @@ mod tests {
         .unwrap();
         bytes[111] = b'/';
         bytes[56..88].copy_from_slice(&[
-            0xde, 0xfd, 0x55, 0x0d, 0x22, 0x4b, 0x3f, 0x41, 0x99, 0x1a, 0xc8, 0x08, 0xca, 0xc4,
-            0xbd, 0x7a, 0xa1, 0xce, 0x01, 0x01, 0xa9, 0xaf, 0x93, 0x70, 0xe4, 0x78, 0xee, 0xc4,
-            0xef, 0x9f, 0x9f, 0xb5,
+            0x9c, 0x74, 0x60, 0xab, 0x14, 0xc8, 0x13, 0x21, 0xbb, 0xaf, 0x98, 0xb6, 0xd1, 0x62,
+            0xd8, 0x72, 0xe2, 0x55, 0xce, 0xb5, 0x2e, 0x44, 0x70, 0xba, 0xf3, 0x9f, 0x10, 0x4a,
+            0x15, 0xf5, 0x4f, 0x3c,
         ]);
 
         assert!(matches!(
@@ -423,7 +449,7 @@ mod tests {
     #[test]
     fn published_bundle_limit_matches_the_pinned_abi() {
         assert_eq!(MAX_BUNDLE_LEN, BUNDLE_MAX_LEN);
-        assert_eq!(MAX_BUNDLE_LEN, 8 * 1024 * 1024);
+        assert_eq!(MAX_BUNDLE_LEN, 6 * 1024 * 1024);
     }
 
     // Production break caught: digest display diverges from the lowercase
@@ -432,11 +458,11 @@ mod tests {
     fn formats_digests_as_lowercase_hex() {
         assert_eq!(
             format_digest([
-                0xd2, 0xe0, 0xc6, 0x02, 0xac, 0xbf, 0x71, 0x1b, 0x5d, 0x1c, 0xb7, 0xa2, 0xae, 0x07,
-                0xdd, 0x19, 0xd9, 0xed, 0xa0, 0xf6, 0x8c, 0xb7, 0x36, 0xa5, 0x07, 0xb9, 0x7a, 0x73,
-                0x9e, 0xa9, 0x7d, 0x48,
+                0x4b, 0xda, 0x85, 0x82, 0x9b, 0x64, 0x0f, 0x03, 0x6e, 0x35, 0xe7, 0x3c, 0x33, 0x0f,
+                0x18, 0x69, 0xc3, 0x5f, 0x12, 0xbd, 0x66, 0xde, 0x71, 0x14, 0x17, 0xfb, 0xa8, 0xcb,
+                0xae, 0x92, 0xe0, 0xd4,
             ]),
-            "d2e0c602acbf711b5d1cb7a2ae07dd19d9eda0f68cb736a507b97a739ea97d48"
+            "4bda85829b640f036e35e73c330f1869c35f12bd66de711417fba8cbae92e0d4"
         );
         assert_eq!(
             format_digest([0; 32]),

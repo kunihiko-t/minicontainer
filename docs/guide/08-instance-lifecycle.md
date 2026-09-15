@@ -76,6 +76,7 @@ Readyを確認したらinstance id `i-<pid>`を一行だけ標準出力へ出し
 handshake中のSIGINTとSIGTERMはforegroundと同じくQEMUのprocess groupへ転送し、回収を経て125で終わる。
 
 detached QEMUにsupervisorは居ない。
+stdin経路も無いため、`read`で待つguestは`stop`されるまで止まったままである。
 guestがExit frameを書いて終了しても誰も読まず、QEMUは動き続け、`ps`は`stop`するまでliveを出し続ける。
 `uart.log`と`qemu.log`には合計量の上限がなく、長時間放置すればdiskを消費する。
 回収は`minictr stop`の役目であり、identity照合つきのSIGTERM、grace、SIGKILL、payloadとstate fileの削除までを行う。
@@ -90,6 +91,7 @@ detached runでもforeground runでも、`stop`は同じ規則で動く。
 - timeout: 全体の期限切れ。
 - 出力上限超過: stdout、stderr、diagnosticsの合計が1 MiBを超えた場合のhost拒否。表示済みbyteも合計に含める。
 - consumer失敗: 逐次転送先の書き出し失敗。QEMU回収とpayload削除は行う。
+- 入力失敗: 標準入力の読み取りまたはguestへの書き込み失敗。QEMU回収とpayload削除は行う。
 - instance登録失敗: state fileを書けないrun。QEMUは起動直後に畳まれる。
 - detached boot失敗: `Ready`を待つ間にQEMUが終了した、または期限に達した。instanceは成立せず、残骸は回収済みである。
 - guest failure: `GuestError` frame。

@@ -23,7 +23,8 @@ fileは`create_new`で開くため、既存fileへの上書きも起きない。
 
 ## 予約メモリーへの受け渡し
 
-一時payloadのpathはQEMUの`-device loader,file=<path>,addr=0x87800000,force-raw=on`へ展開される。
+一時payloadのpathはQEMUの`-device loader,file=<path>,addr=<window>,force-raw=on`へ展開される。
+`<window>`は`RAM末尾 - 2 MiBのFDT予約 - 6 MiBのbundle窓`であり、`-m`の値から導く。既定の128 MiBでは`0x87800000`になる。
 miniOSは起動時にこの予約窓からELF byte sliceを取り出し、既存のloader経路へ渡す。
 ホスト側はELF mappingやuser pointer検証を複製しない。
 pathに`,`を含む場合はQEMUのoption構文を壊すため、起動前に型付きerrorで拒否する。

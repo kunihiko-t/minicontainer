@@ -6,6 +6,7 @@ mod error;
 mod instance;
 mod process;
 mod session;
+mod stdin;
 mod stop;
 mod temp;
 
@@ -27,10 +28,12 @@ pub use temp::PayloadTemp;
 
 use std::{
     ffi::OsStr,
-    io,
+    io::{self, Read},
     path::Path,
     time::{Duration, Instant},
 };
+
+use stdin::{STDIN_ABI_MINOR, StdinForwarder};
 
 /// 一つのMiniContainer runに必要な不変入力。
 pub struct RunRequest<'a> {
@@ -42,6 +45,13 @@ pub struct RunRequest<'a> {
     pub deadline: Duration,
     /// QEMUへ渡すguest resource量。
     pub resources: QemuResources,
+    /// guestへ転送するstdin byte stream。`Some`のrunはguest `Ready`後に
+    /// 内容を`STDIN` frameへ逐次変換し、readerのEOFで長さ0のframe
+    /// (guest側EOF) を送る。`None`のrunもstdin対応guestへはEOF frameだけを
+    /// 送り、`read`が0を返せるようにする。guest ABI v1.0への`Some`は
+    /// [`RuntimeError::InputAbiUnsupported`]で拒否され、`None`は従来どおり
+    /// frameを送らない。
+    pub input: Option<Box<dyn Read + Send>>,
     /// hostへ届いたSIGINTとSIGTERMを観測する源。`None`のrunはsignalを
     /// 観測せず、hostがsignalで死んだ場合はchildをreapできない。
     pub interrupts: Option<&'a dyn InterruptSource>,
@@ -155,6 +165,11 @@ const SIGNAL_GRACE: Duration = Duration::from_secs(2);
 /// signal観測のためにevent loopを起こす最大間隔。
 const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// stdin転送の終端を観測するためにevent loopを起こす最大間隔。forwarderが
+/// 生きている間だけ`next_event`の待機を切り詰め、UART trafficがなくても
+/// reader/writer failureを検知できるようにする。
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// MiniBundleを一時payloadとしてQEMU上で実行するruntime。
 pub struct Runtime<B: ProcessBackend = SystemProcessBackend> {
     backend: B,
@@ -234,6 +249,8 @@ impl<B: ProcessBackend> Runtime<B> {
 
         let mut session = Session::new();
         let mut signals = SignalWatch::new(request.interrupts, self.signal_grace);
+        let mut input = request.input;
+        let mut forwarder: Option<StdinForwarder> = None;
         let primary = 'events: loop {
             let bound = signals.bound(deadline);
             // queueにeventが残っていても全体の期限を強制する。backendが期限
@@ -245,7 +262,19 @@ impl<B: ProcessBackend> Runtime<B> {
             if let Err(error) = signals.poll(&mut child) {
                 break Err(error);
             }
-            match child.next_event(signals.event_deadline(bound)) {
+            // 転送の終端はloop先頭で観測する。reader/writer failureはrunの
+            // 主errorにし、EOF完了はforwarderを外すだけである。
+            if let Some(result) = forwarder.as_mut().and_then(StdinForwarder::poll) {
+                forwarder = None;
+                if let Err(error) = result {
+                    break Err(RuntimeError::Input(error));
+                }
+            }
+            let mut event_deadline = signals.event_deadline(bound);
+            if forwarder.is_some() {
+                event_deadline = event_deadline.min(Instant::now() + INPUT_POLL_INTERVAL);
+            }
+            match child.next_event(event_deadline) {
                 Ok(ProcessEvent::Uart(bytes)) => {
                     let events = match session.push_uart(&bytes) {
                         Ok(events) => events,
@@ -254,6 +283,14 @@ impl<B: ProcessBackend> Runtime<B> {
                     for event in &events {
                         if let Err(error) = sink.push(event) {
                             break 'events Err(RuntimeError::Consumer(error));
+                        }
+                        // `Ready`はsession上onceであり、guest ABIを確認して
+                        // から初めてhost→guest方向へ書き込める。
+                        if matches!(event, SessionEvent::Ready) {
+                            match start_forwarder(&mut child, input.take(), &session) {
+                                Ok(started) => forwarder = started,
+                                Err(error) => break 'events Err(error),
+                            }
                         }
                     }
                 }
@@ -287,6 +324,29 @@ impl Default for Runtime<SystemProcessBackend> {
     fn default() -> Self {
         Self::new(SystemProcessBackend::new())
     }
+}
+
+/// guest `Ready`観測後のstdin転送を開始する。`input`があるrunはEOFまで
+/// 転送する。`None`のrunもABIが対応していればEOF frameだけを送り、
+/// guestの`read`が0を返せるようにする。対応しないABIでは`None`のrunは
+/// 従来どおりframeを送らない。
+fn start_forwarder<C: ProcessControl>(
+    child: &mut C,
+    input: Option<Box<dyn Read + Send>>,
+    session: &Session,
+) -> Result<Option<StdinForwarder>, RuntimeError> {
+    let minor = session.guest_abi_minor().expect("Ready was observed");
+    if minor < STDIN_ABI_MINOR {
+        return match input {
+            Some(_) => Err(RuntimeError::InputAbiUnsupported(minor)),
+            None => Ok(None),
+        };
+    }
+    let writer = child.take_stdin().ok_or_else(|| {
+        RuntimeError::Input(io::Error::other("the backend provides no guest stdin"))
+    })?;
+    let input = input.unwrap_or_else(|| Box::new(io::empty()));
+    Ok(Some(StdinForwarder::spawn(writer, input)))
 }
 
 fn finish_without_child(
@@ -435,11 +495,16 @@ mod tests {
         collections::VecDeque,
         env,
         ffi::OsStr,
-        fs, io,
+        fs,
+        io::{self, Read, Write},
         path::PathBuf,
         process::{Child, Command},
         rc::Rc,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
         time::{Duration, Instant},
     };
 
@@ -475,6 +540,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(1),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: None,
                 instances: None,
             })
@@ -535,6 +601,7 @@ mod tests {
                         kernel: "/kernel".as_ref(),
                         deadline: Duration::from_secs(1),
                         resources: QemuResources::DEFAULT,
+                        input: None,
                         interrupts: None,
                         instances: None,
                     })
@@ -576,6 +643,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: None,
                 })
@@ -595,6 +663,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: None,
                 })
@@ -645,6 +714,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_millis(100),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: None,
                 instances: None,
             })
@@ -674,6 +744,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::MAX,
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: None,
                 instances: None,
             })
@@ -714,6 +785,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(1),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: None,
                 instances: None,
             })
@@ -763,6 +835,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: None,
                 },
@@ -817,6 +890,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: None,
                 },
@@ -862,6 +936,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: None,
                 },
@@ -911,6 +986,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_millis(50),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: None,
                 },
@@ -963,6 +1039,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(5),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: None,
                 },
@@ -1010,6 +1087,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: Some(&interrupts),
                 instances: None,
             })
@@ -1047,6 +1125,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: Some(&interrupts),
                 instances: None,
             })
@@ -1092,6 +1171,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: Some(&interrupts),
                 instances: None,
             })
@@ -1140,6 +1220,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(60),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: Some(&interrupts),
                     instances: None,
                 },
@@ -1186,6 +1267,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: Some(&interrupts),
                 instances: None,
             })
@@ -1225,6 +1307,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: Some(&interrupts),
                 instances: None,
             })
@@ -1266,6 +1349,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(60),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: Some(&interrupts),
                 instances: None,
             })
@@ -1305,6 +1389,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::ZERO,
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: Some(&interrupts),
                 instances: None,
             })
@@ -1317,6 +1402,336 @@ mod tests {
         assert!(
             !trace.borrow().contains(&"sigint"),
             "a run past its deadline must not start forwarding"
+        );
+    }
+
+    // Catches forwarding input before Ready or forgetting the EOF frame: the
+    // guest must receive the bytes as Stdin frames followed by the sentinel,
+    // and only after the ABI handshake.
+    #[test]
+    fn stdin_bytes_are_forwarded_as_frames_after_ready() {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![
+                    ProcessEvent::Uart(guest_stream(0)),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            )
+            .stdin(SharedBuffer(capture.clone())),
+        );
+
+        let outcome = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(5),
+                resources: QemuResources::DEFAULT,
+                input: Some(Box::new(&b"abc\x00\xff"[..])),
+                interrupts: None,
+                instances: None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 0);
+        // forwarderは非同期なので、run終了後に書き込み完了を待つ。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let frames = loop {
+            let frames = minicontainer_protocol::Decoder::new()
+                .push(&capture.lock().unwrap())
+                .unwrap_or_default();
+            if frames.len() >= 2 {
+                break frames;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the forwarded frames never arrived, got {frames:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.payload.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"abc\x00\xff".as_slice(), b""]
+        );
+        assert!(
+            frames.iter().all(|frame| frame.kind == FrameKind::Stdin),
+            "all forwarded frames must be Stdin, got {frames:?}"
+        );
+    }
+
+    // Catches a host stdin read failure being swallowed: the run must fail
+    // with the typed input error and still reap QEMU and the payload.
+    #[test]
+    fn an_input_reader_failure_fails_the_run_and_cleans_up() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _output: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "stdin broke"))
+            }
+        }
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        // Ready以降はeventなし — forwarderの失敗だけがloopを終わらせる。
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![ProcessEvent::Uart(ready_frame())],
+            )
+            .stdin(SharedBuffer(capture)),
+        );
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(60),
+                resources: QemuResources::DEFAULT,
+                input: Some(Box::new(FailingReader)),
+                interrupts: None,
+                instances: None,
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Input(_)),
+            "the read failure must be a typed input error, got {error:?}"
+        );
+        assert_eq!(
+            trace
+                .borrow()
+                .iter()
+                .filter(|event| **event == "reap")
+                .count(),
+            1
+        );
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches a QEMU stdin write failure being hidden: a non-EPIPE write
+    // error must fail the run and still clean up.
+    #[test]
+    fn a_stdin_write_failure_fails_the_run_and_cleans_up() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![ProcessEvent::Uart(ready_frame())],
+            )
+            .stdin(FailingWriter(io::ErrorKind::PermissionDenied)),
+        );
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(60),
+                resources: QemuResources::DEFAULT,
+                input: Some(Box::new(&b"data"[..])),
+                interrupts: None,
+                instances: None,
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Input(_)),
+            "the write failure must be a typed input error, got {error:?}"
+        );
+        assert_eq!(
+            trace
+                .borrow()
+                .iter()
+                .filter(|event| **event == "reap")
+                .count(),
+            1
+        );
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches the run waiting on a blocked input reader: guest Exit must end
+    // the run even while the forwarder thread is still parked in `read`.
+    #[test]
+    fn a_blocked_input_reader_does_not_hold_the_run() {
+        struct BlockingReader(mpsc::Receiver<()>);
+        impl Read for BlockingReader {
+            fn read(&mut self, _output: &mut [u8]) -> io::Result<usize> {
+                // senderが生きている間は永久に待つ。dropでEOFになる。
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (keep_open, park) = mpsc::channel();
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![
+                    ProcessEvent::Uart(guest_stream(5)),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            )
+            .stdin(SharedBuffer(capture)),
+        );
+
+        let outcome = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(5),
+                resources: QemuResources::DEFAULT,
+                input: Some(Box::new(BlockingReader(park))),
+                interrupts: None,
+                instances: None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 5);
+        // readerを解放してforwarder threadを終わらせる。
+        drop(keep_open);
+    }
+
+    // Catches silently dropping requested input on an old guest: a v1.0 guest
+    // has no Stdin frame kind, so the run must refuse instead of pretending.
+    #[test]
+    fn a_guest_without_stdin_support_rejects_input() {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![
+                    ProcessEvent::Uart(ready_frame_minor(0)),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            )
+            .stdin(SharedBuffer(capture.clone())),
+        );
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(5),
+                resources: QemuResources::DEFAULT,
+                input: Some(Box::new(&b"data"[..])),
+                interrupts: None,
+                instances: None,
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::InputAbiUnsupported(0)),
+            "the v1.0 guest must reject input, got {error:?}"
+        );
+        assert!(
+            capture.lock().unwrap().is_empty(),
+            "no Stdin frame may reach a guest that cannot decode it"
+        );
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches an input-less run leaving guest reads blocked: a stdin-capable
+    // guest must still receive the EOF frame so its read returns 0.
+    #[test]
+    fn a_run_without_input_sends_only_the_eof_frame() {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![
+                    ProcessEvent::Uart(guest_stream(3)),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            )
+            .stdin(SharedBuffer(capture.clone())),
+        );
+
+        let outcome = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(5),
+                resources: QemuResources::DEFAULT,
+                input: None,
+                interrupts: None,
+                instances: None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 3);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let frames = minicontainer_protocol::Decoder::new()
+                .push(&capture.lock().unwrap())
+                .unwrap_or_default();
+            if let [frame] = frames.as_slice() {
+                assert_eq!(frame.kind, FrameKind::Stdin);
+                assert!(frame.payload.is_empty());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the EOF frame never arrived, got {frames:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // Catches writing even the EOF sentinel to a guest that predates the
+    // Stdin kind: a v1.0 guest cannot decode the frame, so an input-less
+    // run must preserve the old behavior and send nothing.
+    #[test]
+    fn a_guest_without_stdin_support_sends_no_frames() {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![
+                    ProcessEvent::Uart(ready_frame_minor(0)),
+                    ProcessEvent::Uart(frame(FrameKind::Exit, &3u32.to_le_bytes())),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            )
+            .stdin(SharedBuffer(capture.clone())),
+        );
+
+        let outcome = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(5),
+                resources: QemuResources::DEFAULT,
+                input: None,
+                interrupts: None,
+                instances: None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 3);
+        assert!(
+            capture.lock().unwrap().is_empty(),
+            "a v1.0 guest must not receive frames it cannot decode"
         );
     }
 
@@ -1356,6 +1771,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(5),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: Some(registration),
                 },
@@ -1401,6 +1817,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(5),
                 resources: QemuResources::DEFAULT,
+                input: None,
                 interrupts: None,
                 instances: Some(registration),
             })
@@ -1456,6 +1873,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(5),
                     resources: QemuResources::DEFAULT,
+                    input: None,
                     interrupts: None,
                     instances: Some(registration),
                 },
@@ -1636,6 +2054,32 @@ mod tests {
         }
     }
 
+    /// `take_stdin`で返す共有buffer writer。forwarderの書き込みをtest側
+    /// からdecodeするために使う。
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// writeで即座に所定のerrorを返すstdin writer。
+    struct FailingWriter(io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "injected stdin write failure"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct FakeBackend {
         trace: Rc<RefCell<Vec<&'static str>>>,
         payload: Rc<RefCell<Option<PathBuf>>>,
@@ -1643,6 +2087,7 @@ mod tests {
         reap_fails: bool,
         signal_fails: bool,
         pid: u32,
+        stdin: RefCell<Option<Box<dyn Write + Send + 'static>>>,
     }
 
     impl FakeBackend {
@@ -1658,6 +2103,7 @@ mod tests {
                 reap_fails: false,
                 signal_fails: false,
                 pid: 42,
+                stdin: RefCell::new(Some(Box::new(io::sink()))),
             }
         }
 
@@ -1672,7 +2118,14 @@ mod tests {
                 reap_fails: false,
                 signal_fails: false,
                 pid: 42,
+                stdin: RefCell::new(Some(Box::new(io::sink()))),
             }
+        }
+
+        /// `take_stdin`が`writer`を返すよう設定する。
+        fn stdin(self, writer: impl Write + Send + 'static) -> Self {
+            *self.stdin.borrow_mut() = Some(Box::new(writer));
+            self
         }
 
         fn reap_fails(mut self) -> Self {
@@ -1718,6 +2171,7 @@ mod tests {
                     reap_fails: self.reap_fails,
                     signal_fails: self.signal_fails,
                     pid: self.pid,
+                    stdin: self.stdin.borrow_mut().take(),
                 }),
                 FakeSpawnResult::Fails => Err(ProcessError::Spawn(io::Error::other(
                     "injected spawn failure",
@@ -1739,11 +2193,16 @@ mod tests {
         reap_fails: bool,
         signal_fails: bool,
         pid: u32,
+        stdin: Option<Box<dyn Write + Send + 'static>>,
     }
 
     impl ProcessControl for FakeChild {
         fn id(&self) -> u32 {
             self.pid
+        }
+
+        fn take_stdin(&mut self) -> Option<Box<dyn Write + Send + 'static>> {
+            self.stdin.take()
         }
 
         fn next_event(&mut self, _deadline: Instant) -> Result<ProcessEvent, ProcessError> {
@@ -1830,8 +2289,19 @@ mod tests {
         frame(
             FrameKind::Ready,
             &ReadyPayload {
-                abi_major: 1,
-                abi_minor: 0,
+                abi_major: minios_abi::boot::BOOT_ABI_MAJOR,
+                abi_minor: minios_abi::boot::BOOT_ABI_MINOR,
+            }
+            .encode(),
+        )
+    }
+
+    fn ready_frame_minor(minor: u16) -> Vec<u8> {
+        frame(
+            FrameKind::Ready,
+            &ReadyPayload {
+                abi_major: minios_abi::boot::BOOT_ABI_MAJOR,
+                abi_minor: minor,
             }
             .encode(),
         )

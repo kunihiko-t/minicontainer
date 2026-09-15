@@ -272,7 +272,7 @@ fn tracked_workflows(root: &Path) -> Result<Vec<PathBuf>, PublicationError> {
 /// gets provenance; a single pinned tag would silently skip future releases.
 const RELEASE_TAG_PATTERN: &str = "v*";
 /// miniOS kernel revision packed into release archives.
-const RELEASE_KERNEL_REV: &str = "9be99255a59d58d19db25b835af0e28a8d2a4036";
+const RELEASE_KERNEL_REV: &str = "4865f9be97a6cdcd77c71e36b1ba426b49bd73d7";
 /// Command that owns release archive builds.
 const DIST_COMMAND: &str = "cargo xtask dist";
 /// Release archive name stem shared by the tarball and its checksum. The
