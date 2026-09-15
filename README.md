@@ -214,6 +214,7 @@ cargo xtask check
 CIはUbuntu 24.04で`setup`と`check`、Apple SiliconのmacOSで`check-host`を実行する。
 E2Eは固定リビジョンのminiOSカーネルをビルドし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了コード42、QEMUの回収、一時ディレクトリーの後始末を確認する。
 タイムアウト、不正フレーム、出力上限、割り込みの失敗経路では、非0終了と残留物がないことも確認する。
+parserのfuzzは`cargo xtask fuzz --target <bundle|uart>`で実行し、findingは決定性のreplayで再現する。詳細は[セキュリティテスト](docs/reference/security-testing.md)を参照する。
 
 ## 配布物
 

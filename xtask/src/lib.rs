@@ -4,6 +4,7 @@ pub mod cargo;
 pub mod cli;
 pub mod dist;
 pub mod docs;
+pub mod fuzz;
 pub mod publication;
 pub mod runtime;
 pub mod tools;
@@ -275,6 +276,7 @@ pub enum XtaskError {
     Cargo(cargo::CargoError),
     Dist(dist::DistError),
     Docs(docs::DocsError),
+    Fuzz(fuzz::FuzzError),
     Publication(publication::PublicationError),
     Runtime(runtime::E2EError),
     Tool(tools::ToolError),
@@ -287,6 +289,7 @@ impl fmt::Display for XtaskError {
             Self::Cargo(error) => error.fmt(formatter),
             Self::Dist(error) => error.fmt(formatter),
             Self::Docs(error) => error.fmt(formatter),
+            Self::Fuzz(error) => error.fmt(formatter),
             Self::Publication(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
             Self::Tool(error) => error.fmt(formatter),
@@ -301,6 +304,7 @@ impl std::error::Error for XtaskError {
             Self::Cargo(error) => Some(error),
             Self::Dist(error) => Some(error),
             Self::Docs(error) => Some(error),
+            Self::Fuzz(error) => Some(error),
             Self::Publication(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::Tool(error) => Some(error),
@@ -318,6 +322,12 @@ impl From<cargo::CargoError> for XtaskError {
 impl From<docs::DocsError> for XtaskError {
     fn from(error: docs::DocsError) -> Self {
         Self::Docs(error)
+    }
+}
+
+impl From<fuzz::FuzzError> for XtaskError {
+    fn from(error: fuzz::FuzzError) -> Self {
+        Self::Fuzz(error)
     }
 }
 
@@ -395,6 +405,21 @@ pub fn run(command: Command) -> Result<(), XtaskError> {
         Command::CheckHost => run_check_host(&workspace_root()),
         Command::Check => run_check(&workspace_root()),
         Command::Dist(args) => dist::run(&workspace_root(), &args).map_err(XtaskError::Dist),
+        Command::Fuzz(args) => {
+            let report = fuzz::run(&args.config(&workspace_root()))?;
+            let noun = if report.iters_run == 1 {
+                "input"
+            } else {
+                "inputs"
+            };
+            println!(
+                "fuzz {}: {} {noun} passed without findings (seed {})",
+                report.target.name(),
+                report.iters_run,
+                report.seed
+            );
+            Ok(())
+        }
     }
 }
 

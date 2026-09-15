@@ -2,6 +2,12 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
+    time::Duration,
+};
+
+use crate::fuzz::{
+    DEFAULT_ALLOC_CAP, DEFAULT_INPUT_TIMEOUT, DEFAULT_ITERS, DEFAULT_MAX_BYTES, DEFAULT_SEED,
+    FuzzConfig, FuzzTarget,
 };
 
 /// A public MiniContainer development command.
@@ -15,6 +21,8 @@ pub enum Command {
     Check,
     /// Builds and verifies a distribution archive from prebuilt inputs.
     Dist(DistArgs),
+    /// Fuzzes one parser with deterministic inputs.
+    Fuzz(FuzzArgs),
 }
 
 /// Arguments for the `dist` command.
@@ -43,6 +51,56 @@ impl DistArgs {
         self.output
             .clone()
             .unwrap_or_else(|| workspace.join("dist"))
+    }
+}
+
+/// Arguments for the `fuzz` command.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FuzzArgs {
+    /// Target parser. Required.
+    pub target: FuzzTarget,
+    /// Random seed. `None` selects the default seed.
+    pub seed: Option<u64>,
+    /// Generated inputs. `None` selects the default count.
+    pub iters: Option<u64>,
+    /// Generated input limit in bytes. `None` selects the default limit.
+    pub max_bytes: Option<usize>,
+    /// Per-input timeout in seconds. `None` selects the default timeout.
+    pub input_timeout_secs: Option<u64>,
+    /// Total time limit in seconds. `None` means no limit.
+    pub time_limit_secs: Option<u64>,
+    /// Seed corpus directory. `None` selects `<workspace>/xtask/corpus`.
+    pub corpus: Option<PathBuf>,
+    /// Finding output directory. `None` selects `<workspace>/target/fuzz`.
+    pub output: Option<PathBuf>,
+    /// Replays this one file without mutation.
+    pub input: Option<PathBuf>,
+}
+
+impl FuzzArgs {
+    /// Resolves the fuzz configuration against the workspace root.
+    pub fn config(&self, workspace: &Path) -> FuzzConfig {
+        FuzzConfig {
+            target: self.target,
+            seed: self.seed.unwrap_or(DEFAULT_SEED),
+            iters: self.iters.unwrap_or(DEFAULT_ITERS),
+            max_bytes: self.max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
+            input_timeout: self
+                .input_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_INPUT_TIMEOUT),
+            time_limit: self.time_limit_secs.map(Duration::from_secs),
+            alloc_cap: DEFAULT_ALLOC_CAP,
+            corpus_dir: self
+                .corpus
+                .clone()
+                .unwrap_or_else(|| workspace.join("xtask/corpus")),
+            output_dir: self
+                .output
+                .clone()
+                .unwrap_or_else(|| workspace.join("target/fuzz")),
+            replay_input: self.input.clone(),
+        }
     }
 }
 
@@ -77,6 +135,8 @@ pub enum CliError {
     MissingValue(&'static str),
     /// A required option was not supplied.
     MissingOption(&'static str),
+    /// An option value has an unsupported shape.
+    InvalidValue(&'static str),
 }
 
 impl fmt::Display for CliError {
@@ -100,13 +160,16 @@ impl fmt::Display for CliError {
             Self::MissingOption(option) => {
                 write!(formatter, "missing required xtask option: {option}")
             }
+            Self::InvalidValue(option) => {
+                write!(formatter, "invalid value for xtask option: {option}")
+            }
         }
     }
 }
 
 /// Returns the complete public command syntax.
 pub fn help() -> &'static str {
-    "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]"
+    "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
 }
 
 /// Parses one supported command from UTF-8 arguments.
@@ -129,6 +192,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         "check-host" => parse_bare(arguments, Command::CheckHost),
         "check" => parse_bare(arguments, Command::Check),
         "dist" => parse_dist(arguments),
+        "fuzz" => parse_fuzz(arguments),
         unknown => Err(CliError::UnknownCommand(unknown.to_owned())),
     }
 }
@@ -228,6 +292,121 @@ fn parse_dist(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
         kernel,
         output,
     }))
+}
+
+/// Parses the `fuzz` options. Every option takes a value, either as a
+/// separate token or as `--option=value`.
+fn parse_fuzz(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut target: Option<FuzzTarget> = None;
+    let mut seed: Option<u64> = None;
+    let mut iters: Option<u64> = None;
+    let mut max_bytes: Option<usize> = None;
+    let mut input_timeout_secs: Option<u64> = None;
+    let mut time_limit_secs: Option<u64> = None;
+    let mut corpus: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut input: Option<PathBuf> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter();
+    while let Some(argument) = rest.next() {
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        let Some(name) = text.strip_prefix("--") else {
+            return Err(CliError::UnexpectedArgument(text));
+        };
+        let (name, inline_value) = match name.split_once('=') {
+            Some((name, value)) => (name, Some(OsString::from(value))),
+            None => (name, None),
+        };
+        let value = |option: &'static str| match inline_value {
+            Some(value) => Ok(value),
+            None => rest.next().ok_or(CliError::MissingValue(option)),
+        };
+        match name {
+            "target" => {
+                if target.is_some() {
+                    return Err(CliError::DuplicateOption("--target"));
+                }
+                let value = value("--target")?;
+                let value = value.into_string().map_err(CliError::NonUtf8Argument)?;
+                target = Some(FuzzTarget::parse(&value).ok_or(CliError::InvalidValue("--target"))?);
+            }
+            "seed" => {
+                if seed.is_some() {
+                    return Err(CliError::DuplicateOption("--seed"));
+                }
+                seed = Some(parse_u64(value("--seed")?, "--seed")?);
+            }
+            "iters" => {
+                if iters.is_some() {
+                    return Err(CliError::DuplicateOption("--iters"));
+                }
+                iters = Some(parse_u64(value("--iters")?, "--iters")?);
+            }
+            "max-bytes" => {
+                if max_bytes.is_some() {
+                    return Err(CliError::DuplicateOption("--max-bytes"));
+                }
+                max_bytes = Some(parse_usize(value("--max-bytes")?, "--max-bytes")?);
+            }
+            "input-timeout" => {
+                if input_timeout_secs.is_some() {
+                    return Err(CliError::DuplicateOption("--input-timeout"));
+                }
+                input_timeout_secs = Some(parse_u64(value("--input-timeout")?, "--input-timeout")?);
+            }
+            "time-limit" => {
+                if time_limit_secs.is_some() {
+                    return Err(CliError::DuplicateOption("--time-limit"));
+                }
+                time_limit_secs = Some(parse_u64(value("--time-limit")?, "--time-limit")?);
+            }
+            "corpus" => {
+                if corpus.is_some() {
+                    return Err(CliError::DuplicateOption("--corpus"));
+                }
+                corpus = Some(PathBuf::from(value("--corpus")?));
+            }
+            "output" => {
+                if output.is_some() {
+                    return Err(CliError::DuplicateOption("--output"));
+                }
+                output = Some(PathBuf::from(value("--output")?));
+            }
+            "input" => {
+                if input.is_some() {
+                    return Err(CliError::DuplicateOption("--input"));
+                }
+                input = Some(PathBuf::from(value("--input")?));
+            }
+            unknown => return Err(CliError::UnknownOption(format!("--{unknown}"))),
+        }
+    }
+
+    let Some(target) = target else {
+        return Err(CliError::MissingOption("--target"));
+    };
+    Ok(Command::Fuzz(FuzzArgs {
+        target,
+        seed,
+        iters,
+        max_bytes,
+        input_timeout_secs,
+        time_limit_secs,
+        corpus,
+        output,
+        input,
+    }))
+}
+
+fn parse_u64(value: OsString, option: &'static str) -> Result<u64, CliError> {
+    let text = value.into_string().map_err(CliError::NonUtf8Argument)?;
+    text.parse().map_err(|_| CliError::InvalidValue(option))
+}
+
+fn parse_usize(value: OsString, option: &'static str) -> Result<usize, CliError> {
+    let text = value.into_string().map_err(CliError::NonUtf8Argument)?;
+    text.parse().map_err(|_| CliError::InvalidValue(option))
 }
 
 #[cfg(test)]
@@ -375,10 +554,116 @@ mod tests {
     }
 
     #[test]
+    fn parses_fuzz_with_required_and_optional_options() {
+        assert_eq!(
+            parse(["fuzz", "--target", "bundle"]),
+            Ok(Command::Fuzz(FuzzArgs {
+                target: FuzzTarget::Bundle,
+                seed: None,
+                iters: None,
+                max_bytes: None,
+                input_timeout_secs: None,
+                time_limit_secs: None,
+                corpus: None,
+                output: None,
+                input: None,
+            }))
+        );
+        assert_eq!(
+            parse([
+                "fuzz",
+                "--target=uart",
+                "--seed=7",
+                "--iters=100",
+                "--max-bytes=4096",
+                "--input-timeout=2",
+                "--time-limit=60",
+                "--corpus=seeds",
+                "--output=out",
+                "--input=crash.bin",
+            ]),
+            Ok(Command::Fuzz(FuzzArgs {
+                target: FuzzTarget::Uart,
+                seed: Some(7),
+                iters: Some(100),
+                max_bytes: Some(4096),
+                input_timeout_secs: Some(2),
+                time_limit_secs: Some(60),
+                corpus: Some(PathBuf::from("seeds")),
+                output: Some(PathBuf::from("out")),
+                input: Some(PathBuf::from("crash.bin")),
+            }))
+        );
+    }
+
+    #[test]
+    fn fuzz_rejects_missing_duplicate_and_invalid_options() {
+        assert_eq!(
+            parse(["fuzz", "--seed", "7"]),
+            Err(CliError::MissingOption("--target"))
+        );
+        assert_eq!(
+            parse(["fuzz", "--target", "qemu"]),
+            Err(CliError::InvalidValue("--target"))
+        );
+        assert_eq!(
+            parse(["fuzz", "--target", "bundle", "--seed", "seven"]),
+            Err(CliError::InvalidValue("--seed"))
+        );
+        assert_eq!(
+            parse(["fuzz", "--target", "bundle", "--max-bytes", "4k"]),
+            Err(CliError::InvalidValue("--max-bytes"))
+        );
+        assert_eq!(
+            parse(["fuzz", "--target", "bundle", "--iters"]),
+            Err(CliError::MissingValue("--iters"))
+        );
+        assert_eq!(
+            parse(["fuzz", "--target", "bundle", "--seed", "1", "--seed", "2",]),
+            Err(CliError::DuplicateOption("--seed"))
+        );
+        assert_eq!(
+            parse(["fuzz", "--target", "bundle", "--jobs", "4"]),
+            Err(CliError::UnknownOption("--jobs".to_owned()))
+        );
+        assert_eq!(
+            parse(["fuzz", "--target", "bundle", "positional"]),
+            Err(CliError::UnexpectedArgument("positional".to_owned()))
+        );
+    }
+
+    #[test]
+    fn fuzz_args_resolves_defaults() {
+        let args = FuzzArgs {
+            target: FuzzTarget::Uart,
+            seed: None,
+            iters: None,
+            max_bytes: None,
+            input_timeout_secs: None,
+            time_limit_secs: None,
+            corpus: None,
+            output: None,
+            input: None,
+        };
+        let config = args.config(Path::new("/workspace"));
+
+        assert_eq!(config.target, FuzzTarget::Uart);
+        assert_eq!(config.seed, DEFAULT_SEED);
+        assert_eq!(config.iters, DEFAULT_ITERS);
+        assert_eq!(config.max_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(config.input_timeout, DEFAULT_INPUT_TIMEOUT);
+        assert_eq!(config.time_limit, None);
+        assert_eq!(config.alloc_cap, DEFAULT_ALLOC_CAP);
+        assert_eq!(config.corpus_dir, PathBuf::from("/workspace/xtask/corpus"));
+        assert_eq!(config.output_dir, PathBuf::from("/workspace/target/fuzz"));
+        assert_eq!(config.replay_input, None);
+    }
+
+    #[test]
     fn help_and_diagnostics_name_the_public_contract() {
         assert_eq!(
             help(),
-            "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]"
+            "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
         );
         assert_eq!(
             CliError::MissingCommand.to_string(),
@@ -391,6 +676,10 @@ mod tests {
         assert_eq!(
             CliError::UnexpectedArgument("extra".to_owned()).to_string(),
             "unexpected xtask argument: extra"
+        );
+        assert_eq!(
+            CliError::InvalidValue("--seed").to_string(),
+            "invalid value for xtask option: --seed"
         );
     }
 

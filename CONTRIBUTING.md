@@ -23,6 +23,19 @@ cargo xtask check
 固有の契約、境界値、失敗の切り分けを担わないテストは、残るテストで同じ退行を検出できることを確認してから削除する。
 判断基準と削除手順は[テストハーネスと公開gate](docs/guide/11-test-harness-gate.md#テストを定期的に棚卸しする)に定める。
 
+## セキュリティテスト
+
+MiniBundle parserとUART decoderの変更では、境界テストに加えてfuzz harnessを実行する。
+
+```sh
+cargo xtask fuzz --target bundle
+cargo xtask fuzz --target uart
+```
+
+findingがあると終了code 1になり、再現commandが表示される。
+findingの入力は縮小して`xtask/corpus/<target>/`へ追加し、corpus replayで固定する。
+検出器、制限、corpus保存方針は[セキュリティテスト](docs/reference/security-testing.md)に定める。
+
 ## コメントと言語
 
 公開するコメントと文書は日本語で書く。
