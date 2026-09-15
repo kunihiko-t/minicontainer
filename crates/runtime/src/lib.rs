@@ -19,6 +19,7 @@ pub use session::{RunOutcome, Session, SessionError, SessionEvent};
 pub use temp::PayloadTemp;
 
 use std::{
+    ffi::OsStr,
     io,
     path::Path,
     time::{Duration, Instant},
@@ -49,6 +50,10 @@ pub struct InstanceRegistration<'a> {
     pub dir: &'a InstanceDir,
     /// `ps`のIMAGE列に出すimage tagまたはdigest。
     pub image: &'a str,
+    /// spawnされるprogramのpathまたは名前。exec完了まで子のcommは親の
+    /// 名前のままなので、basenameがcommへ現れるまでidentityの記録を待つ
+    /// ために使う。
+    pub program: &'a OsStr,
 }
 
 /// hostが受け取った中断signal。
@@ -201,7 +206,11 @@ impl<B: ProcessBackend> Runtime<B> {
         // 起動したprocessのidentityをrunの開始時点で記録する。記録できない
         // instanceを起動したままにはしないため、失敗時は通常cleanupを通す。
         let instance = match &request.instances {
-            Some(registration) => match registration.dir.register(registration.image, child.id()) {
+            Some(registration) => match registration.dir.register(
+                registration.image,
+                child.id(),
+                registration.program,
+            ) {
                 Ok(handle) => Some((registration.dir, handle)),
                 Err(error) => {
                     let mut failures = Vec::new();
@@ -405,7 +414,9 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         collections::VecDeque,
-        env, fs, io,
+        env,
+        ffi::OsStr,
+        fs, io,
         path::PathBuf,
         process::{Child, Command},
         rc::Rc,
@@ -1311,9 +1322,11 @@ mod tests {
             )
             .pid(sleeper.id()),
         );
+        let sleeper_program = env::current_exe().unwrap();
         let registration = InstanceRegistration {
             dir: &dir,
             image: "hello",
+            program: sleeper_program.as_os_str(),
         };
         let mut sink = RecordingSink::new(trace.clone()).probe(state_path);
 
@@ -1360,6 +1373,7 @@ mod tests {
         let registration = InstanceRegistration {
             dir: &dir,
             image: "hello",
+            program: OsStr::new("sleep"),
         };
 
         let error = runtime
@@ -1406,9 +1420,11 @@ mod tests {
             )
             .pid(sleeper.id()),
         );
+        let sleeper_program = env::current_exe().unwrap();
         let registration = InstanceRegistration {
             dir: &dir,
             image: "hello",
+            program: sleeper_program.as_os_str(),
         };
         let mut sink = RecordingSink::new(trace.clone()).on_push(move || {
             make_read_only(&run_dir);

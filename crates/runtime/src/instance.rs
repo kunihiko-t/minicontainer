@@ -7,11 +7,13 @@
 
 use std::{
     error::Error,
+    ffi::OsStr,
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// state fileのversion行。先頭が一致しないfileはcorruptとして扱う。
@@ -29,6 +31,17 @@ const MAX_IMAGE_LEN: usize = 128;
 const MAX_COMM_LEN: usize = 64;
 /// atomic書き込みの一時file名が衝突したときの再試行回数。
 const TEMP_CREATE_ATTEMPTS: usize = 8;
+/// kernelがprocessの`comm`へ保持するbyte数の上限 (TASK_COMM_LEN-1)。spawn
+/// したprogram名はこの長さへ切り詰められてexec完了の確認値になる。
+const KERNEL_COMM_LEN: usize = 15;
+/// `register`がchildのexec完了を待つ上限。fork直後のchildは親のcommを
+/// 引き継ぐため、exec前にidentityを記録すると消える名前を残すことになる。
+const EXEC_PROBE_BUDGET: Duration = Duration::from_secs(2);
+/// `status_of`がtransientな読み取り失敗を許す上限。exec途中のprocessは
+/// 一瞬だけidentityを読めないため、即座にstaleへ倒さない。
+const STATUS_PROBE_BUDGET: Duration = Duration::from_millis(250);
+/// identity probeの再試行間隔。
+const PROBE_INTERVAL: Duration = Duration::from_millis(1);
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -193,13 +206,39 @@ impl InstanceDir {
 
     /// `pid`のprocessを記録し、公開名を持つhandleを返す。
     ///
-    /// process identityを取得できないplatformや既に死亡したprocessは
-    /// `UnverifiableProcess`で拒否する。fileはatomicに置き換わるため、
-    /// 再利用されたpidのstale fileは新しい記録で上書きされる。
-    pub fn register(&self, image: &str, pid: u32) -> Result<InstanceHandle, InstanceError> {
+    /// `program`はspawn時に指定した実行fileのpathまたは名前であり、その
+    /// basename (kernelが15byteへ切り詰めた値) がcommに現れるまでprobeを
+    /// 繰り返す。fork直後のchildはexec完了まで親のcommを引き継ぐため、
+    /// この確認を省くと消えてしまう名前を記録して永久にstaleと誤判定する。
+    ///
+    /// process identityを取得できないplatform、既に死亡したprocess、期限
+    /// 内に期待するcommへexecしなかったprocessは`UnverifiableProcess`で
+    /// 拒否する。fileはatomicに置き換わるため、再利用されたpidのstale
+    /// fileは新しい記録で上書きされる。
+    pub fn register(
+        &self,
+        image: &str,
+        pid: u32,
+        program: &OsStr,
+    ) -> Result<InstanceHandle, InstanceError> {
         validate_image(image)?;
-        let identity = process_identity(pid).ok_or(InstanceError::UnverifiableProcess)?;
-        if identity.token == 0 || identity.comm.is_empty() {
+        let expected = expected_comm(program).ok_or(InstanceError::UnverifiableProcess)?;
+        let deadline = Instant::now() + EXEC_PROBE_BUDGET;
+        let identity = loop {
+            match probe_identity(pid) {
+                Probe::Found(identity) if identity.comm.as_bytes() == expected => break identity,
+                // exec前の親名や別名へのexecは待ち続ける。死亡やprobe失敗
+                // と区別するため、Goneだけを即座の失敗にする。
+                Probe::Found(_) | Probe::Transient => {
+                    if Instant::now() >= deadline {
+                        return Err(InstanceError::UnverifiableProcess);
+                    }
+                    thread::sleep(PROBE_INTERVAL);
+                }
+                Probe::Gone => return Err(InstanceError::UnverifiableProcess),
+            }
+        };
+        if identity.token == 0 {
             return Err(InstanceError::UnverifiableProcess);
         }
         let state = InstanceState {
@@ -280,16 +319,30 @@ fn row_id(row: &InstanceRow) -> &str {
 
 /// 記録と現在のprocess identityを照合する。pidが生存しtoken (開始時刻) と
 /// commが記録と一致するprocessだけがliveであり、死亡も再利用もstaleである。
+/// exec途中のprocessは一瞬identityを読めないため、transientな失敗は短く
+/// 再試行してからstaleへ倒す。
 fn status_of(state: &InstanceState) -> InstanceStatus {
-    match process_identity(state.pid) {
-        Some(current) => {
-            if state.token != 0 && current.token == state.token && current.comm == state.comm {
-                InstanceStatus::Live
-            } else {
-                InstanceStatus::Stale
+    let deadline = Instant::now() + STATUS_PROBE_BUDGET;
+    loop {
+        match probe_identity(state.pid) {
+            Probe::Found(current) => {
+                break if state.token != 0
+                    && current.token == state.token
+                    && current.comm == state.comm
+                {
+                    InstanceStatus::Live
+                } else {
+                    InstanceStatus::Stale
+                };
+            }
+            Probe::Gone => break InstanceStatus::Stale,
+            Probe::Transient => {
+                if Instant::now() >= deadline {
+                    break InstanceStatus::Stale;
+                }
+                thread::sleep(PROBE_INTERVAL);
             }
         }
-        None => InstanceStatus::Stale,
     }
 }
 
@@ -377,8 +430,55 @@ struct ProcessIdentity {
     comm: String,
 }
 
+/// identity probe一回分の結果。
+enum Probe {
+    /// pidが存在し、identityを読めた。
+    Found(ProcessIdentity),
+    /// pidのprocessは存在しない。再試行しても回復しない。
+    Gone,
+    /// pidは存在するが一時的に読めなかった。exec途中のprocessはkernel内部
+    /// の再構成で一瞬identityを返せないため、短い再試行で回復し得る。
+    Transient,
+}
+
+/// spawnしたprogramのexec完了時にcommへ現れる期待値。basenameをkernelの
+/// 上限である15 byteへ切り詰めたもの。
+fn expected_comm(program: &OsStr) -> Option<&[u8]> {
+    let name = Path::new(program).file_name()?;
+    let bytes = name.as_encoded_bytes();
+    Some(&bytes[..KERNEL_COMM_LEN.min(bytes.len())])
+}
+
+/// identityの一回分の読み取り。読めなかった理由は呼び出し側がpidの生死で
+/// 分けるため、失敗は`None`に畳む。
+fn probe_identity(pid: u32) -> Probe {
+    match platform_identity(pid) {
+        Some(identity) => Probe::Found(identity),
+        // 読み取り失敗がexec途中のtransientか本当の死亡かはpidの存在で
+        // 決める。`kill(pid, 0)`のESRCHだけが確実な不在である。
+        None if process_exists(pid) => Probe::Transient,
+        None => Probe::Gone,
+    }
+}
+
+/// pidのprocessが存在するか。`kill(pid, 0)`はsignalを送らず存否だけを
+/// 返し、ESRCHが不存在、成功とEPERMが存在を示す。
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    // SAFETY: signal 0は配送されず、pidの存否確認だけに使う。
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
-fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+fn platform_identity(pid: u32) -> Option<ProcessIdentity> {
     use std::mem::MaybeUninit;
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
     // SAFETY: `proc_pidinfo`は成功時に`info`をsize_of分だけ初期化する。
@@ -411,7 +511,7 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+fn platform_identity(pid: u32) -> Option<ProcessIdentity> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm (field 2) は空白や括弧を含み得るため、最後の`)`までを名前として
     // 取り、その後の空白区切りfieldとして数える。starttimeはfield 22であり、
@@ -432,7 +532,7 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+fn platform_identity(pid: u32) -> Option<ProcessIdentity> {
     let _ = pid;
     // process開始時刻を取得できないplatformではpid再利用を識別できないため、
     // 記録もlive判定も行わない。
@@ -440,7 +540,7 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
 }
 
 #[cfg(not(unix))]
-fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
+fn platform_identity(_pid: u32) -> Option<ProcessIdentity> {
     None
 }
 
@@ -505,9 +605,11 @@ mod tests {
         InstanceDir, InstanceError, InstanceRow, InstanceState, InstanceStatus, STATE_SUFFIX,
     };
     use std::{
-        env, fs,
+        env,
+        ffi::OsStr,
+        fs,
         path::PathBuf,
-        process::{Child, Command},
+        process::{Child, Command, Stdio},
         sync::atomic::{AtomicU64, Ordering},
         time::{Duration, Instant},
     };
@@ -547,6 +649,13 @@ mod tests {
 
     fn open_dir(root: &TempRoot) -> InstanceDir {
         InstanceDir::open(&root.0).expect("a scratch store root must open")
+    }
+
+    /// sleeperがspawnするprogram (このtest binary自身) のpath。`register`
+    /// はexec完了をcomm名で確認するため、呼び出し側がspawn時のprogramを
+    /// そのまま渡す必要がある。
+    fn helper_program() -> PathBuf {
+        env::current_exe().expect("the test binary path must exist")
     }
 
     fn spawn_sleeper() -> Child {
@@ -668,10 +777,66 @@ mod tests {
         let root = TempRoot::create();
         let dir = open_dir(&root);
         assert!(matches!(
-            dir.register("img", u32::MAX - 1),
+            dir.register("img", u32::MAX - 1, OsStr::new("sleep")),
             Err(InstanceError::UnverifiableProcess)
         ));
         assert!(dir.list().unwrap().is_empty());
+    }
+
+    // Catches identity being recorded before exec completes: a child whose
+    // comm still carries the launching program's name must not be recorded,
+    // because the kernel rewrites comm at exec and the row would report
+    // stale forever. The register call must wait for the post-exec name.
+    #[test]
+    fn register_waits_for_the_child_to_exec() {
+        let root = TempRoot::create();
+        let dir = open_dir(&root);
+        // `sh`が先に走り、遅れて`sleep`へexecするchild。registerの呼び出し
+        // 時点ではcommが"sh"であり、"sleep"が見えるまで待たなければ
+        // ならない。
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 0.2; exec sleep 20"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the delayed-exec helper must spawn");
+
+        let handle = dir
+            .register("hello", child.id(), OsStr::new("sleep"))
+            .unwrap();
+
+        let rows = dir.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            InstanceRow::Known { id, state, status } => {
+                assert_eq!(id, handle.id());
+                assert_eq!(*status, InstanceStatus::Live);
+                assert_eq!(state.comm, "sleep");
+            }
+            InstanceRow::Corrupt { id } => panic!("expected a live row, got corrupt {id}"),
+        }
+
+        dir.unregister(&handle).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    // Catches register waiting forever for a comm that never arrives: a
+    // process that exec'd a different program must be rejected once the
+    // probe budget expires rather than blocking or recording a wrong name.
+    #[test]
+    fn register_rejects_a_process_that_never_execs_the_expected_program() {
+        let root = TempRoot::create();
+        let dir = open_dir(&root);
+        let mut sleeper = spawn_sleeper();
+
+        let result = dir.register("hello", sleeper.id(), OsStr::new("not-the-helper"));
+
+        assert!(matches!(result, Err(InstanceError::UnverifiableProcess)));
+        assert!(dir.list().unwrap().is_empty());
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
     }
 
     // Catches a live process being reported as anything else: register, then
@@ -682,7 +847,9 @@ mod tests {
         let root = TempRoot::create();
         let dir = open_dir(&root);
         let mut sleeper = spawn_sleeper();
-        let handle = dir.register("hello", sleeper.id()).unwrap();
+        let handle = dir
+            .register("hello", sleeper.id(), helper_program().as_os_str())
+            .unwrap();
 
         let rows = dir.list().unwrap();
         assert_eq!(rows.len(), 1);
@@ -708,7 +875,8 @@ mod tests {
         let root = TempRoot::create();
         let dir = open_dir(&root);
         let mut sleeper = spawn_sleeper();
-        dir.register("hello", sleeper.id()).unwrap();
+        dir.register("hello", sleeper.id(), helper_program().as_os_str())
+            .unwrap();
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
 
@@ -830,7 +998,9 @@ mod tests {
         let root = TempRoot::create();
         let dir = open_dir(&root);
         let mut sleeper = spawn_sleeper();
-        let handle = dir.register("hello", sleeper.id()).unwrap();
+        let handle = dir
+            .register("hello", sleeper.id(), helper_program().as_os_str())
+            .unwrap();
 
         dir.unregister(&handle).unwrap();
         dir.unregister(&handle).unwrap();
@@ -857,7 +1027,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    dir.register(label, sleeper.id()),
+                    dir.register(label, sleeper.id(), helper_program().as_os_str()),
                     Err(InstanceError::UnsafeImage)
                 ),
                 "{label:?} must be rejected"
