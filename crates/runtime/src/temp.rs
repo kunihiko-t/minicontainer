@@ -119,6 +119,22 @@ impl PayloadTemp {
     pub fn path(&self) -> &Path {
         &self.payload
     }
+
+    /// payloadを収める一時directory。detached runのUARTやQEMU診断の
+    /// 出力先としても使われ、instance stateに記録される回収対象である。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// drop時の削除を行わず、directoryを残したまま所有権を手放す。
+    ///
+    /// detached runは戻った後もQEMUがUART logを書き続けるため、回収は
+    /// instance stateを辿る`minictr stop`へ委ねる。
+    pub fn persist(self) -> PathBuf {
+        let root = self.root.clone();
+        std::mem::forget(self);
+        root
+    }
 }
 
 fn create_private_root(path: &Path) -> io::Result<()> {

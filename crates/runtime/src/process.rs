@@ -397,7 +397,7 @@ fn start_reader(
     })
 }
 
-fn process_status(status: ExitStatus) -> ProcessStatus {
+pub(crate) fn process_status(status: ExitStatus) -> ProcessStatus {
     ProcessStatus {
         code: status.code(),
         success: status.success(),

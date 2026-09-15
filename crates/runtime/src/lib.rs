@@ -1,13 +1,19 @@
 //! MiniContainer host runtime。
 
 mod command;
+mod detach;
 mod error;
 mod instance;
 mod process;
 mod session;
+mod stop;
 mod temp;
 
 pub use command::{QemuCommand, QemuResources};
+pub use detach::{
+    DetachBackend, DetachLogs, DetachRequest, DetachedChild, DetachedInstance, DetachedRuntime,
+    SystemDetachBackend, SystemDetachedChild,
+};
 pub use error::{CleanupFailure, RuntimeError};
 pub use instance::{
     InstanceDir, InstanceError, InstanceHandle, InstanceRow, InstanceState, InstanceStatus,
@@ -16,6 +22,7 @@ pub use process::{
     ProcessBackend, ProcessControl, ProcessError, ProcessEvent, ProcessStatus, SystemProcessBackend,
 };
 pub use session::{RunOutcome, Session, SessionError, SessionEvent};
+pub use stop::{StopError, StopOutcome, StopReport};
 pub use temp::PayloadTemp;
 
 use std::{
@@ -210,6 +217,7 @@ impl<B: ProcessBackend> Runtime<B> {
                 registration.image,
                 child.id(),
                 registration.program,
+                payload.path().parent().expect("payload has a root"),
             ) {
                 Ok(handle) => Some((registration.dir, handle)),
                 Err(error) => {
@@ -383,10 +391,10 @@ impl<'a> SignalWatch<'a> {
     }
 }
 
-fn finish_with_cleanup(
-    primary: Result<RunOutcome, RuntimeError>,
+pub(crate) fn finish_with_cleanup<T>(
+    primary: Result<T, RuntimeError>,
     cleanup_failures: Vec<CleanupFailure>,
-) -> Result<RunOutcome, RuntimeError> {
+) -> Result<T, RuntimeError> {
     match (primary, cleanup_failures.is_empty()) {
         (Ok(outcome), true) => Ok(outcome),
         (Ok(_), false) => Err(RuntimeError::CleanupOnly(cleanup_failures)),
@@ -407,6 +415,17 @@ fn remove_payload(payload: &PayloadTemp) -> Vec<CleanupFailure> {
         failures.push(CleanupFailure::Payload(error));
     }
     failures
+}
+
+/// detached runのpayload dirを中身ごと消す。uart.logやqemu.logを含むため
+/// 空dir前提の`remove_payload`は使えない。dirは専用に作られたものなので
+/// 中身はすべてこのrunの所有物である。
+pub(crate) fn remove_payload_tree(root: &Path) -> Vec<CleanupFailure> {
+    match std::fs::remove_dir_all(root) {
+        Ok(()) => Vec::new(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => vec![CleanupFailure::Payload(error)],
+    }
 }
 
 #[cfg(test)]

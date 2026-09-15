@@ -58,12 +58,28 @@ Exit前の中断は`RuntimeError::Interrupted`として報告し、転送や強�
 
 `RunRequest.instances`があれば、runtimeはQEMU childのspawn直後にstoreの`run/`へstate fileを作る。
 記録できないinstanceを起動したままにはしないため、登録に失敗したrunはchildを回収してpayloadを消してから`RuntimeError::Instance`で終わる。
-state fileにはQEMUのpid、process開始token、comm名、image label、作成時刻を記録する。
+state fileにはQEMUのpid、process開始token、comm名、image label、作成時刻、payload directoryのpathを記録する。
 
 主結果が決まった後のcleanupでは、QEMU回収とpayload削除ののちにstate fileを消す。
 削除は冪等であり、失敗はcleanup errorへ合成される。
 hostが`SIGKILL`や電源喪失で即死した場合だけstate fileが残り、`minictr ps`がpid identityを照合してliveまたはstaleとして表示する。
 file形式と照合の契約は[instance state](../reference/instance-state.md)を参照する。
+
+## detached run
+
+`run --detach`は留守番processを立てずにQEMUだけを残す。
+hostが居なくなってもpipeを詰まらせないよう、UART出力とQEMUの標準エラー出力はpayload directory内のfile (`uart.log`と`qemu.log`) へ切り替える。
+
+spawnとstate登録ののち、guestの`Ready` frameがUART logに現れるのを`--timeout-ms`の期限まで待つ。
+Readyを確認したらinstance id `i-<pid>`を一行だけ標準出力へ出して終了し、state fileとpayload directoryは残る。
+期限切れやReady前のQEMU終了では、QEMUを畳み、payloadとstate fileを消してから終了code 125で失敗する。
+handshake中のSIGINTとSIGTERMはforegroundと同じくQEMUのprocess groupへ転送し、回収を経て125で終わる。
+
+detached QEMUにsupervisorは居ない。
+guestがExit frameを書いて終了しても誰も読まず、QEMUは動き続け、`ps`は`stop`するまでliveを出し続ける。
+`uart.log`と`qemu.log`には合計量の上限がなく、長時間放置すればdiskを消費する。
+回収は`minictr stop`の役目であり、identity照合つきのSIGTERM、grace、SIGKILL、payloadとstate fileの削除までを行う。
+detached runでもforeground runでも、`stop`は同じ規則で動く。
 
 ## 失敗の区別
 
@@ -75,6 +91,7 @@ file形式と照合の契約は[instance state](../reference/instance-state.md)�
 - 出力上限超過: stdout、stderr、diagnosticsの合計が1 MiBを超えた場合のhost拒否。表示済みbyteも合計に含める。
 - consumer失敗: 逐次転送先の書き出し失敗。QEMU回収とpayload削除は行う。
 - instance登録失敗: state fileを書けないrun。QEMUは起動直後に畳まれる。
+- detached boot失敗: `Ready`を待つ間にQEMUが終了した、または期限に達した。instanceは成立せず、残骸は回収済みである。
 - guest failure: `GuestError` frame。
 - protocol破損: 不正header、truncated frame、payload上限超過。
 - applicationの非0終了: guestの終了codeをそのまま返す。

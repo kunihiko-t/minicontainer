@@ -15,18 +15,19 @@ use minicontainer_bundle::{
     ImageSpec, MAX_BUNDLE_LEN, Store, TagRecord, build, format_digest, parse, parse_digest,
 };
 use minicontainer_runtime::{
-    HostSignal, InstanceDir, InstanceRegistration, InstanceRow, InterruptSource, OutputSink,
-    QemuResources, RunOutcome, RunRequest, Runtime, RuntimeError, SessionEvent, SignalObservation,
-    SystemProcessBackend,
+    DetachRequest, DetachedInstance, DetachedRuntime, HostSignal, InstanceDir,
+    InstanceRegistration, InstanceRow, InterruptSource, OutputSink, QemuResources, RunOutcome,
+    RunRequest, Runtime, RuntimeError, SessionEvent, SignalObservation, StopError, StopOutcome,
+    SystemDetachBackend, SystemProcessBackend,
 };
 
 use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
     ResolvedExportOci, ResolvedImport, ResolvedImportOci, ResolvedInspect, ResolvedList,
-    ResolvedPrune, ResolvedPs, ResolvedPullOci, ResolvedRemove, ResolvedRun, VERSION, help,
-    parse_os, resolve, resolve_build, resolve_doctor, resolve_export, resolve_export_oci,
+    ResolvedPrune, ResolvedPs, ResolvedPullOci, ResolvedRemove, ResolvedRun, ResolvedStop, VERSION,
+    help, parse_os, resolve, resolve_build, resolve_doctor, resolve_export, resolve_export_oci,
     resolve_import, resolve_import_oci, resolve_inspect, resolve_list, resolve_prune, resolve_ps,
-    resolve_pull_oci, resolve_remove,
+    resolve_pull_oci, resolve_remove, resolve_stop,
 };
 
 /// usage errorのprocess終了code。
@@ -102,6 +103,17 @@ pub fn real_main(
                 }
             };
             ps_resolved(&resolved, stdout, stderr)
+        }
+        Command::Stop(args) => {
+            let resolved = match resolve_stop(&args, env) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = writeln!(stderr, "minictr: {error}");
+                    let _ = writeln!(stderr, "{help}", help = help());
+                    return USAGE_EXIT;
+                }
+            };
+            stop_resolved(&resolved, stdout, stderr)
         }
         Command::Image(command) => match command {
             ImageCommand::Build(args) => {
@@ -449,6 +461,10 @@ pub trait Runner {
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError>;
+
+    /// bundleをQEMU上でdetachedに起動し、guest Readyの確認後にinstanceを
+    /// 返す。戻った後の停止と回収は`minictr stop`へ委ねられる。
+    fn detach(&self, spec: RunSpec<'_>) -> Result<DetachedInstance, RuntimeError>;
 }
 
 /// guest出力をhostの標準入出力へ逐次転送するsink。
@@ -522,21 +538,7 @@ impl Runner for RealRunner {
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError> {
-        // hostがSIGINT/SIGTERMを捕捉してruntimeへ報告し、runtimeがQEMUの
-        // process groupへ転送する。QEMUは別のgroupにいるため端末のCtrl-Cは
-        // 直接届かず、この経路だけが全signalの入口になる。捕捉するhandlerは
-        // exec後にdefaultへ戻るため、QEMUへ設定を継承しない。
-        // SAFETY: handler内ではsignal-safeでない処理を一切行わない。
-        unsafe {
-            libc::signal(
-                libc::SIGINT,
-                record_signal as *const () as libc::sighandler_t,
-            );
-            libc::signal(
-                libc::SIGTERM,
-                record_signal as *const () as libc::sighandler_t,
-            );
-        }
+        install_signal_handlers();
         let interrupts = CliInterrupts;
         let runtime = Runtime::new(SystemProcessBackend::new());
         runtime.run_with_sink(
@@ -550,6 +552,47 @@ impl Runner for RealRunner {
             },
             &mut CliSink::new(stdout, stderr),
         )
+    }
+
+    fn detach(&self, spec: RunSpec<'_>) -> Result<DetachedInstance, RuntimeError> {
+        install_signal_handlers();
+        let interrupts = CliInterrupts;
+        let runtime = DetachedRuntime::new(SystemDetachBackend::new());
+        // detached runはstate記録が必須である。`run_resolved`は常に登録情報を
+        // 渡すが、Noneのspecを受けた場合は追跡不能なinstanceを残さないよう
+        // 拒否する。
+        let Some(instances) = spec.instances else {
+            return Err(RuntimeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a detached run requires instance state",
+            )));
+        };
+        runtime.run(DetachRequest {
+            bundle: spec.bundle,
+            kernel: spec.kernel,
+            deadline: spec.timeout,
+            resources: spec.resources,
+            interrupts: Some(&interrupts),
+            instances,
+        })
+    }
+}
+
+/// SIGINT/SIGTERMを捕捉してruntimeへ報告するhandlerを設定する。
+/// QEMUは別のprocess groupにいるため端末のCtrl-Cは直接届かず、この経路
+/// だけが全signalの入口になる。捕捉するhandlerはexec後にdefaultへ戻る
+/// ため、QEMUへ設定を継承しない。
+fn install_signal_handlers() {
+    // SAFETY: handler内ではsignal-safeでない処理を一切行わない。
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            record_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            record_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -577,25 +620,35 @@ pub fn run_resolved(
             return RUNTIME_EXIT;
         }
     };
-    execute(
-        RunSpec {
-            bundle: &bundle,
-            kernel: &resolved.kernel,
-            timeout: resolved.timeout,
-            resources: QemuResources {
-                memory_mib: resolved.memory_mib,
-                cpus: resolved.cpus,
-            },
-            instances: Some(InstanceRegistration {
-                dir: &instances_dir,
-                image: &resolved.image,
-                program: OsStr::new(QEMU_PROGRAM),
-            }),
+    let spec = RunSpec {
+        bundle: &bundle,
+        kernel: &resolved.kernel,
+        timeout: resolved.timeout,
+        resources: QemuResources {
+            memory_mib: resolved.memory_mib,
+            cpus: resolved.cpus,
         },
-        runner,
-        stdout,
-        stderr,
-    )
+        instances: Some(InstanceRegistration {
+            dir: &instances_dir,
+            image: &resolved.image,
+            program: OsStr::new(QEMU_PROGRAM),
+        }),
+    };
+    if resolved.detach {
+        return match runner.detach(spec) {
+            Ok(instance) => {
+                // detached runの結果はinstance idだけである。scriptから
+                // `minictr stop`へ渡せるよう装飾なしで出す。
+                let _ = writeln!(stdout, "{}", instance.id);
+                0
+            }
+            Err(error) => {
+                let _ = writeln!(stderr, "minictr: {error}");
+                RUNTIME_EXIT
+            }
+        };
+    }
+    execute(spec, runner, stdout, stderr)
 }
 
 /// 解決済み`image build`を実行し、process終了codeを返す。
@@ -789,6 +842,46 @@ pub fn ps_resolved(resolved: &ResolvedPs, stdout: &mut dyn Write, stderr: &mut d
         return RUNTIME_EXIT;
     }
     0
+}
+
+/// 解決済み`stop`を実行し、process終了codeを返す。
+///
+/// 成功時はinstance idだけをstdoutへ出す。既に消えていたinstanceは
+/// 残骸の回収だけを行い、その旨をstderrへ報告して成功とする。
+pub fn stop_resolved(
+    resolved: &ResolvedStop,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let dir = match InstanceDir::open(&resolved.store) {
+        Ok(dir) => dir,
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            return RUNTIME_EXIT;
+        }
+    };
+    match dir.stop(&resolved.id, resolved.timeout) {
+        Ok(report) => {
+            if report.outcome == StopOutcome::AlreadyGone {
+                let _ = writeln!(
+                    stderr,
+                    "minictr: instance {} was already gone; collected its state",
+                    report.id
+                );
+            }
+            let _ = writeln!(stdout, "{}", report.id);
+            0
+        }
+        Err(error @ StopError::InvalidId(_)) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            let _ = writeln!(stderr, "{help}", help = help());
+            USAGE_EXIT
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "minictr: {error}");
+            RUNTIME_EXIT
+        }
+    }
 }
 
 /// 解決済み`image inspect`を実行し、process終了codeを返す。
@@ -1569,18 +1662,28 @@ mod tests {
 
     struct FakeRunner {
         results: RefCell<VecDeque<Result<RunOutcome, RuntimeError>>>,
+        detach_result: RefCell<Option<Result<DetachedInstance, RuntimeError>>>,
     }
 
     impl FakeRunner {
         fn ok(outcome: RunOutcome) -> Self {
             Self {
                 results: RefCell::new(VecDeque::from([Ok(outcome)])),
+                detach_result: RefCell::new(None),
             }
         }
 
         fn err(error: RuntimeError) -> Self {
             Self {
                 results: RefCell::new(VecDeque::from([Err(error)])),
+                detach_result: RefCell::new(None),
+            }
+        }
+
+        fn detaching(result: Result<DetachedInstance, RuntimeError>) -> Self {
+            Self {
+                results: RefCell::new(VecDeque::new()),
+                detach_result: RefCell::new(Some(result)),
             }
         }
     }
@@ -1615,6 +1718,13 @@ mod tests {
                 .write_all(&outcome.stderr)
                 .map_err(RuntimeError::Consumer)?;
             Ok(outcome)
+        }
+
+        fn detach(&self, _spec: RunSpec<'_>) -> Result<DetachedInstance, RuntimeError> {
+            self.detach_result
+                .borrow_mut()
+                .take()
+                .expect("one detach call")
         }
     }
 
@@ -1830,6 +1940,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             memory_mib: 128,
             cpus: 1,
+            detach: false,
         }
     }
 
@@ -1922,6 +2033,10 @@ mod tests {
                 *self.seen.borrow_mut() = Some(spec.resources);
                 Ok(outcome(b"", b"", 0))
             }
+
+            fn detach(&self, _spec: RunSpec<'_>) -> Result<DetachedInstance, RuntimeError> {
+                panic!("this test does not detach")
+            }
         }
 
         let runner = RecordingRunner {
@@ -1970,6 +2085,10 @@ mod tests {
                     .map(|registration| registration.image.to_owned());
                 Ok(outcome(b"", b"", 0))
             }
+
+            fn detach(&self, _spec: RunSpec<'_>) -> Result<DetachedInstance, RuntimeError> {
+                panic!("this test does not detach")
+            }
         }
 
         let root = temp_store_root("run-instances");
@@ -2011,6 +2130,10 @@ mod tests {
             ) -> Result<RunOutcome, RuntimeError> {
                 panic!("the runner must not run without a state directory")
             }
+
+            fn detach(&self, _spec: RunSpec<'_>) -> Result<DetachedInstance, RuntimeError> {
+                panic!("the runner must not run without a state directory")
+            }
         }
 
         let target = temp_store_root("run-instances-target");
@@ -2032,6 +2155,176 @@ mod tests {
         assert!(String::from_utf8_lossy(&stderr).contains("instance state"));
         std::fs::remove_file(&link).unwrap();
         std::fs::remove_dir_all(&target).unwrap();
+    }
+
+    // Catches a detached run printing anything but the bare instance id:
+    // scripts feed stdout into `minictr stop`, so it must carry only the id.
+    #[test]
+    fn run_detach_prints_the_instance_id() {
+        let runner = FakeRunner::detaching(Ok(DetachedInstance {
+            id: "i-7".to_owned(),
+            pid: 7,
+        }));
+        let store = FakeStore {
+            result: Ok(vec![1, 2, 3]),
+        };
+        let mut config = resolved();
+        config.detach = true;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_resolved(&config, &runner, &store, &mut stdout, &mut stderr);
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"i-7\n");
+        assert!(stderr.is_empty());
+        std::fs::remove_dir_all(&config.store).unwrap();
+    }
+
+    // Catches a failed detached start looking like success or leaking an id:
+    // the handshake failure must surface as a runtime error with no id.
+    #[test]
+    fn run_detach_maps_a_boot_failure_to_a_runtime_error() {
+        let runner = FakeRunner::detaching(Err(RuntimeError::DetachedBoot {
+            status: minicontainer_runtime::ProcessStatus {
+                code: Some(1),
+                success: false,
+            },
+            diagnostics: "qemu: could not open kernel".to_owned(),
+        }));
+        let store = FakeStore {
+            result: Ok(vec![1, 2, 3]),
+        };
+        let mut config = resolved();
+        config.detach = true;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_resolved(&config, &runner, &store, &mut stdout, &mut stderr);
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty(), "a failed detach must not print an id");
+        assert!(String::from_utf8_lossy(&stderr).contains("QEMU exited"));
+        std::fs::remove_dir_all(&config.store).unwrap();
+    }
+
+    // Catches stop collecting a dead instance's debris: a stale row must be
+    // reported, the payload dir and state file removed, and the id printed.
+    #[test]
+    fn stop_collects_a_stale_instance() {
+        let root = temp_store_root("stop-stale");
+        let payload = std::env::temp_dir().join(format!(
+            "minicontainer-run-stop-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&payload).unwrap();
+        // `open`で`run/`を作ってからstate fileを置く。pid 2^32-2は
+        // 実在しないためstaleとして分類される。
+        InstanceDir::open(&root).unwrap();
+        let stale = "i-4294967294";
+        std::fs::write(
+            root.join("run").join(format!("{stale}.state")),
+            format!(
+                "minicontainer-state-v1\npid=4294967294\ntoken=1\ncomm=dead\nimage=gone\nstarted=0\npayload={}\n",
+                payload.display()
+            ),
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("stop"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from(stale),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, format!("{stale}\n").as_bytes());
+        assert!(String::from_utf8_lossy(&stderr).contains("already gone"));
+        assert!(!payload.exists(), "the stale payload dir must be removed");
+        assert!(!root.join("run").join(format!("{stale}.state")).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches a double stop (or stopping a never-registered id) reporting
+    // success: without a state file the command must fail as unknown.
+    #[test]
+    fn stop_reports_an_unknown_instance() {
+        let root = temp_store_root("stop-unknown");
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("stop"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("i-4242"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8_lossy(&stderr).contains("not registered"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches stop signaling a process it cannot identify: a corrupt state
+    // file must fail without touching the process or removing the file.
+    #[test]
+    fn stop_refuses_a_corrupt_state() {
+        let root = temp_store_root("stop-corrupt");
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        let path = root.join("run").join("i-7.state");
+        std::fs::write(&path, b"\x00\xffnot a state").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [
+                OsString::from("stop"),
+                OsString::from("--store"),
+                root.clone().into_os_string(),
+                OsString::from("i-7"),
+            ],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(String::from_utf8_lossy(&stderr).contains("corrupt"));
+        assert!(path.exists(), "a corrupt state file must survive stop");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Catches a malformed id reaching `stop`: the CLI must reject it as a
+    // usage error before any state directory is opened.
+    #[test]
+    fn stop_rejects_a_noncanonical_id_as_a_usage_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = real_main(
+            [OsString::from("stop"), OsString::from("x-1")],
+            &UnusedEnv,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, USAGE_EXIT);
+        assert!(String::from_utf8_lossy(&stderr).contains("invalid instance id"));
     }
 
     // Catches mapping a nonzero guest exit to success or to a host error.
@@ -2760,10 +3053,16 @@ mod tests {
         let dir = InstanceDir::open(&root).unwrap();
         let own = std::process::id();
         let own_exe = std::env::current_exe().unwrap();
-        dir.register("hello", own, own_exe.as_os_str()).unwrap();
+        dir.register(
+            "hello",
+            own,
+            own_exe.as_os_str(),
+            Path::new("/tmp/minicontainer-run-ps-test"),
+        )
+        .unwrap();
         std::fs::write(
             root.join("run").join("i-4294967294.state"),
-            b"minicontainer-state-v1\npid=4294967294\ntoken=1\ncomm=dead\nimage=gone\nstarted=0\n",
+            b"minicontainer-state-v1\npid=4294967294\ntoken=1\ncomm=dead\nimage=gone\nstarted=0\npayload=/tmp/minicontainer-run-gone\n",
         )
         .unwrap();
         std::fs::write(root.join("run").join("i-junk.state"), b"\x00\xffnope").unwrap();

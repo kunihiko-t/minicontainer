@@ -9,6 +9,8 @@ use minicontainer_runtime::QemuResources;
 
 /// `--timeout-ms`を省略したときの待ち時間。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// `stop`がSIGTERMの効果を待つ既定の猶予。runのsignal graceと揃える。
+const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `minictr` binaryのversion。`--version`がそのまま表示する。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,6 +28,8 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// 記録済みinstanceのlive/stale/corrupt状態を一覧する。
     Ps(PsArgs),
+    /// 記録済みinstanceを停止して残骸を回収する。
+    Stop(StopArgs),
     /// imageのbuildなどstore内容を操作する。
     Image(ImageCommand),
 }
@@ -181,6 +185,20 @@ pub struct RunArgs {
     pub memory_mib: u32,
     /// guest vCPU数。
     pub cpus: u32,
+    /// detached runを要求する。`true`ならguest Readyまでの起動確認だけを
+    /// 行い、instance idを返して終了する。
+    pub detach: bool,
+}
+
+/// `stop` commandの型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopArgs {
+    /// 停止するinstanceの公開名 (`i-<pid>`)。
+    pub id: String,
+    /// `--store`の指定値。`None`なら環境とHOMEから解決する。
+    pub store: Option<PathBuf>,
+    /// SIGTERMからSIGKILLへ進むまでの猶予。
+    pub timeout: Duration,
 }
 
 /// `doctor` commandの型付き引数。
@@ -216,6 +234,19 @@ pub struct ResolvedRun {
     pub memory_mib: u32,
     /// guest vCPU数。
     pub cpus: u32,
+    /// detached runを要求する。
+    pub detach: bool,
+}
+
+/// `stop`に必要な不変入力を解決した結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStop {
+    /// 停止するinstanceの公開名。
+    pub id: String,
+    /// bundle storeのroot。
+    pub store: PathBuf,
+    /// SIGTERMからSIGKILLへ進むまでの猶予。
+    pub timeout: Duration,
 }
 
 /// `image build`に必要な不変入力を解決した結果。
@@ -336,6 +367,10 @@ pub enum CliError {
     UnknownCommand(String),
     /// `run`にimageが与えられなかった。
     MissingImage,
+    /// `stop`にinstance idが与えられなかった。
+    MissingStopId,
+    /// `stop`のinstance idが`i-<pid>`の形ではない。
+    InvalidInstanceId(String),
     /// `image build`にimageが与えられなかった。
     MissingBuildImage,
     /// `image build`にELF pathが与えられなかった。
@@ -402,6 +437,10 @@ impl fmt::Display for CliError {
                 write!(formatter, "unknown minictr command: {command}")
             }
             Self::MissingImage => formatter.write_str("missing image for `minictr run`"),
+            Self::MissingStopId => formatter.write_str("missing instance id for `minictr stop`"),
+            Self::InvalidInstanceId(id) => {
+                write!(formatter, "invalid instance id: {id}")
+            }
             Self::MissingBuildImage => {
                 formatter.write_str("missing image for `minictr image build`")
             }
@@ -491,7 +530,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+    "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
 }
 
 /// OS引数からcommandをparseする。
@@ -505,6 +544,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         "run" => {}
         "doctor" => return parse_doctor(arguments),
         "ps" => return parse_ps(arguments),
+        "stop" => return parse_stop(arguments),
         "image" => {
             let subcommand = arguments.next().ok_or(CliError::MissingCommand)?;
             let subcommand = subcommand
@@ -533,6 +573,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
     let mut timeout: Option<Duration> = None;
     let mut memory_mib: Option<u32> = None;
     let mut cpus: Option<u32> = None;
+    let mut detach = false;
 
     // `--opt=value`はoption位置のtokenだけを分割する。`--store`や`--kernel`が
     // 消費した値はOS pathとして不透明に扱い、`--`で始まり`=`を含むpathを
@@ -600,6 +641,15 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
                     let value = value.into_string().map_err(CliError::NonUtf8Argument)?;
                     cpus = Some(parse_cpus(&value)?);
                 }
+                "--detach" => {
+                    if inline_value.is_some() {
+                        return Err(CliError::UnexpectedValue("--detach"));
+                    }
+                    if detach {
+                        return Err(CliError::DuplicateOption("--detach"));
+                    }
+                    detach = true;
+                }
                 unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
             }
             continue;
@@ -622,6 +672,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
         memory_mib: memory_mib.unwrap_or(QemuResources::DEFAULT_MEMORY_MIB),
         cpus: cpus.unwrap_or(QemuResources::DEFAULT_CPUS),
+        detach,
     }))
 }
 
@@ -885,6 +936,84 @@ fn parse_ps(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, Cl
     }
 
     Ok(Command::Ps(PsArgs { store }))
+}
+
+/// `stop`の引数をparseする。`--store`と`--timeout-ms`はINSTANCEの前後
+/// どこに置いてもよい。idは`i-<pid>`のcanonicalな形だけを受理する。
+fn parse_stop(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut id: Option<String> = None;
+    let mut store: Option<PathBuf> = None;
+    let mut timeout: Option<Duration> = None;
+
+    let pending: Vec<OsString> = arguments.into_iter().collect();
+    let mut rest = pending.into_iter().peekable();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--store"))?,
+                    };
+                    store = Some(PathBuf::from(value));
+                }
+                "--timeout-ms" => {
+                    if timeout.is_some() {
+                        return Err(CliError::DuplicateOption("--timeout-ms"));
+                    }
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => rest.next().ok_or(CliError::MissingValue("--timeout-ms"))?,
+                    };
+                    let value = value.into_string().map_err(CliError::NonUtf8Argument)?;
+                    timeout = Some(parse_timeout(&value)?);
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+            continue;
+        }
+
+        let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+        if id.is_some() {
+            return Err(CliError::UnexpectedArgument(text));
+        }
+        id = Some(text);
+    }
+
+    let Some(id) = id else {
+        return Err(CliError::MissingStopId);
+    };
+    if !is_instance_id(&id) {
+        return Err(CliError::InvalidInstanceId(id));
+    }
+    Ok(Command::Stop(StopArgs {
+        id,
+        store,
+        timeout: timeout.unwrap_or(DEFAULT_STOP_TIMEOUT),
+    }))
+}
+
+/// `i-<pid>`のcanonicalな形かを検査する。`i-042`やu32に収まらない値は
+/// state file名として存在し得ないため受理しない。
+fn is_instance_id(id: &str) -> bool {
+    let Some(digits) = id.strip_prefix("i-") else {
+        return false;
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(pid) = digits.parse::<u32>() else {
+        return false;
+    };
+    id == format!("i-{pid}")
 }
 
 /// `image inspect`の引数をparseする。optionはIMAGEの前後どこに置いてもよい。
@@ -1369,6 +1498,23 @@ pub fn resolve(args: &RunArgs, env: &dyn Environ) -> Result<ResolvedRun, CliErro
         timeout: args.timeout,
         memory_mib: args.memory_mib,
         cpus: args.cpus,
+        detach: args.detach,
+    })
+}
+
+/// parse済み`stop`引数と環境からstore pathを解決する。
+pub fn resolve_stop(args: &StopArgs, env: &dyn Environ) -> Result<ResolvedStop, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedStop {
+        id: args.id.clone(),
+        store,
+        timeout: args.timeout,
     })
 }
 
@@ -1648,6 +1794,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 memory_mib: 128,
                 cpus: 1,
+                detach: false,
             }))
         );
     }
@@ -1673,6 +1820,7 @@ mod tests {
                 timeout: Duration::from_millis(250),
                 memory_mib: 128,
                 cpus: 1,
+                detach: false,
             }))
         );
     }
@@ -1689,6 +1837,7 @@ mod tests {
                 timeout: Duration::from_millis(750),
                 memory_mib: 128,
                 cpus: 1,
+                detach: false,
             }))
         );
     }
@@ -1788,6 +1937,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 memory_mib: 128,
                 cpus: 1,
+                detach: false,
             }))
         );
         assert_eq!(
@@ -1799,6 +1949,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 memory_mib: 128,
                 cpus: 1,
+                detach: false,
             }))
         );
         assert_eq!(
@@ -1838,6 +1989,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 memory_mib: 128,
                 cpus: 1,
+                detach: false,
             }))
         );
     }
@@ -1859,6 +2011,7 @@ mod tests {
                     timeout: Duration::from_secs(5),
                     memory_mib: 256,
                     cpus: 2,
+                    detach: false,
                 }))
             );
         }
@@ -2040,6 +2193,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             memory_mib: 128,
             cpus: 1,
+            detach: false,
         };
         let resolved = resolve(&args, &home_env()).unwrap();
         assert_eq!(resolved.store, PathBuf::from("/home/test/.minicontainer"));
@@ -2068,6 +2222,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             memory_mib: 128,
             cpus: 1,
+            detach: false,
         };
         let env = FakeEnv {
             store: None,
@@ -2087,6 +2242,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             memory_mib: 128,
             cpus: 1,
+            detach: false,
         };
         let env = FakeEnv {
             store: Some(OsString::from("/env/store")),
@@ -2103,7 +2259,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+            "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
         );
     }
 
@@ -3007,6 +3163,123 @@ mod tests {
         assert_eq!(
             parse(["ps", "--store"]),
             Err(CliError::MissingValue("--store"))
+        );
+    }
+
+    // Catches losing the detach flag in the option soup: it must be set and
+    // survive option reordering.
+    #[test]
+    fn parses_run_detach() {
+        for arguments in [
+            vec!["run", "--detach", "hello"],
+            vec!["run", "hello", "--detach"],
+        ] {
+            assert_eq!(
+                parse(arguments),
+                Ok(Command::Run(RunArgs {
+                    image: "hello".into(),
+                    store: None,
+                    kernel: None,
+                    timeout: Duration::from_secs(5),
+                    memory_mib: 128,
+                    cpus: 1,
+                    detach: true,
+                }))
+            );
+        }
+    }
+
+    // Catches detach silently swallowing a value or being applied twice.
+    #[test]
+    fn rejects_detach_value_and_duplicates() {
+        assert_eq!(
+            parse(["run", "--detach=yes", "hello"]),
+            Err(CliError::UnexpectedValue("--detach"))
+        );
+        assert_eq!(
+            parse(["run", "--detach", "--detach", "hello"]),
+            Err(CliError::DuplicateOption("--detach"))
+        );
+    }
+
+    // Catches `stop` accepting only the canonical instance id and the
+    // documented options, in any position.
+    #[test]
+    fn parses_stop_with_defaults_and_options() {
+        assert_eq!(
+            parse(["stop", "i-42"]),
+            Ok(Command::Stop(StopArgs {
+                id: "i-42".into(),
+                store: None,
+                timeout: Duration::from_secs(2),
+            }))
+        );
+        assert_eq!(
+            parse([
+                "stop",
+                "--store",
+                "/data/store",
+                "--timeout-ms",
+                "500",
+                "i-42"
+            ]),
+            Ok(Command::Stop(StopArgs {
+                id: "i-42".into(),
+                store: Some(PathBuf::from("/data/store")),
+                timeout: Duration::from_millis(500),
+            }))
+        );
+    }
+
+    // Catches a stop without an id, with a non-canonical id, or with an
+    // unexpected argument reaching the runtime: the CLI must reject them
+    // before any state file is touched.
+    #[test]
+    fn rejects_invalid_stop_arguments() {
+        assert_eq!(parse(["stop"]), Err(CliError::MissingStopId));
+        for id in ["x-1", "i-", "i-abc", "i-042", "i-99999999999999999"] {
+            assert_eq!(
+                parse(["stop", id]),
+                Err(CliError::InvalidInstanceId(id.to_owned())),
+                "{id:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            parse(["stop", "i-1", "i-2"]),
+            Err(CliError::UnexpectedArgument("i-2".to_owned()))
+        );
+        assert_eq!(
+            parse(["stop", "--volume", "i-1"]),
+            Err(CliError::UnknownOption("--volume".to_owned()))
+        );
+    }
+
+    // Catches resolving the stop store from anything but the documented
+    // explicit option, environment, and HOME order.
+    #[test]
+    fn resolves_stop_store_from_the_documented_environment() {
+        let stop = StopArgs {
+            id: "i-42".into(),
+            store: None,
+            timeout: Duration::from_secs(2),
+        };
+        assert_eq!(
+            resolve_stop(&stop, &home_env()).unwrap(),
+            ResolvedStop {
+                id: "i-42".into(),
+                store: PathBuf::from("/home/test/.minicontainer"),
+                timeout: Duration::from_secs(2),
+            }
+        );
+
+        let env = FakeEnv {
+            store: Some(OsString::from("/env/store")),
+            kernel: None,
+            home: Some(OsString::from("/home/test")),
+        };
+        assert_eq!(
+            resolve_stop(&stop, &env).unwrap().store,
+            PathBuf::from("/env/store")
         );
     }
 

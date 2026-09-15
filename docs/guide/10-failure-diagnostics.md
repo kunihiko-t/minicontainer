@@ -35,6 +35,12 @@ timeout、QEMU失敗、guest failure、protocol破損、実行中のSIGINT/SIGTE
 - `runtime session failed: QEMU exited unsuccessfully`を含む行はExit後のQEMU非0終了である。
 - `run interrupted by SIGINT`または`run interrupted by SIGTERM`を含む行はhostが受け取ったsignalによる中断である。
 - `instance state failed`を含む行はinstance stateの記録または削除の失敗である。storeの`run/`の権限とsymlinkを確認する。
+- `QEMU exited before the guest was ready`を含む行はdetached runのhandshake失敗である。`qemu:`以降に`qemu.log`の末尾が続くことがあり、payload directoryとstate fileは回収済みである。
+- `instance ... is not registered`を含む行は`stop`がstate fileを見つけられなかったことを示す。既に停止済みか、記録されていない。
+- `instance ... state is corrupt`を含む行はidentity照合を信頼できないため、`stop`がprocessにもfileにも触れなかったことを示す。
+- `instance ... was already gone`を含む行は`stop`の成功報告であり、標準エラー出力へ出るが終了codeは0である。
+- `instance ... did not die after SIGKILL`を含む行はSIGKILL後もprocessが消えなかったことを示す。state fileとpayloadは残るため再試行できる。
+- `instance was ... but cleanup failed`を含む行は停止自体は完了したが残骸の回収に失敗したことを示す。
 - `guest output exceeds 1 MiB`を含む行は出力合計の上限超過である。
 - `guest output consumer failed`を含む行は、run途中の標準出力・標準エラー出力への書き出し失敗である。QEMU回収とpayload削除は行われる。
 - `; cleanup also failed`を含む行は、主操作に加えて後始末も失敗したことを示す。
@@ -92,8 +98,18 @@ guestのExit受信後に届いたsignalは確定済みのguest結果を返し、
 `SIGKILL`は捕捉できないため、強制終了されたrunの後始末は保証しない。
 
 強制終了で残ったinstanceはstoreの`run/`にstate fileが残り、孤児になったQEMUが生きていれば`minictr ps`でlive、死んでいればstaleと表示される。
-`ps`は観測だけを行い削除しないため、残ったfileとQEMUは利用者が片付ける。
+`ps`は観測だけを行い削除しないため、残ったfileとQEMUは`stop`で回収する。
 crash経路の検証では、`minictr`のSIGKILLとQEMUのkillのあと`ps`がstaleを表示することを確認する。
+
+## detached runの診断
+
+`run --detach`はsupervisorを残さないため、終了したguestを報告する仕組みはない。
+guestのExit frameは誰も読まず、終了codeを得る経路はない。
+`ps`が`live`を出し続けるだけではguestの生死は分からず、回収したい時点で`stop`を呼ぶ。
+
+guestのUART出力とQEMU自身の診断はpayload directory内の`uart.log`と`qemu.log`へ書かれる。
+どちらも合計量の上限がなく、`stop`でdirectoryごと消える。
+handshake失敗時は`qemu.log`の末尾だけが`minictr:`行の`qemu:`以降へ出る。
 
 ## 出力合計の上限
 
