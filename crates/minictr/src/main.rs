@@ -3,7 +3,7 @@
 mod cli;
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -589,6 +589,7 @@ pub fn run_resolved(
             instances: Some(InstanceRegistration {
                 dir: &instances_dir,
                 image: &resolved.image,
+                program: OsStr::new(QEMU_PROGRAM),
             }),
         },
         runner,
@@ -2758,7 +2759,8 @@ mod tests {
         let root = temp_store_root("ps-rows");
         let dir = InstanceDir::open(&root).unwrap();
         let own = std::process::id();
-        dir.register("hello", own).unwrap();
+        let own_exe = std::env::current_exe().unwrap();
+        dir.register("hello", own, own_exe.as_os_str()).unwrap();
         std::fs::write(
             root.join("run").join("i-4294967294.state"),
             b"minicontainer-state-v1\npid=4294967294\ntoken=1\ncomm=dead\nimage=gone\nstarted=0\n",
