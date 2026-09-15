@@ -15,5 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 minicontainer-bundle = { path = "../crates/bundle" }
+minicontainer-protocol = { path = "../crates/protocol" }
+minios-abi.workspace = true
 libc = "0.2"
 sha2 = "0.10"

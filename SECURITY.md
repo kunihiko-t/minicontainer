@@ -26,3 +26,10 @@ gh attestation verify 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz' 
 
 A checksum alone proves file integrity, not origin. The attestation binds the
 artifact digest to the source commit and the builder workflow.
+
+## Security testing
+
+The MiniBundle parser and the UART control-frame decoder handle untrusted
+bytes. They are covered by a deterministic fuzz harness in addition to
+boundary tests. See the [security testing notes](docs/reference/security-testing.md)
+for targets, detectors, limits, and the crash-to-regression procedure.

@@ -14,7 +14,7 @@ fn non_utf8_argument_prints_usage_and_exits_2() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).expect("diagnostic is UTF-8"),
-        "xtask argument is not valid UTF-8\n\nusage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\n"
+        "xtask argument is not valid UTF-8\n\nusage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]\n"
     );
 }
 
@@ -31,6 +31,15 @@ fn utf8_cli_errors_print_usage_and_exit_2() {
             "unexpected xtask argument: extra",
         ),
         (vec!["dist"], "missing required xtask option: --target"),
+        (vec!["fuzz"], "missing required xtask option: --target"),
+        (
+            vec!["fuzz", "--target", "qemu"],
+            "invalid value for xtask option: --target",
+        ),
+        (
+            vec!["fuzz", "--target", "bundle", "--seed", "seven"],
+            "invalid value for xtask option: --seed",
+        ),
         (
             vec![
                 "dist",
@@ -55,7 +64,7 @@ fn utf8_cli_errors_print_usage_and_exit_2() {
         assert_eq!(
             String::from_utf8(output.stderr).expect("diagnostic is UTF-8"),
             format!(
-                "{diagnostic}\n\nusage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\n"
+                "{diagnostic}\n\nusage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]\n"
             )
         );
     }

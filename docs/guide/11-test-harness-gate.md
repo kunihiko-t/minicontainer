@@ -2,7 +2,8 @@
 
 書式、文書、Clippy、単体試験、ビルド、実QEMUでの検証は、共通のテストハーネスから実行する。
 検証の入口は`cargo xtask setup`と`cargo xtask check-host`と`cargo xtask check`の三つだけである。
-`xtask`が受け付けるcommandはこの三つであり、引数を付けると型付きerrorになる。
+`xtask`はこの三つに加えて、配布物を組み立てる`dist`とparserをfuzzする`fuzz`を受け付ける。
+`setup`、`check-host`、`check`に引数を付けると型付きerrorになる。
 
 ## setupは診断だけを行う
 
