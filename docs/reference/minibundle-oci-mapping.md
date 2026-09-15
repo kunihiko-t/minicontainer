@@ -217,4 +217,4 @@ bundle hexと各digestは`minictr image build`の実出力から計算した。
 
 `v1`の対応は固定する。
 media type、必須field、canonical形、判定表のいずれかを変えるときは、新しい版のmedia type名を導入するIssueを作り、`v1`の実装とfixtureを壊さない。
-互換性と廃止の宣言は[#26](https://github.com/kunihiko-t/minicontainer/issues/26)の方針に従う。
+互換性と廃止の宣言は[互換性と移行の方針](compatibility.md)に従う。

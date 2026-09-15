@@ -31,6 +31,7 @@ payload=<payload一時directoryの絶対path>
 書き込みは一時fileへの完全な書き込みと`sync`ののちrenameで公開する。
 `ps`が部分書き込みのfileを読むことはない。
 parseはversion行とfieldの順序・必須性への厳密な一致だけを受理し、上限 (1 KiB) 超過、未知version、順序の入れ替わり、余分な行はすべてcorruptとして扱う。
+version行のbumpと移行の扱いは[互換性と移行の方針](compatibility.md)に従う。
 `image`は行形式を壊す文字 (空白、`=`、改行) と128 byte超過を拒否する。
 `payload`は`stop`が残骸を消すための手掛かりであり、後述のpath制約を通ったものだけが削除対象になる。
 

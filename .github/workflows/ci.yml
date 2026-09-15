@@ -108,6 +108,13 @@ jobs:
           set -e
           test "$status" -eq 42
           grep -q "hello from guest" /tmp/oci-interop/guest2.txt
+      - name: Verify compatibility fixtures offline
+        run: |
+          set -eu
+          (cd tests/fixtures/compat && sha256sum -c SHA256SUMS)
+          MINICTR=target/debug/minictr
+          "$MINICTR" image import --store /tmp/oci-interop/store legacy tests/fixtures/compat/minibundle-abi-v1.0.mcb
+          "$MINICTR" image inspect --store /tmp/oci-interop/store legacy | grep -q "digest: sha256:f8200f06e25dcb0f36a744b780c0fa1b40030c9a6bb9786b122cad44cad221ff"
   check-macos:
     runs-on: macos-15
     steps:
