@@ -11,7 +11,7 @@ programは`qemu-system-riscv64`である。
 ```text
 -machine virt -m <memory>M -smp <cpus> -bios default
 -kernel <kernel>
--device loader,file=<payload>,addr=0x87800000,force-raw=on
+-device loader,file=<payload>,addr=<RAM末尾-8MiB>,force-raw=on
 -serial stdio -monitor none -display none
 ```
 
@@ -23,8 +23,8 @@ serialはstdioへ直結し、monitorとdisplayは無効化するため、QEMUは
 ## resourceの範囲
 
 公開するmemoryは128から8192 MiB、vCPUは1から8である。
-memoryの下限128は、payload予約窓`0x8780_0000..0x8800_0000`がRAMに載るために必要であり、既定値と一致する。
-これより小さい値ではloaderがpayloadを配置できない。
+memoryの下限128は、FDT予約とpayload予約窓の合計8 MiBがRAMに収まるよう確保する学習用の下限であり、既定値と一致する。
+loader addressは`RAM末尾 - 8 MiB`としてmemory量から導き、kernelがFDTから導く窓と常に一致する。
 上限8192 MiBと8 vCPUは学習用途の公開上限であり、CPU quotaやhost cgroup、hotplugは対象外である。
 
 kernelはboot hartだけを使い、予約窓より上も管理しない。

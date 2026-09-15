@@ -32,6 +32,7 @@ enum Phase {
     MinictrTests,
     XtaskTests,
     GuestExampleBuild,
+    GuestEchoBuild,
     LockedBuild,
     EndToEnd,
 }
@@ -109,6 +110,19 @@ impl Phase {
                 "--config",
                 "build.target-dir=\"target/guest-hello\"",
             ]),
+            Self::GuestEchoBuild => Some(&[
+                "build",
+                "--manifest-path",
+                "examples/guest-echo/Cargo.toml",
+                "--target",
+                "riscv64gc-unknown-none-elf",
+                "--release",
+                "--locked",
+                "--config",
+                "target.riscv64gc-unknown-none-elf.rustflags=[\"-C\", \"link-arg=-Tlinker.ld\"]",
+                "--config",
+                "build.target-dir=\"target/guest-echo\"",
+            ]),
             Self::LockedBuild => Some(&["build", "--workspace", "--locked"]),
             Self::EndToEnd => None,
         }
@@ -148,6 +162,7 @@ fn check_phases() -> Vec<Phase> {
         Phase::MinictrTests,
         Phase::XtaskTests,
         Phase::GuestExampleBuild,
+        Phase::GuestEchoBuild,
         Phase::LockedBuild,
         Phase::EndToEnd,
     ]
@@ -448,11 +463,12 @@ mod tests {
                 Phase::MinictrTests,
                 Phase::XtaskTests,
                 Phase::GuestExampleBuild,
+                Phase::GuestEchoBuild,
                 Phase::LockedBuild,
                 Phase::EndToEnd,
             ]
         );
-        assert_eq!(check_phases().len(), 16);
+        assert_eq!(check_phases().len(), 17);
     }
 
     #[test]
@@ -463,8 +479,9 @@ mod tests {
             .collect();
 
         assert_eq!(check_host_phases(), expected);
-        assert_eq!(check_host_phases().len(), 15);
+        assert_eq!(check_host_phases().len(), 16);
         assert!(check_host_phases().contains(&Phase::GuestExampleBuild));
+        assert!(check_host_phases().contains(&Phase::GuestEchoBuild));
         assert!(!check_host_phases().contains(&Phase::EndToEnd));
     }
 

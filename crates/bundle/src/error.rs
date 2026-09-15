@@ -28,7 +28,7 @@ impl fmt::Display for BundleError {
             Self::Header(error) => write!(formatter, "invalid MiniBundle header: {error:?}"),
             Self::Manifest(error) => write!(formatter, "invalid MiniBundle manifest: {error:?}"),
             Self::LengthOverflow => formatter.write_str("MiniBundle length arithmetic overflowed"),
-            Self::TooLarge => formatter.write_str("MiniBundle exceeds the 8 MiB payload limit"),
+            Self::TooLarge => formatter.write_str("MiniBundle exceeds the 6 MiB payload limit"),
             Self::LengthMismatch { declared, actual } => write!(
                 formatter,
                 "MiniBundle declared {declared} bytes but contains {actual} bytes"

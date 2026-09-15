@@ -228,8 +228,8 @@ dependencies = [
 
 [[package]]
 name = "minios-abi"
-version = "0.1.1"
-source = "git+https://github.com/kunihiko-t/minios.git?tag=minios-abi-v0.1.1#a3631759fe0490c5d39214108a004dedfdeab9f8"
+version = "0.2.0"
+source = "git+https://github.com/kunihiko-t/minios.git?tag=minios-abi-v0.2.0#0751dd67c051cc396aa5b4aade7bdc2ba8037587"
 
 [[package]]
 name = "once_cell"

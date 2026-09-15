@@ -61,7 +61,7 @@ Guest ABIは`minios-abi-v0.1.1`に固定している。
 
 次にゲストELFを`image build`で`store`へ登録し、`hello`タグを付ける。
 `$STORE`は絶対パスで指定した保存先であり、`Store::new`が作成する。
-8 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
+6 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
 実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
 ELFの中身はhostでは検証せずguestのloaderが検証する。
 
@@ -138,6 +138,10 @@ cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/r
 
 ゲストの標準エラー出力は`minictr`の標準エラー出力に届く。Cargoのビルド状況も標準エラー出力に表示される。
 この例の42は意図した終了コードであり、シェルの`set -e`が有効でも結果を確認できる形にしている。
+
+標準入力が端末でなければ、その内容はguestのstdinへ転送される。
+`examples/guest-echo`は入力をechoして42で終わるguestであり、`printf 'ping' | minictr run echo`で往復を確認できる。
+端末からの起動や`--detach`では入力経路がなく、端末起動ではguestの`read`は直ちに0を返す。
 `minictr`は0〜255のゲスト終了コードをそのまま返し、範囲外はホスト側の失敗として扱う。
 使い方の誤りは終了コード2、ホスト側の失敗（`image build`の失敗、`store`の解決失敗、QEMUの失敗、タイムアウトを含む）は終了コード125になる。
 実行中のCtrl-C (SIGINT) とSIGTERMは`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののち必要ならSIGKILLで回収する。中断されたrunは後始末を経て終了コード125で終わる。
@@ -188,7 +192,7 @@ cargo run -p minictr --locked -- image pull-oci --store "$STORE" hello registry.
 ```
 
 pullはHTTPSだけを使い、認証はしない。参照はtagではなくdigest pinだけを受け入れる。
-redirectは5回まで、接続10秒・要求60秒のtimeout、manifestとconfigは64 KiB・layerは8 MiBの上限で取得する。
+redirectは5回まで、接続10秒・要求60秒のtimeout、manifestとconfigは64 KiB・layerは6 MiBの上限で取得する。
 詳細は[第12章](docs/guide/12-oci-image-spec.md)を参照する。
 
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。

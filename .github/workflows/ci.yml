@@ -45,7 +45,7 @@ jobs:
           set -eu
           cargo build -p minictr --release --locked
           git clone https://github.com/kunihiko-t/minios.git /tmp/release-smoke/minios
-          git -C /tmp/release-smoke/minios checkout --detach 9be99255a59d58d19db25b835af0e28a8d2a4036
+          git -C /tmp/release-smoke/minios checkout --detach 4865f9be97a6cdcd77c71e36b1ba426b49bd73d7
           cargo build --manifest-path /tmp/release-smoke/minios/Cargo.toml --target-dir /tmp/release-smoke/minios/target -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --release --locked
           cargo xtask dist --target x86_64-unknown-linux-gnu --minictr target/release/minictr --kernel /tmp/release-smoke/minios/target/riscv64gc-unknown-none-elf/release/minios-kernel --output /tmp/release-smoke/dist
           (cd /tmp/release-smoke/dist && sha256sum -c ./*.sha256)

@@ -59,6 +59,9 @@ pub enum SessionError {
     GuestError(Vec<u8>),
     /// stdout、stderr、diagnosticsの合計蓄積量が上限を超えた。
     GuestOutputTooLarge,
+    /// guest→hostとして意味を持たないframeを受信した。`STDIN`は
+    /// host→guest専用、`PROC_EXIT`はmulti-image bundle専用である。
+    UnexpectedKind(FrameKind),
     /// guest Exit後にQEMUが失敗して終了した。
     ProcessFailed(ProcessStatus),
 }
@@ -80,6 +83,9 @@ impl fmt::Display for SessionError {
                 ready.abi_major, ready.abi_minor
             ),
             Self::InvalidExitPayload => write!(formatter, "Exit payload must contain a u32"),
+            Self::UnexpectedKind(kind) => {
+                write!(formatter, "{kind:?} frame is not valid from guest to host")
+            }
             Self::GuestError(bytes) => write!(
                 formatter,
                 "guest reported an error: {}",
@@ -108,6 +114,7 @@ impl Error for SessionError {
             | Self::MissingExit
             | Self::UnsupportedReadyAbi(_)
             | Self::InvalidExitPayload
+            | Self::UnexpectedKind(_)
             | Self::GuestError(_)
             | Self::GuestOutputTooLarge
             | Self::ProcessFailed(_) => None,
@@ -138,6 +145,7 @@ pub struct Session {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     diagnostics: Vec<u8>,
+    guest_abi_minor: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,8 +166,15 @@ impl Session {
             control_started: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            guest_abi_minor: None,
             diagnostics: Vec::new(),
         }
+    }
+
+    /// guestがReadyで名乗ったABI minor。Ready到達前は`None`。
+    /// host→guestの新frame (例: `STDIN`) はこの値で送信可否を判断する。
+    pub fn guest_abi_minor(&self) -> Option<u16> {
+        self.guest_abi_minor
     }
 
     /// QEMU stdoutから届いたUART bytesを処理する。
@@ -315,9 +330,13 @@ impl Session {
                 abi_minor: 0,
             })
         })?;
-        if ready.abi_major != BOOT_ABI_MAJOR || ready.abi_minor != BOOT_ABI_MINOR {
+        // host側の受理規約は`abi_major`一致と`abi_minor`以下である。古い
+        // minorを名乗るguestには`STDIN`のような新frameを送らない判断が
+        // 呼び出し側へ委ねられるよう、成立したminorを記録する。
+        if ready.abi_major != BOOT_ABI_MAJOR || ready.abi_minor > BOOT_ABI_MINOR {
             return Err(SessionError::UnsupportedReadyAbi(ready));
         }
+        self.guest_abi_minor = Some(ready.abi_minor);
         self.state = State::Running;
         events.push(SessionEvent::Ready);
         Ok(())
@@ -361,6 +380,7 @@ impl Session {
                 Ok(())
             }
             FrameKind::GuestError => Err(SessionError::GuestError(frame.payload)),
+            FrameKind::Stdin | FrameKind::ProcExit => Err(SessionError::UnexpectedKind(frame.kind)),
         }
     }
 }
@@ -628,6 +648,39 @@ mod tests {
         );
     }
 
+    // Catches the ABI rule that a newer guest must not be spoken to: the host
+    // only accepts a Ready minor at or below the pinned ABI. An older minor
+    // is accepted and recorded so the caller can gate host-to-guest frames.
+    #[test]
+    fn ready_minor_below_or_above_the_pinned_abi_is_handled() {
+        for minor in [0, 1] {
+            let mut session = Session::new();
+            let payload = ReadyPayload {
+                abi_major: 1,
+                abi_minor: minor,
+            }
+            .encode();
+            assert_eq!(
+                session.push_uart(&frame(FrameKind::Ready, &payload)),
+                Ok(vec![SessionEvent::Ready]),
+                "minor {minor} must be accepted"
+            );
+            assert_eq!(session.guest_abi_minor(), Some(minor));
+        }
+
+        let mut session = Session::new();
+        let payload = ReadyPayload {
+            abi_major: 1,
+            abi_minor: minios_abi::boot::BOOT_ABI_MINOR + 1,
+        }
+        .encode();
+        assert!(matches!(
+            session.push_uart(&frame(FrameKind::Ready, &payload)),
+            Err(SessionError::UnsupportedReadyAbi(_))
+        ));
+        assert_eq!(session.guest_abi_minor(), None);
+    }
+
     // Catches treating a guest-declared execution failure as ordinary stderr
     // output, which would let Runtime::run report a false success.
     #[test]
@@ -777,8 +830,8 @@ mod tests {
 
     fn ready_frame() -> Vec<u8> {
         let payload = ReadyPayload {
-            abi_major: 1,
-            abi_minor: 0,
+            abi_major: minios_abi::boot::BOOT_ABI_MAJOR,
+            abi_minor: minios_abi::boot::BOOT_ABI_MINOR,
         }
         .encode();
         frame(FrameKind::Ready, &payload)

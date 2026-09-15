@@ -228,11 +228,11 @@ mod tests {
     use super::*;
     use minicontainer_bundle::ImageSpec;
 
-    const LAYER_DIGEST: &str = "6c710671215c4929fa600956d236ae82df1f3a9f05f0b125c3fb0feed9096136";
-    const CONFIG_DIGEST: &str = "3f19ea537fd3b4cdee56a34be0d9c7f90b1472d3e12c0e7aff3a505f7dfac98e";
+    const LAYER_DIGEST: &str = "5b5bfa03d58cf705f1e4b2b25c7deff040dacd6d07c9530bb413af759873b07d";
+    const CONFIG_DIGEST: &str = "883d7fa4996b5ab067214dd9b4d64a83805f61bbef9ff30912067d88e9247835";
     const MANIFEST_DIGEST: &str =
-        "f095c9356a85036bc3e4a08e562e6826321aedd3569aaa15e076a9639170995b";
-    const INDEX_DIGEST: &str = "29dd36cc92562f77bb648ee0ad74d4fe3cde3330f723fadd0f514c15309ceb54";
+        "64287f614ec08171127db4f9e411767d2ea1d635b9ec560377e0cdbed7367eeb";
+    const INDEX_DIGEST: &str = "f1eaff19e582d40560022d45a8819cfd28a657bd9f88c318008ef46f1759634c";
 
     /// The golden fixture from the mapping reference: name `hello`, no
     /// arguments, ELF bytes `0x00` through `0x0f`.

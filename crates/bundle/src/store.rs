@@ -430,21 +430,21 @@ mod tests {
         assert_eq!(
             digest,
             [
-                0xd2, 0xe0, 0xc6, 0x02, 0xac, 0xbf, 0x71, 0x1b, 0x5d, 0x1c, 0xb7, 0xa2, 0xae, 0x07,
-                0xdd, 0x19, 0xd9, 0xed, 0xa0, 0xf6, 0x8c, 0xb7, 0x36, 0xa5, 0x07, 0xb9, 0x7a, 0x73,
-                0x9e, 0xa9, 0x7d, 0x48,
+                0x4b, 0xda, 0x85, 0x82, 0x9b, 0x64, 0x0f, 0x03, 0x6e, 0x35, 0xe7, 0x3c, 0x33, 0x0f,
+                0x18, 0x69, 0xc3, 0x5f, 0x12, 0xbd, 0x66, 0xde, 0x71, 0x14, 0x17, 0xfb, 0xa8, 0xcb,
+                0xae, 0x92, 0xe0, 0xd4,
             ]
         );
         assert_eq!(
             fs::read(home.path().join(
-                "images/sha256/d2e0c602acbf711b5d1cb7a2ae07dd19d9eda0f68cb736a507b97a739ea97d48.mcb"
+                "images/sha256/4bda85829b640f036e35e73c330f1869c35f12bd66de711417fba8cbae92e0d4.mcb"
             ))
             .unwrap(),
             bytes
         );
         assert_eq!(
             fs::read(home.path().join("tags/hello")).unwrap(),
-            b"d2e0c602acbf711b5d1cb7a2ae07dd19d9eda0f68cb736a507b97a739ea97d48"
+            b"4bda85829b640f036e35e73c330f1869c35f12bd66de711417fba8cbae92e0d4"
         );
         assert_eq!(store.resolve("hello").unwrap(), bytes);
     }
@@ -1025,7 +1025,7 @@ mod tests {
         let cases: [(&str, &[u8]); 3] = [
             (
                 "newline",
-                b"d2e0c602acbf711b5d1cb7a2ae07dd19d9eda0f68cb736a507b97a739ea97d48\n",
+                b"4bda85829b640f036e35e73c330f1869c35f12bd66de711417fba8cbae92e0d4\n",
             ),
             (
                 "uppercase",
@@ -1164,7 +1164,7 @@ mod tests {
             .open(store.image_path(digest))
             .unwrap();
         image.set_len(BUNDLE_MAX_LEN + 1).unwrap();
-        assert_eq!(image.metadata().unwrap().len(), 8 * 1024 * 1024 + 1);
+        assert_eq!(image.metadata().unwrap().len(), 6 * 1024 * 1024 + 1);
 
         assert!(matches!(
             store.resolve("oversized"),
@@ -1172,7 +1172,7 @@ mod tests {
         ));
     }
 
-    // Production break caught: bounded resolve rejects a bundle exactly at the 8 MiB ABI limit.
+    // Production break caught: bounded resolve rejects a bundle exactly at the 6 MiB ABI limit.
     #[test]
     fn resolve_accepts_the_maximum_bundle_length() {
         let home = TempHome::new();
@@ -1188,7 +1188,7 @@ mod tests {
         store.tag("maximum", digest).unwrap();
 
         let resolved = store.resolve("maximum").unwrap();
-        assert_eq!(resolved.len(), 8 * 1024 * 1024);
+        assert_eq!(resolved.len(), 6 * 1024 * 1024);
         assert_eq!(&resolved[resolved.len() - 8..], &[0x5a; 8]);
     }
 

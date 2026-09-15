@@ -52,6 +52,11 @@ pub enum RuntimeError {
     Process(ProcessError),
     /// QEMU UART sessionを復元できなかった。
     Session(SessionError),
+    /// host stdinのreadまたはQEMU stdinへのwriteに失敗した。
+    Input(io::Error),
+    /// guest ABIが`STDIN` frameを持たないのに入力の転送が要求された。
+    /// 値はguestが報告したABI minor version。
+    InputAbiUnsupported(u16),
     /// 逐次転送先のconsumerがchunkの受け取りに失敗した。
     Consumer(io::Error),
     /// detached起動のhandshake中に、guest Readyを観測する前にQEMUが
@@ -94,6 +99,11 @@ impl fmt::Display for RuntimeError {
             Self::Instance(error) => write!(formatter, "instance state failed: {error}"),
             Self::Process(error) => write!(formatter, "runtime process failed: {error}"),
             Self::Session(error) => write!(formatter, "runtime session failed: {error}"),
+            Self::Input(error) => write!(formatter, "guest stdin forwarding failed: {error}"),
+            Self::InputAbiUnsupported(minor) => write!(
+                formatter,
+                "guest ABI v1.{minor} does not support stdin forwarding"
+            ),
             Self::Consumer(error) => {
                 write!(formatter, "guest output consumer failed: {error}")
             }
@@ -138,9 +148,9 @@ impl Error for RuntimeError {
             Self::Bundle(error) => Some(error),
             Self::InvalidDeadline => None,
             Self::UnsafePayloadPath(_) => None,
-            Self::Io(error) | Self::Consumer(error) => Some(error),
+            Self::Io(error) | Self::Input(error) | Self::Consumer(error) => Some(error),
             Self::Instance(error) => Some(error),
-            Self::DetachedBoot { .. } | Self::Interrupted(_) => None,
+            Self::DetachedBoot { .. } | Self::Interrupted(_) | Self::InputAbiUnsupported(_) => None,
             Self::Process(error) => Some(error),
             Self::Session(error) => Some(error),
             Self::Cleanup { primary, .. } => Some(primary),

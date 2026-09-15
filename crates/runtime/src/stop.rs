@@ -340,15 +340,22 @@ mod tests {
     }
 
     /// 記録対象のpayload dir。`stop`の安全検査を通るため、basenameと親dir
-    /// は本物の契約どおりに作る。
+    /// は本物の契約どおりに作る。`PayloadTemp`と同じ名前空間を共有するため、
+    /// 衝突は別の連番でやり直す。
     fn payload_root() -> PathBuf {
-        let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let root = env::temp_dir().join(format!(
-            "minicontainer-run-{}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("a scratch payload dir must be creatable");
-        root
+        for _ in 0..64 {
+            let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+            let root = env::temp_dir().join(format!(
+                "minicontainer-run-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => return root,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("a scratch payload dir must be creatable: {error}"),
+            }
+        }
+        panic!("a scratch payload dir must be creatable: name space exhausted")
     }
 
     fn helper_program() -> PathBuf {
