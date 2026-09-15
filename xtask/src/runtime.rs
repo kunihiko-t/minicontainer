@@ -1095,9 +1095,25 @@ fn run_orphan_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError
         // run中のinstanceはliveとして見えなければならない。登録はQEMU起動
         // 直後に行われるため、boot観測からの僅かな遅れを許す。
         if let Err(error) = wait_for_ps_row(minictr, &store_path, qemu_pid, "live") {
-            terminate_spawned(spawned);
+            // 行が出なかった理由をrun側の状態から絞る。minictrが既に終わって
+            // いれば登録失敗、走っていれば表示かidentity照合の問題である。
+            let _ = signal_process_group(spawned.pid, libc::SIGKILL);
+            let _ = spawned.child.kill();
+            let exited = spawned.child.wait().ok();
+            let stdout = join_reader(spawned.stdout_reader, &spawned.command_line)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            let stderr = join_reader(spawned.stderr_reader, &spawned.command_line)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
             let _ = signal_process(qemu_pid, libc::SIGKILL);
-            return Err(error);
+            return Err(E2EError::UnexpectedRun {
+                case: "crash-path ps live row",
+                expected: format!("a live i-{qemu_pid} row"),
+                actual: format!(
+                    "{error}; minictr exit {exited:?} (stdout: {stdout}, stderr: {stderr})"
+                ),
+            });
         }
         // hostを即死させてcleanupを回避する。QEMUは別groupで生き続ける。
         if let Err(error) = signal_process(spawned.pid, libc::SIGKILL) {
@@ -1169,12 +1185,11 @@ fn wait_for_ps_row(
         store.as_os_str().to_owned(),
     ];
     loop {
-        match run_with_timeout(minictr, &args, None, &[], COMMAND_TIMEOUT) {
+        // deadline到達時点では直前のpollが必ず成功しているため、最後のps
+        // 出力をそのまま診断へ載せられる。
+        let text = match run_with_timeout(minictr, &args, None, &[], COMMAND_TIMEOUT) {
             Ok(completed) if completed.status.success() => {
-                let text = String::from_utf8_lossy(&completed.stdout);
-                if text.lines().any(|line| line.starts_with(&expected)) {
-                    return Ok(());
-                }
+                String::from_utf8_lossy(&completed.stdout).into_owned()
             }
             Ok(completed) => {
                 return Err(E2EError::UnexpectedRun {
@@ -1188,10 +1203,15 @@ fn wait_for_ps_row(
                 });
             }
             Err(error) => return Err(error),
+        };
+        if text.lines().any(|line| line.starts_with(&expected)) {
+            return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(E2EError::TimedOut {
-                command: format!("minictr ps waiting for a {status} i-{qemu_pid}"),
+            return Err(E2EError::UnexpectedRun {
+                case: "crash-path ps row",
+                expected: format!("a {status} i-{qemu_pid} row within the E2E limit"),
+                actual: format!("last ps output: {}", text.trim_end()),
             });
         }
         thread::sleep(POLL_INTERVAL);
