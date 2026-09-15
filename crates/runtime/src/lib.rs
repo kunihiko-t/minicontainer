@@ -30,6 +30,74 @@ pub struct RunRequest<'a> {
     pub deadline: Duration,
     /// QEMUへ渡すguest resource量。
     pub resources: QemuResources,
+    /// hostへ届いたSIGINTとSIGTERMを観測する源。`None`のrunはsignalを
+    /// 観測せず、hostがsignalで死んだ場合はchildをreapできない。
+    pub interrupts: Option<&'a dyn InterruptSource>,
+}
+
+/// hostが受け取った中断signal。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostSignal {
+    /// SIGINT (端末のCtrl-Cや`kill -INT`)。
+    Interrupt,
+    /// SIGTERM。
+    Terminate,
+}
+
+impl HostSignal {
+    /// 診断と公開error文言に使うsignal名。
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+
+    /// 転送時にchildのprocess groupへ送るsignal番号。
+    pub(crate) const fn signo(self) -> libc::c_int {
+        match self {
+            Self::Interrupt => libc::SIGINT,
+            Self::Terminate => libc::SIGTERM,
+        }
+    }
+
+    /// signal番号から`HostSignal`へ写像する。対象外の番号は`None`。
+    pub fn from_signo(signo: libc::c_int) -> Option<Self> {
+        match signo {
+            libc::SIGINT => Some(Self::Interrupt),
+            libc::SIGTERM => Some(Self::Terminate),
+            _ => None,
+        }
+    }
+}
+
+/// `InterruptSource::poll`が返す、観測済みsignalのsnapshot。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalObservation {
+    /// 最初に届いたsignal。転送対象は常にこれである。
+    pub first: HostSignal,
+    /// 到着したsignalの累計数。最初の転送後に増えればrunを即時killする。
+    pub count: u32,
+}
+
+/// run中のhost signalを`Runtime`へ届ける観測点。
+///
+/// 実装はasync-signal-safeな記録側 (例: atomicを書くだけのsignal handler) と
+/// 分離し、`poll`はrun loopから任意の間隔で呼べる。`count`は単調増加の累計値
+/// であり、runtimeは前回pollからの増分だけを新しいsignalとして扱う。
+pub trait InterruptSource {
+    /// 観測済みのsignalがあればそのsnapshotを、なければ`None`を返す。
+    fn poll(&self) -> Option<SignalObservation>;
+}
+
+/// signalを観測しないsource。`RunRequest::interrupts`が`None`のrunと同じ
+/// 振る舞いを明示したいembedder向け。
+pub struct NeverInterrupt;
+
+impl InterruptSource for NeverInterrupt {
+    fn poll(&self) -> Option<SignalObservation> {
+        None
+    }
 }
 
 /// decode済みguest eventをrunの終了前に受け取る転送先。
@@ -52,15 +120,34 @@ impl OutputSink for Discard {
     }
 }
 
+/// 転送した最初のsignalへchildのprocess groupが応答するのを待つ期限。
+/// 期限切れまたは続くsignalではprocess groupをSIGKILLで止める。
+const SIGNAL_GRACE: Duration = Duration::from_secs(2);
+
+/// signal観測のためにevent loopを起こす最大間隔。
+const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// MiniBundleを一時payloadとしてQEMU上で実行するruntime。
 pub struct Runtime<B: ProcessBackend = SystemProcessBackend> {
     backend: B,
+    signal_grace: Duration,
 }
 
 impl<B: ProcessBackend> Runtime<B> {
     /// 指定backendを使うruntimeを作る。
     pub const fn new(backend: B) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            signal_grace: SIGNAL_GRACE,
+        }
+    }
+
+    /// signal graceを短くするtest用builder。実QEMUと同じ契約を短時間で
+    /// 検査するために使い、公開APIではない。
+    #[cfg(test)]
+    fn with_signal_grace(mut self, grace: Duration) -> Self {
+        self.signal_grace = grace;
+        self
     }
 
     /// MiniBundleを検証し、QEMUで実行してguest outcomeを返す。
@@ -97,14 +184,19 @@ impl<B: ProcessBackend> Runtime<B> {
         };
 
         let mut session = Session::new();
+        let mut signals = SignalWatch::new(request.interrupts, self.signal_grace);
         let primary = 'events: loop {
+            let bound = signals.bound(deadline);
             // queueにeventが残っていても全体の期限を強制する。backendが期限
             // 過ぎの出力を返し続けても、この検査がrunをtimeoutで終わらせる。
             // sinkの停滞でloopが止まっても、復帰後の先頭検査が期限を効かせる。
-            if Instant::now() >= deadline {
-                break Err(RuntimeError::Process(ProcessError::TimedOut));
+            if Instant::now() >= bound {
+                break Err(signals.bound_error());
             }
-            match child.next_event(deadline) {
+            if let Err(error) = signals.poll(&mut child) {
+                break Err(error);
+            }
+            match child.next_event(signals.event_deadline(bound)) {
                 Ok(ProcessEvent::Uart(bytes)) => {
                     let events = match session.push_uart(&bytes) {
                         Ok(events) => events,
@@ -118,11 +210,11 @@ impl<B: ProcessBackend> Runtime<B> {
                 }
                 Ok(ProcessEvent::Diagnostic(_)) => {}
                 Ok(ProcessEvent::Exited(status)) => {
-                    break session.finish(status).map_err(RuntimeError::Session);
+                    break signals.finish(&mut session, status);
                 }
-                Ok(ProcessEvent::TimedOut) => {
-                    break Err(RuntimeError::Process(ProcessError::TimedOut));
-                }
+                // 観測間隔に切り詰めた期限でも同じ検査から始め直すだけであり、
+                // 実際の期限は`bound`が持つ。
+                Ok(ProcessEvent::TimedOut) => continue,
                 Err(error) => break Err(RuntimeError::Process(error)),
             }
         };
@@ -147,6 +239,101 @@ fn finish_without_child(
     payload: &PayloadTemp,
 ) -> Result<RunOutcome, RuntimeError> {
     finish_with_cleanup(primary, remove_payload(payload))
+}
+
+/// 一回のrunにおけるhost signalの転送とgraceの状態機械。
+///
+/// 最初のsignalはchildのprocess groupへ転送し、`grace`後も生きていれば
+/// 呼び出し側の通常cleanup (SIGKILL) へ委ねる。二回目以降のsignalはgraceを
+/// 待たずに即座にrunを中断する。guest Exitが確定した後に届いたsignalは
+/// 結果を変えず、QEMUの早期終了を促すだけである。
+struct SignalWatch<'a> {
+    source: Option<&'a dyn InterruptSource>,
+    grace: Duration,
+    seen: u32,
+    interrupted: Option<HostSignal>,
+    grace_end: Option<Instant>,
+}
+
+impl<'a> SignalWatch<'a> {
+    fn new(source: Option<&'a dyn InterruptSource>, grace: Duration) -> Self {
+        Self {
+            source,
+            grace,
+            seen: 0,
+            interrupted: None,
+            grace_end: None,
+        }
+    }
+
+    /// このloop反復で有効な期限。転送後はrunのdeadlineではなくgraceの
+    /// 終端が効く。
+    fn bound(&self, deadline: Instant) -> Instant {
+        self.grace_end.unwrap_or(deadline)
+    }
+
+    /// `next_event`へ渡す期限。sourceがあるときだけ観測間隔で切り詰め、
+    /// signalの検知遅延を`SIGNAL_POLL_INTERVAL`以内に抑える。
+    fn event_deadline(&self, bound: Instant) -> Instant {
+        match self.source {
+            Some(_) => bound.min(Instant::now() + SIGNAL_POLL_INTERVAL),
+            None => bound,
+        }
+    }
+
+    /// 新しく届いたsignalを処理する。戻り値の`Err`はrunの主結果になる。
+    ///
+    /// 転送自体に失敗した場合はそのprocess errorを返す。中断ではなく
+    /// 失敗を表すほうが原因として正確であり、後始末の強制killは別途行う。
+    fn poll<C: ProcessControl>(&mut self, child: &mut C) -> Result<(), RuntimeError> {
+        let Some(source) = self.source else {
+            return Ok(());
+        };
+        let Some(observation) = source.poll() else {
+            return Ok(());
+        };
+        if observation.count <= self.seen {
+            return Ok(());
+        }
+        self.seen = observation.count;
+        if let Some(interrupted) = self.interrupted {
+            return Err(RuntimeError::Interrupted(interrupted));
+        }
+        child
+            .send_signal(observation.first)
+            .map_err(RuntimeError::Process)?;
+        self.interrupted = Some(observation.first);
+        self.grace_end = Some(Instant::now() + self.grace);
+        // 最初の観測までに複数signalが溜まっていた場合もgraceを飛ばす。
+        if observation.count > 1 {
+            return Err(RuntimeError::Interrupted(observation.first));
+        }
+        Ok(())
+    }
+
+    /// 期限到達時の主結果。転送済みなら中断、そうでなければtimeout。
+    fn bound_error(&self) -> RuntimeError {
+        match self.interrupted {
+            Some(signal) => RuntimeError::Interrupted(signal),
+            None => RuntimeError::Process(ProcessError::TimedOut),
+        }
+    }
+
+    /// child終了時のrun結果。確定済みのguest結果は中断後も返し、中断が
+    /// 原因で終了した経路だけを`Interrupted`として報告する。
+    fn finish(
+        &self,
+        session: &mut Session,
+        status: ProcessStatus,
+    ) -> Result<RunOutcome, RuntimeError> {
+        match session.finish(status) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(match self.interrupted {
+                Some(signal) => RuntimeError::Interrupted(signal),
+                None => RuntimeError::Session(error),
+            }),
+        }
+    }
 }
 
 fn finish_with_cleanup(
@@ -178,7 +365,7 @@ fn remove_payload(payload: &PayloadTemp) -> Vec<CleanupFailure> {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::VecDeque,
         io,
         path::PathBuf,
@@ -190,9 +377,9 @@ mod tests {
     use minios_abi::control::{FrameHeader, FrameKind, ReadyPayload};
 
     use super::{
-        CleanupFailure, OutputSink, ProcessBackend, ProcessControl, ProcessError, ProcessEvent,
-        ProcessStatus, QemuCommand, QemuResources, RunRequest, Runtime, RuntimeError, SessionError,
-        SessionEvent,
+        CleanupFailure, HostSignal, InterruptSource, OutputSink, ProcessBackend, ProcessControl,
+        ProcessError, ProcessEvent, ProcessStatus, QemuCommand, QemuResources, RunRequest, Runtime,
+        RuntimeError, SessionError, SessionEvent, SignalObservation,
     };
 
     // Catches skipping any part of the happy-path lifecycle: only a validated
@@ -217,6 +404,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(1),
                 resources: QemuResources::DEFAULT,
+                interrupts: None,
             })
             .unwrap();
 
@@ -275,6 +463,7 @@ mod tests {
                         kernel: "/kernel".as_ref(),
                         deadline: Duration::from_secs(1),
                         resources: QemuResources::DEFAULT,
+                        interrupts: None,
                     })
                     .is_err(),
                 "{name} must fail"
@@ -314,6 +503,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    interrupts: None,
                 })
                 .is_err()
         );
@@ -331,6 +521,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    interrupts: None,
                 })
                 .is_err()
         );
@@ -351,6 +542,10 @@ mod tests {
 
             fn next_event(&mut self, _deadline: Instant) -> Result<ProcessEvent, ProcessError> {
                 Ok(ProcessEvent::Diagnostic(vec![0x78]))
+            }
+
+            fn send_signal(&mut self, _signal: HostSignal) -> Result<(), ProcessError> {
+                Ok(())
             }
 
             fn terminate_and_reap(&mut self) -> Result<ProcessStatus, ProcessError> {
@@ -375,6 +570,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_millis(100),
                 resources: QemuResources::DEFAULT,
+                interrupts: None,
             })
             .unwrap_err();
 
@@ -402,6 +598,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::MAX,
                 resources: QemuResources::DEFAULT,
+                interrupts: None,
             })
             .unwrap_err();
 
@@ -440,6 +637,7 @@ mod tests {
                 kernel: "/kernel".as_ref(),
                 deadline: Duration::from_secs(1),
                 resources: QemuResources::DEFAULT,
+                interrupts: None,
             })
             .unwrap_err();
 
@@ -487,6 +685,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    interrupts: None,
                 },
                 &mut sink,
             )
@@ -539,6 +738,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    interrupts: None,
                 },
                 &mut sink,
             )
@@ -582,6 +782,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(1),
                     resources: QemuResources::DEFAULT,
+                    interrupts: None,
                 },
                 &mut sink,
             )
@@ -629,6 +830,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_millis(50),
                     resources: QemuResources::DEFAULT,
+                    interrupts: None,
                 },
                 &mut sink,
             )
@@ -679,6 +881,7 @@ mod tests {
                     kernel: "/kernel".as_ref(),
                     deadline: Duration::from_secs(5),
                     resources: QemuResources::DEFAULT,
+                    interrupts: None,
                 },
                 &mut sink,
             )
@@ -702,6 +905,328 @@ mod tests {
             })
             .sum();
         assert_eq!(streamed, 1024 * 1024);
+    }
+
+    // Catches ignoring a delivered host signal: the first signal must reach
+    // the child, and the run must end as an interrupt instead of waiting out
+    // the deadline.
+    #[test]
+    fn a_first_signal_is_forwarded_and_the_run_reports_interrupted() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(trace.clone(), payload.clone(), vec![]))
+            .with_signal_grace(Duration::from_millis(60));
+        let interrupts = ScriptedInterrupts::observing([Some(SignalObservation {
+            first: HostSignal::Interrupt,
+            count: 1,
+        })]);
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(60),
+                resources: QemuResources::DEFAULT,
+                interrupts: Some(&interrupts),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Interrupted(HostSignal::Interrupt)),
+            "the run must report the interrupt, got {error:?}"
+        );
+        let events = trace.borrow();
+        assert!(
+            events.contains(&"sigint"),
+            "SIGINT must be forwarded to the child, got {events:?}"
+        );
+        assert_eq!(events.iter().filter(|event| **event == "reap").count(), 1);
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches forwarding SIGTERM as the wrong signal: the child must see the
+    // same signal the host received, not a rewritten one.
+    #[test]
+    fn a_terminate_signal_is_forwarded_as_sigterm() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(trace.clone(), payload.clone(), vec![]))
+            .with_signal_grace(Duration::from_millis(60));
+        let interrupts = ScriptedInterrupts::observing([Some(SignalObservation {
+            first: HostSignal::Terminate,
+            count: 1,
+        })]);
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(60),
+                resources: QemuResources::DEFAULT,
+                interrupts: Some(&interrupts),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Interrupted(HostSignal::Terminate)),
+            "the run must report SIGTERM, got {error:?}"
+        );
+        assert!(
+            trace.borrow().contains(&"sigterm"),
+            "SIGTERM must be forwarded to the child"
+        );
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches discarding a finalized guest result: a signal after the Exit
+    // frame still forwards to QEMU, but a guest outcome must be returned when
+    // QEMU exits inside the grace period.
+    #[test]
+    fn a_signal_after_guest_exit_preserves_the_guest_outcome() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(
+            trace.clone(),
+            payload.clone(),
+            vec![
+                ProcessEvent::Uart(guest_stream(7)),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        ));
+        let interrupts = ScriptedInterrupts::observing([
+            None,
+            Some(SignalObservation {
+                first: HostSignal::Interrupt,
+                count: 1,
+            }),
+        ]);
+
+        let outcome = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(60),
+                resources: QemuResources::DEFAULT,
+                interrupts: Some(&interrupts),
+            })
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 7);
+        assert!(
+            trace.borrow().contains(&"sigint"),
+            "the signal must still reach QEMU for a prompt exit"
+        );
+    }
+
+    // Catches freezing the output pipeline while interrupted: a signal while
+    // frames are still arriving must forward to the child and keep streaming
+    // to the sink for the rest of the grace period.
+    #[test]
+    fn a_signal_during_output_keeps_streaming_until_the_child_exits() {
+        let mut before = ready_frame();
+        before.extend_from_slice(&frame(FrameKind::Stdout, b"before signal\n"));
+        let during = frame(FrameKind::Stdout, b"during grace\n");
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(
+            trace.clone(),
+            payload.clone(),
+            vec![
+                ProcessEvent::Uart(before),
+                ProcessEvent::Uart(during),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        ))
+        .with_signal_grace(Duration::from_secs(60));
+        let interrupts = ScriptedInterrupts::observing([
+            None,
+            Some(SignalObservation {
+                first: HostSignal::Interrupt,
+                count: 1,
+            }),
+        ]);
+        let mut sink = RecordingSink::new(trace.clone());
+
+        let error = runtime
+            .run_with_sink(
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: "/kernel".as_ref(),
+                    deadline: Duration::from_secs(60),
+                    resources: QemuResources::DEFAULT,
+                    interrupts: Some(&interrupts),
+                },
+                &mut sink,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Interrupted(HostSignal::Interrupt)),
+            "a child exit without a guest Exit must report the interrupt, got {error:?}"
+        );
+        assert!(
+            sink.events
+                .contains(&SessionEvent::Stdout(b"during grace\n".to_vec())),
+            "output must keep streaming during grace, got {:?}",
+            sink.events
+        );
+        assert!(trace.borrow().contains(&"sigint"));
+    }
+
+    // Catches letting a second signal sit behind the grace period: once a
+    // signal was forwarded, any later signal must stop waiting and kill.
+    #[test]
+    fn a_second_signal_during_grace_kills_the_run_immediately() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(trace.clone(), payload.clone(), vec![]))
+            .with_signal_grace(Duration::from_secs(60));
+        let interrupts = ScriptedInterrupts::observing([
+            Some(SignalObservation {
+                first: HostSignal::Interrupt,
+                count: 1,
+            }),
+            Some(SignalObservation {
+                first: HostSignal::Interrupt,
+                count: 2,
+            }),
+        ]);
+
+        let started = Instant::now();
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(60),
+                resources: QemuResources::DEFAULT,
+                interrupts: Some(&interrupts),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Interrupted(HostSignal::Interrupt)),
+            "the second signal must interrupt the run, got {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the second signal must not wait out the grace period"
+        );
+        let events = trace.borrow();
+        assert_eq!(events.iter().filter(|event| **event == "sigint").count(), 1);
+        assert_eq!(events.iter().filter(|event| **event == "reap").count(), 1);
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches a signal forward failure being hidden behind the interrupt: the
+    // forwarding failure is the honest primary error while cleanup still runs.
+    #[test]
+    fn a_failed_forward_reports_the_process_error_and_still_cleans_up() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(
+            FakeBackend::events(trace.clone(), payload.clone(), vec![]).signal_fails(),
+        );
+        let interrupts = ScriptedInterrupts::observing([Some(SignalObservation {
+            first: HostSignal::Interrupt,
+            count: 1,
+        })]);
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(60),
+                resources: QemuResources::DEFAULT,
+                interrupts: Some(&interrupts),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Process(ProcessError::Signal(_))),
+            "the forwarding failure must be the primary error, got {error:?}"
+        );
+        assert_eq!(
+            trace
+                .borrow()
+                .iter()
+                .filter(|event| **event == "reap")
+                .count(),
+            1
+        );
+        assert!(!payload.borrow().as_ref().unwrap().exists());
+    }
+
+    // Catches the interrupt swallowing cleanup diagnostics: a failed reap
+    // after a signal must keep the interrupt as primary and still surface
+    // the cleanup failure.
+    #[test]
+    fn an_interrupted_run_still_reports_cleanup_failures() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime =
+            Runtime::new(FakeBackend::events(trace.clone(), payload.clone(), vec![]).reap_fails())
+                .with_signal_grace(Duration::from_millis(60));
+        let interrupts = ScriptedInterrupts::observing([Some(SignalObservation {
+            first: HostSignal::Interrupt,
+            count: 1,
+        })]);
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(60),
+                resources: QemuResources::DEFAULT,
+                interrupts: Some(&interrupts),
+            })
+            .unwrap_err();
+
+        match error {
+            RuntimeError::Cleanup { primary, failures } => {
+                assert!(
+                    matches!(*primary, RuntimeError::Interrupted(HostSignal::Interrupt)),
+                    "the interrupt must stay primary, got {primary:?}"
+                );
+                assert!(matches!(
+                    failures.as_slice(),
+                    [CleanupFailure::Process(ProcessError::Wait(_))]
+                ));
+            }
+            other => panic!("expected interrupt plus cleanup failures, got {other:?}"),
+        }
+    }
+
+    // Catches a pending signal outranking an elapsed deadline: a run that is
+    // already over the deadline must keep the timeout outcome rather than
+    // starting a grace period.
+    #[test]
+    fn a_signal_pending_at_the_deadline_still_times_out() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let runtime = Runtime::new(FakeBackend::events(trace.clone(), payload.clone(), vec![]));
+        let interrupts = ScriptedInterrupts::observing([Some(SignalObservation {
+            first: HostSignal::Interrupt,
+            count: 1,
+        })]);
+
+        let error = runtime
+            .run(RunRequest {
+                bundle: &valid_bundle(),
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::ZERO,
+                resources: QemuResources::DEFAULT,
+                interrupts: Some(&interrupts),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Process(ProcessError::TimedOut)),
+            "the deadline must win over the pending signal, got {error:?}"
+        );
+        assert!(
+            !trace.borrow().contains(&"sigint"),
+            "a run past its deadline must not start forwarding"
+        );
     }
 
     struct RecordingSink {
@@ -734,6 +1259,31 @@ mod tests {
         }
     }
 
+    /// 決められた順序でsignalを報告する`InterruptSource`。scriptを使い
+    /// 切った後は最後の観測を返し続ける (実sourceの累計countと同じ粘着性)。
+    struct ScriptedInterrupts {
+        script: RefCell<VecDeque<Option<SignalObservation>>>,
+        last: Cell<Option<SignalObservation>>,
+    }
+
+    impl ScriptedInterrupts {
+        fn observing(script: impl IntoIterator<Item = Option<SignalObservation>>) -> Self {
+            Self {
+                script: RefCell::new(script.into_iter().collect()),
+                last: Cell::new(None),
+            }
+        }
+    }
+
+    impl InterruptSource for ScriptedInterrupts {
+        fn poll(&self) -> Option<SignalObservation> {
+            if let Some(next) = self.script.borrow_mut().pop_front() {
+                self.last.set(next);
+            }
+            self.last.get()
+        }
+    }
+
     impl OutputSink for RecordingSink {
         fn push(&mut self, event: &SessionEvent) -> io::Result<()> {
             if !self.sleep.is_zero() {
@@ -759,6 +1309,7 @@ mod tests {
         payload: Rc<RefCell<Option<PathBuf>>>,
         result: RefCell<FakeSpawnResult>,
         reap_fails: bool,
+        signal_fails: bool,
     }
 
     impl FakeBackend {
@@ -772,6 +1323,7 @@ mod tests {
                 payload,
                 result: RefCell::new(FakeSpawnResult::Events(events)),
                 reap_fails: false,
+                signal_fails: false,
             }
         }
 
@@ -784,11 +1336,17 @@ mod tests {
                 payload,
                 result: RefCell::new(FakeSpawnResult::Fails),
                 reap_fails: false,
+                signal_fails: false,
             }
         }
 
         fn reap_fails(mut self) -> Self {
             self.reap_fails = true;
+            self
+        }
+
+        fn signal_fails(mut self) -> Self {
+            self.signal_fails = true;
             self
         }
     }
@@ -818,6 +1376,7 @@ mod tests {
                     trace: self.trace.clone(),
                     events: events.into(),
                     reap_fails: self.reap_fails,
+                    signal_fails: self.signal_fails,
                 }),
                 FakeSpawnResult::Fails => Err(ProcessError::Spawn(io::Error::other(
                     "injected spawn failure",
@@ -837,6 +1396,7 @@ mod tests {
         trace: Rc<RefCell<Vec<&'static str>>>,
         events: VecDeque<ProcessEvent>,
         reap_fails: bool,
+        signal_fails: bool,
     }
 
     impl ProcessControl for FakeChild {
@@ -853,6 +1413,19 @@ mod tests {
                 ProcessEvent::TimedOut => "timeout",
             });
             Ok(event)
+        }
+
+        fn send_signal(&mut self, signal: HostSignal) -> Result<(), ProcessError> {
+            self.trace.borrow_mut().push(match signal {
+                HostSignal::Interrupt => "sigint",
+                HostSignal::Terminate => "sigterm",
+            });
+            if self.signal_fails {
+                return Err(ProcessError::Signal(io::Error::other(
+                    "injected signal failure",
+                )));
+            }
+            Ok(())
         }
 
         fn terminate_and_reap(&mut self) -> Result<ProcessStatus, ProcessError> {

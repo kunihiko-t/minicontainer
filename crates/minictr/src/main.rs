@@ -7,7 +7,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -15,8 +15,8 @@ use minicontainer_bundle::{
     ImageSpec, MAX_BUNDLE_LEN, Store, TagRecord, build, format_digest, parse, parse_digest,
 };
 use minicontainer_runtime::{
-    OutputSink, QemuResources, RunOutcome, RunRequest, Runtime, RuntimeError, SessionEvent,
-    SystemProcessBackend,
+    HostSignal, InterruptSource, OutputSink, QemuResources, RunOutcome, RunRequest, Runtime,
+    RuntimeError, SessionEvent, SignalObservation, SystemProcessBackend,
 };
 
 use cli::{
@@ -459,7 +459,36 @@ impl OutputSink for CliSink<'_> {
 /// 実際のhost runtime。
 pub struct RealRunner;
 
-extern "C" fn ignore_sigint(_signal: libc::c_int) {}
+/// 最初に届いたsignal番号。0は未着を表す。
+static RECORDED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+/// 届いたsignalの累計数。
+static RECORDED_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// `RealRunner`がruntimeへ供給するsignalの観測点。
+struct CliInterrupts;
+
+impl InterruptSource for CliInterrupts {
+    fn poll(&self) -> Option<SignalObservation> {
+        observe_signals(&RECORDED_SIGNAL, &RECORDED_COUNT)
+    }
+}
+
+fn observe_signals(first: &AtomicI32, count: &AtomicU32) -> Option<SignalObservation> {
+    let recorded = HostSignal::from_signo(first.load(Ordering::Acquire))?;
+    Some(SignalObservation {
+        first: recorded,
+        count: count.load(Ordering::Acquire),
+    })
+}
+
+extern "C" fn record_signal(signal: libc::c_int) {
+    // handler内ではasync-signal-safeなatomicのstoreのみを行う。最初のsignal
+    // だけが転送対象として意味を持ち、以降は数だけを数える。
+    RECORDED_SIGNAL
+        .compare_exchange(0, signal, Ordering::AcqRel, Ordering::Acquire)
+        .ok();
+    RECORDED_COUNT.fetch_add(1, Ordering::AcqRel);
+}
 
 impl Runner for RealRunner {
     fn run(
@@ -471,17 +500,22 @@ impl Runner for RealRunner {
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<RunOutcome, RuntimeError> {
-        // run中のCtrl-CはQEMUにも届く。host側はsignalだけを無視して生存し、
-        // runtimeの通常経路でQEMUをreapして一時payloadを削除する。捕捉する
-        // handlerはexec後にdefaultへ戻るため、QEMUへ無視設定を継承しない。
-        // SAFETY: 空のsignal handlerをmain threadから設定し、handler内では
-        // signal-safeでない処理を一切行わない。
+        // hostがSIGINT/SIGTERMを捕捉してruntimeへ報告し、runtimeがQEMUの
+        // process groupへ転送する。QEMUは別のgroupにいるため端末のCtrl-Cは
+        // 直接届かず、この経路だけが全signalの入口になる。捕捉するhandlerは
+        // exec後にdefaultへ戻るため、QEMUへ設定を継承しない。
+        // SAFETY: handler内ではsignal-safeでない処理を一切行わない。
         unsafe {
             libc::signal(
                 libc::SIGINT,
-                ignore_sigint as *const () as libc::sighandler_t,
+                record_signal as *const () as libc::sighandler_t,
+            );
+            libc::signal(
+                libc::SIGTERM,
+                record_signal as *const () as libc::sighandler_t,
             );
         }
+        let interrupts = CliInterrupts;
         let runtime = Runtime::new(SystemProcessBackend::new());
         runtime.run_with_sink(
             RunRequest {
@@ -489,6 +523,7 @@ impl Runner for RealRunner {
                 kernel,
                 deadline: timeout,
                 resources,
+                interrupts: Some(&interrupts),
             },
             &mut CliSink::new(stdout, stderr),
         )
@@ -1868,6 +1903,63 @@ mod tests {
 
         assert_eq!(code, RUNTIME_EXIT);
         assert!(String::from_utf8_lossy(&stderr).contains("minictr:"));
+    }
+
+    // Catches mapping an interrupted run to anything but the documented host
+    // failure: SIGINT/SIGTERM abort the run as exit 125 with the signal named
+    // in the diagnostic.
+    #[test]
+    fn maps_an_interrupted_run_to_a_host_error() {
+        let runner = FakeRunner::err(RuntimeError::Interrupted(HostSignal::Terminate));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = execute(
+            b"bundle",
+            Path::new("/kernel"),
+            Duration::from_secs(5),
+            QemuResources::DEFAULT,
+            &runner,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, RUNTIME_EXIT);
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("interrupted by SIGTERM"),
+            "the interrupt diagnostic must name the signal, got {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    // Catches the handler-facing observation dropping or reordering the first
+    // signal: no signal must report nothing, and a recorded SIGINT/SIGTERM
+    // must surface with its cumulative count.
+    #[test]
+    fn signal_observation_reports_first_signal_and_count() {
+        let first = AtomicI32::new(0);
+        let count = AtomicU32::new(0);
+        assert_eq!(observe_signals(&first, &count), None);
+
+        first.store(libc::SIGINT, Ordering::SeqCst);
+        count.store(1, Ordering::SeqCst);
+        assert_eq!(
+            observe_signals(&first, &count),
+            Some(SignalObservation {
+                first: HostSignal::Interrupt,
+                count: 1,
+            })
+        );
+
+        first.store(libc::SIGTERM, Ordering::SeqCst);
+        count.store(3, Ordering::SeqCst);
+        assert_eq!(
+            observe_signals(&first, &count),
+            Some(SignalObservation {
+                first: HostSignal::Terminate,
+                count: 3,
+            })
+        );
     }
 
     // Catches ignoring a broken host stdout pipe and exiting zero.

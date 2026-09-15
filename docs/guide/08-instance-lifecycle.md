@@ -41,6 +41,19 @@ consumerが`Err`を返したらrunは`RuntimeError::Consumer`で中断するが�
 主操作だけ失敗すればそのerror、後始末だけ失敗すればcleanup error、両方失敗すれば主errorにcleanup診断を添えて返す。
 主操作が成功して後始末が失敗した場合も、成功として扱わずcleanup errorを返す。
 
+## host signalとgrace
+
+QEMUは`minictr`とは別のprocess groupのleaderとして起動する。
+端末のCtrl-Cや`minictr`のgroup宛signalはhostだけへ届くため、QEMUへsignalを届ける経路はhost側の転送だけである。
+
+`minictr`はSIGINTとSIGTERMを捕捉し、最初のsignalをQEMUのprocess group全体へ転送してから2秒のgraceを始める。
+grace中もguest出力のdecodeと転送は続き、grace内にQEMUが終了すれば通常の後始末へ進む。
+graceを過ぎてもQEMUが残る場合はgroup全体へSIGKILLを送って回収し、grace中の2回目以降のsignalはgraceを待たずにSIGKILLへ進める。
+
+guestのExit frame受信後に届いたsignalは結果を変えず、確定済みのguest結果を返す。
+Exit前の中断は`RuntimeError::Interrupted`として報告し、転送や強制kill、後始末の失敗は中断errorへcleanup診断を添えて返す。
+`InterruptSource`を渡さないembedderのrunはsignalを観測せず、hostがsignalで死んだ場合はchildをreapできない。
+
 ## 失敗の区別
 
 呼び出し側は次の失敗を区別できる。
@@ -56,6 +69,6 @@ consumerが`Err`を返したらrunは`RuntimeError::Consumer`で中断するが�
 - host失敗: QEMU非0終了、入出力error、cleanup失敗。
 
 `minictr`は0〜255のゲスト終了コードをプロセス終了コードへ写し、範囲外やホスト側の失敗を終了コード125へ写す。
-実行中のCtrl-Cは`minictr`自身がSIGINTを無視するため、QEMUだけが終了してExit欠落のhost失敗になり、通常の後始末を経て125で終わる。
-SIGTERMとSIGKILLは捕捉せず、後始末を保証しないため、子processや一時fileが残る場合がある。
+実行中のSIGINT (Ctrl-Cを含む) とSIGTERMはQEMUのprocess groupへ転送したうえで中断として扱い、通常の後始末を経て125で終わる。
+SIGKILLは捕捉できないため、後始末を保証せず子processや一時fileが残る場合がある。
 詳しいCLIの振る舞いは第9章を参照する。

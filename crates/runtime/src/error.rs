@@ -2,7 +2,7 @@ use std::{error::Error, fmt, io, path::PathBuf};
 
 use minicontainer_bundle::BundleError;
 
-use crate::{ProcessError, SessionError};
+use crate::{HostSignal, ProcessError, SessionError};
 
 /// runの後始末中に追加で起きた失敗。
 #[derive(Debug)]
@@ -48,6 +48,8 @@ pub enum RuntimeError {
     Session(SessionError),
     /// 逐次転送先のconsumerがchunkの受け取りに失敗した。
     Consumer(io::Error),
+    /// hostがSIGINTまたはSIGTERMを受け取り、runを中断した。
+    Interrupted(HostSignal),
     /// 主操作の失敗を維持したまま、後始末でも失敗した。
     Cleanup {
         /// runが最初に失敗した理由。
@@ -80,6 +82,9 @@ impl fmt::Display for RuntimeError {
             Self::Consumer(error) => {
                 write!(formatter, "guest output consumer failed: {error}")
             }
+            Self::Interrupted(signal) => {
+                write!(formatter, "run interrupted by {}", signal.name())
+            }
             Self::Cleanup { primary, failures } => {
                 write!(formatter, "{primary}; cleanup also failed")?;
                 for failure in failures {
@@ -105,6 +110,7 @@ impl Error for RuntimeError {
             Self::InvalidDeadline => None,
             Self::UnsafePayloadPath(_) => None,
             Self::Io(error) | Self::Consumer(error) => Some(error),
+            Self::Interrupted(_) => None,
             Self::Process(error) => Some(error),
             Self::Session(error) => Some(error),
             Self::Cleanup { primary, .. } => Some(primary),

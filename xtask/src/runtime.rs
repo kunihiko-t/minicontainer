@@ -10,8 +10,10 @@
 //! kernelをQEMU `-kernel` で起動し、`SessionError::Protocol` になることを
 //! 検査する (guestはcontrol headerを直接書けないため)。出力上限経路は1 MiB
 //! を超える連打guestをminiOS経由で走らせ、`SessionError::GuestOutputTooLarge`
-//! になることを検査する。割り込み経路は回転中のguestへSIGINTをgroup宛に
-//! 送り、125終了とQEMU・一時領域の非残留を検査する。
+//! になることを検査する。割り込み経路は回転中のguestへSIGINTを`minictr`の
+//! group宛に送り、125終了とQEMU・一時領域の非残留を検査する。SIGTERM経路は
+//! `minictr`のPIDだけへ送り、別groupのQEMUへhost転送が届くことと同じ後始末
+//! を検査する。
 //!
 //! 実kernelのwire契約 (pin `9be99255a59d58d19db25b835af0e28a8d2a4036` の
 //! `run_boot_payload`、`console::enter_control_mode`、`user::run` から確認):
@@ -299,6 +301,16 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         interrupted.qemu_before,
         interrupted.qemu_after,
         interrupted.elapsed.as_secs_f64()
+    ));
+
+    log("e2e: sigterm path (SIGTERM to the minictr pid exits 125 without leftovers)");
+    let terminated = run_sigterm_path(&minictr, &kernel)?;
+    log(&format!(
+        "e2e: sigterm path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
+        terminated.minictr_pid,
+        terminated.qemu_before,
+        terminated.qemu_after,
+        terminated.elapsed.as_secs_f64()
     ));
 
     Ok(transcript)
@@ -950,7 +962,31 @@ fn assert_minictr_running(mut spawned: SpawnedChild) -> Result<SpawnedChild, E2E
     }
 }
 
+/// SIGINTを`minictr`のprocess group宛に送る経路。QEMUは`minictr`と別の
+/// groupにいるためgroup宛signalは`minictr`だけへ届き、QEMUへの到達は
+/// host側の転送が担う。
 fn run_interrupt_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
+    run_signal_path(minictr, kernel, "SIGINT", |pid| {
+        signal_process_group(pid, libc::SIGINT)
+    })
+}
+
+/// SIGTERMを`minictr`のPIDだけへ送る経路。group宛ではないため、QEMUが
+/// 止まるのはhostが転送した場合だけである。
+fn run_sigterm_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError> {
+    run_signal_path(minictr, kernel, "SIGTERM", |pid| {
+        signal_process(pid, libc::SIGTERM)
+    })
+}
+
+/// 回転中のrunへ`send`でsignalを送り、125終了・signalを名指す診断・
+/// QEMUと一時領域の非残留を検査する。
+fn run_signal_path(
+    minictr: &Path,
+    kernel: &Path,
+    signal_name: &'static str,
+    send: impl FnOnce(u32) -> io::Result<()>,
+) -> Result<CaseReport, E2EError> {
     let store = prepare_store(&spin_elf_bytes())?;
     let store_path = store.path.clone();
     let qemu_before = qemu_pids()?;
@@ -967,9 +1003,9 @@ fn run_interrupt_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EEr
         let spawned = wait_for_qemu_boot(spawned, &qemu_before)?;
         thread::sleep(INTERRUPT_SETTLE);
         let spawned = assert_minictr_running(spawned)?;
-        if let Err(error) = signal_process_group(spawned.pid, libc::SIGINT) {
+        if let Err(error) = send(spawned.pid) {
             let failure = E2EError::Command {
-                command: format!("send SIGINT to process group {}", spawned.pid),
+                command: format!("send {signal_name} to minictr {}", spawned.pid),
                 message: error.to_string(),
             };
             terminate_spawned(spawned);
@@ -991,19 +1027,20 @@ fn run_interrupt_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EEr
     };
     if report.status != Some(125) {
         return Err(E2EError::UnexpectedRun {
-            case: "interrupt exit code",
+            case: "signal exit code",
             expected: "exit 125".to_owned(),
             actual: format!(
-                "status {:?} after SIGINT (stderr: {})",
+                "status {:?} after {signal_name} (stderr: {})",
                 report.status,
                 String::from_utf8_lossy(&report.stderr)
             ),
         });
     }
-    if !String::from_utf8_lossy(&report.stderr).contains("without a guest Exit frame") {
+    let expected = format!("run interrupted by {signal_name}");
+    if !String::from_utf8_lossy(&report.stderr).contains(&expected) {
         return Err(E2EError::UnexpectedRun {
-            case: "interrupt diagnostic",
-            expected: "a MissingExit diagnostic on stderr".to_owned(),
+            case: "signal diagnostic",
+            expected: format!("an {signal_name} interrupt diagnostic on stderr"),
             actual: format!("stderr: {}", String::from_utf8_lossy(&report.stderr)),
         });
     }
@@ -1255,6 +1292,18 @@ fn signal_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
     // SAFETY: `kill(2)`の第一引数が負のときはprocess groupを指定する。
     // `pid`はspawn直後の子のPIDで`pid_t`に収まる。
     let result = unsafe { libc::kill(target, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// harnessの子のPIDだけへsignalを送る。group宛では届かない別groupの子孫
+/// (host転送を待つQEMUなど) には届かない。
+fn signal_process(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: `pid`はspawn直後の子のPIDで`pid_t`に収まる。
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
     if result == 0 {
         Ok(())
     } else {

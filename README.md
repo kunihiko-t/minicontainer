@@ -140,7 +140,7 @@ cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/r
 この例の42は意図した終了コードであり、シェルの`set -e`が有効でも結果を確認できる形にしている。
 `minictr`は0〜255のゲスト終了コードをそのまま返し、範囲外はホスト側の失敗として扱う。
 使い方の誤りは終了コード2、ホスト側の失敗（`image build`の失敗、`store`の解決失敗、QEMUの失敗、タイムアウトを含む）は終了コード125になる。
-実行中のCtrl-CはQEMUの終了をホスト側の失敗として回収し、後始末を経て終了コード125で終わる。
+実行中のCtrl-C (SIGINT) とSIGTERMは`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののち必要ならSIGKILLで回収する。中断されたrunは後始末を経て終了コード125で終わる。
 
 ## 現在の機能と制限
 
@@ -192,7 +192,7 @@ redirectは5回まで、接続10秒・要求60秒のtimeout、manifestとconfig�
 MiniBundleの構築と検証、SHA-256ダイジェスト、manifestの制限、content-addressed storeへの取り込み、タグ付け、解決、一覧ができる。
 UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
 QEMUバックエンドは固定した引数で起動し、通常の成功経路とエラー経路で子プロセスの回収と一時領域の削除を試みる。
-後始末の失敗もエラーとして返す。ホストの停止や`SIGKILL`、`SIGTERM`による強制終了では、後始末を実行できない場合がある。
+後始末の失敗もエラーとして返す。ホストの停止や捕捉できない`SIGKILL`による強制終了では、後始末を実行できない場合がある。
 ゲスト出力はdecodeされ次第、標準出力と標準エラー出力へ区別して逐次表示する。stdout、stderr、診断の合計は表示済みも含めて1 MiBが上限であり、超過はホスト側の失敗として扱う。対話入力には対応していない。
 
 OCI互換はMiniBundle用artifactの配布形式（export、import、匿名pull）だけであり、Docker runtime互換とLinuxアプリケーション実行互換ではない。

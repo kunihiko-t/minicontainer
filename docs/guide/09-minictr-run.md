@@ -228,14 +228,17 @@ pipe越しでも進行が見えるよう、chunkごとにflushする。
 二つのストリームは区別して書き出すが、ホスト側の二出力間の到達順序は保証しない。
 run途中の書き込みやフラッシュ失敗はconsumer失敗としてrunを中断し、QEMU回収とpayload削除を経てホスト側の失敗で終わる。
 ランタイムがエラーを返した場合、中断前に書き出した分は残るが、残りの出力は届かない。
+実行中のSIGINT (Ctrl-Cを含む) とSIGTERMは`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののち必要ならgroup全体へSIGKILLで回収する。
+grace中の2回目以降のsignalは即座に強制回収へ進み、guestのExit受信後に届いたsignalは確定済みのguest結果を返す。
 E2Eのhappy pathは同梱ゲストを`image build`、`image inspect`、`run`へ一続きで通し、このflow全体を公開CLIで検証する。
+割り込み経路はgroup宛のSIGINTと`minictr`のPIDだけへのSIGTERMを別々に検査し、どちらも125終了とQEMU・一時領域の非残留を確認する。
 
 ## 終了code
 
 guestの終了codeは0から255の範囲でそのままprocess終了codeになる。
 範囲外の終了codeはhost失敗として扱う。
 使い方の誤りは終了code 2、store解決失敗とruntime失敗は終了code 125である。
-timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、診断は標準エラー出力へ出る。
+timeout、QEMU失敗、guest failure、protocol破損、実行中のSIGINT/SIGTERMによる中断はすべて125に写り、診断は標準エラー出力へ出る。
 `image build`では、ELFの読み取り失敗、上限超過、bundle構築失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
 `image build`のparse失敗とstore pathの既定値解決失敗は使い方の誤りとして終了code 2になる。
 `image import`では、fileの読み取り失敗、上限超過、bundle検証失敗、import失敗、tag失敗が終了code 125になり、成功表示は出さない。
@@ -257,6 +260,7 @@ timeout、QEMU失敗、guest failure、protocol破損はすべて125に写り、
 `invalid UART control frame`を含む行はcontrol protocolの破損である。
 `guest reported an error`を含む行はguest自身の実行失敗である。
 `deadline elapsed`を含む行は全体のtimeoutである。
+`run interrupted by`を含む行はhostが受け取ったSIGINTまたはSIGTERMによる中断であり、signal名を行に示す。
 ゲスト自身も2や125を返せるため、終了コードだけでは使い方の誤りやホスト側の失敗と区別できない。
 `minictr:`という文字列もゲストが出力できるので、接頭辞は調査の手掛かりとして使う。
 プログラムから失敗を厳密に区別する場合は、Rust APIの`Result`とエラー型を使う。
