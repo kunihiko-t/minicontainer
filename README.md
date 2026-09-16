@@ -52,12 +52,12 @@ GUEST="target/guest-hello/riscv64gc-unknown-none-elf/release/guest-hello"
 
 ```sh
 git clone https://github.com/kunihiko-t/minios.git "$MINIOS"
-git -C "$MINIOS" checkout 9be99255a59d58d19db25b835af0e28a8d2a4036
+git -C "$MINIOS" checkout 4865f9be97a6cdcd77c71e36b1ba426b49bd73d7
 cargo build --manifest-path "$MINIOS/Cargo.toml" --target-dir "$MINIOS/target" -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --locked
 ```
 
 ビルド成果物`$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel`が実行カーネルである。
-Guest ABIは`minios-abi-v0.1.1`に固定している。
+Guest ABIは`minios-abi-v0.2.0`に固定している。
 
 次にゲストELFを`image build`で`store`へ登録し、`hello`タグを付ける。
 `$STORE`は絶対パスで指定した保存先であり、`Store::new`が作成する。
@@ -244,7 +244,7 @@ gh attestation verify 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz' 
 設計の全体像は[アーキテクチャ](docs/design/architecture.md)に記載している。
 学習の入口は[ガイド索引](docs/guide/README.md)である。
 ゲストとの境界と制約は[脅威モデル](docs/reference/threat-model.md)で確認できる。
-公開契約の変更ルールは[互換性と移行の方針](docs/reference/compatibility.md)が定める。
+公開契約の変更ルールは[互換性と移行の方針](docs/reference/compatibility.md)が定め、各契約の保証と検証根拠は[公開契約の監査表](docs/reference/public-contract.md)が対応付ける。
 実装済みの節目と次の実装順は[ロードマップ](docs/reference/roadmap.md)に記載している。
 
 ## 制約とセキュリティー

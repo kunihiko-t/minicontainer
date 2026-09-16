@@ -376,6 +376,10 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         echoed.elapsed.as_secs_f64()
     ));
 
+    log("e2e: cli surface pass (QEMUを要しない公開commandを実storeへ実行)");
+    run_cli_surface(&minictr, workspace)?;
+    log("e2e: cli surface passed");
+
     log("e2e: stress section (bounded loops over a shared store)");
     let stress = run_stress(&minictr, &kernel, workspace)?;
     log(&format!("e2e: stress passed ({stress})"));
@@ -761,6 +765,172 @@ fn minictr_inspect_args(store: &Path, image: &str) -> Vec<OsString> {
         store.as_os_str().to_owned(),
         OsString::from(image),
     ]
+}
+
+/// QEMUを要しない公開commandを一時storeへ一回ずつ実行し、文書に記した
+/// command面が実binaryで動くことを確認する。`image pull-oci`だけは実
+/// registryを要するため対象外であり、unit testが担保する。
+fn run_cli_surface(minictr: &Path, workspace: &Path) -> Result<(), E2EError> {
+    let stdout = run_checked(
+        minictr,
+        &[OsString::from("--version")],
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    let version_line = format!("minictr {}\n", env!("CARGO_PKG_VERSION"));
+    check_cli_output("cli surface --version", &stdout, &version_line)?;
+
+    let stdout = run_checked(
+        minictr,
+        &[OsString::from("help")],
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    check_cli_output("cli surface help", &stdout, "usage: minictr run")?;
+    check_cli_output("cli surface help", &stdout, "image pull-oci")?;
+
+    let elf = workspace.join(GUEST_HELLO_ELF);
+    if !elf.is_file() {
+        return Err(E2EError::MissingGuestElf(elf));
+    }
+    let store = TempStore::empty();
+    let digest = run_image_build(minictr, &store.path, &elf)?;
+
+    let stdout = run_checked(
+        minictr,
+        &minictr_image_args(&store.path, "list", &[]),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    check_cli_output("cli surface image list", &stdout, "TAG\tDIGEST")?;
+    check_cli_output(
+        "cli surface image list",
+        &stdout,
+        &format!("{E2E_IMAGE}\tsha256:{digest}"),
+    )?;
+
+    let export_dir = TempDir::create("minictr-e2e-export-")?;
+    let export_file = export_dir.path().join("hello.mcb");
+    let stdout = run_checked(
+        minictr,
+        &minictr_image_args(
+            &store.path,
+            "export",
+            &[
+                OsString::from(E2E_IMAGE),
+                OsString::from("--output"),
+                export_file.as_os_str().to_owned(),
+            ],
+        ),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    check_cli_output(
+        "cli surface image export",
+        &stdout,
+        &format!("{E2E_IMAGE} sha256:{digest}"),
+    )?;
+    if !export_file.is_file() {
+        return Err(E2EError::UnexpectedRun {
+            case: "cli surface image export",
+            expected: format!("exported file {}", export_file.display()),
+            actual: "no exported file".to_owned(),
+        });
+    }
+
+    let second = TempStore::empty();
+    let stdout = run_checked(
+        minictr,
+        &minictr_image_args(
+            &second.path,
+            "import",
+            &[OsString::from("copy"), export_file.as_os_str().to_owned()],
+        ),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    check_cli_output(
+        "cli surface image import",
+        &stdout,
+        &format!("copy sha256:{digest}"),
+    )?;
+
+    let stdout = run_checked(
+        minictr,
+        &minictr_image_args(&second.path, "remove", &[OsString::from("copy")]),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    check_cli_output("cli surface image remove", &stdout, "copy removed")?;
+
+    let stdout = run_checked(
+        minictr,
+        &minictr_image_args(&second.path, "list", &[]),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    if String::from_utf8_lossy(&stdout).contains("copy") {
+        return Err(E2EError::UnexpectedRun {
+            case: "cli surface image list after remove",
+            expected: "no `copy` row".to_owned(),
+            actual: format!("output {:?}", String::from_utf8_lossy(&stdout)),
+        });
+    }
+
+    // removeしたblobはorphanになり、`--force`なしのpruneは候補の表示だけを
+    // 行う。`--force`で実削除し、いずれも成功を確認する。
+    let stdout = run_checked(
+        minictr,
+        &minictr_image_args(&second.path, "prune", &[]),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    check_cli_output(
+        "cli surface image prune",
+        &stdout,
+        &format!("sha256:{digest}"),
+    )?;
+    run_checked(
+        minictr,
+        &minictr_image_args(&second.path, "prune", &[OsString::from("--force")]),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    Ok(())
+}
+
+/// `minictr image <verb> [--store store] <extra...>`の引数列を作る。
+fn minictr_image_args(store: &Path, verb: &str, extra: &[OsString]) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("image"),
+        OsString::from(verb),
+        OsString::from("--store"),
+        store.as_os_str().to_owned(),
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// 公開commandのstdoutが期待片を含むことを確認する。
+fn check_cli_output(case: &'static str, stdout: &[u8], expected: &str) -> Result<(), E2EError> {
+    let text = String::from_utf8_lossy(stdout);
+    if !text.contains(expected) {
+        return Err(E2EError::UnexpectedRun {
+            case,
+            expected: format!("output containing {expected:?}"),
+            actual: format!("output {text:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// `image build`の成功行から小文字16進64桁のdigestを抜き出す。
@@ -2652,6 +2822,60 @@ fn build_elf_at(entry: u64, code: &[u32]) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    // Catches documentation that still names a stale miniOS kernel
+    // revision. `MINIOS_KERNEL_REV` is the only source of truth; a
+    // revision bump must update every doc that spells the revision out.
+    #[test]
+    fn docs_name_the_pinned_kernel_revision() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut stale = Vec::new();
+        for relative in crate::docs::markdown_files(&root).expect("markdown scan must work") {
+            // release notesは当時のpinを記す履歴、hidden dir配下の作業記録は
+            // 公開文書ではないため、いずれも現行pinの対象外とする。
+            let hidden = relative
+                .components()
+                .any(|component| component.as_os_str().to_string_lossy().starts_with('.'));
+            let notes = relative
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("-release-notes.md"));
+            if hidden || notes {
+                continue;
+            }
+            let contents = std::fs::read_to_string(root.join(&relative))
+                .expect("tracked markdown must be readable");
+            for (line, text) in contents.lines().enumerate() {
+                if !text.to_ascii_lowercase().contains("minios") {
+                    continue;
+                }
+                for token in text.split(|c: char| !c.is_ascii_hexdigit() || c.is_ascii_uppercase())
+                {
+                    if token.len() == 40 && token != MINIOS_KERNEL_REV {
+                        stale.push(format!("{}:{}: {token}", relative.display(), line + 1));
+                    }
+                }
+                let mut rest = text;
+                while let Some(offset) = rest.find("minios-abi-v") {
+                    rest = &rest[offset..];
+                    let end = rest
+                        .find(|c: char| {
+                            !(c.is_ascii_digit() || c == '.' || c.is_ascii_lowercase() || c == '-')
+                        })
+                        .unwrap_or(rest.len());
+                    let tag = &rest[..end];
+                    if tag != MINIOS_ABI_TAG {
+                        stale.push(format!("{}:{}: {tag}", relative.display(), line + 1));
+                    }
+                    rest = &rest[end..];
+                }
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "stale miniOS revisions in docs (expected {MINIOS_KERNEL_REV}):\n{}",
+            stale.join("\n")
+        );
+    }
 
     fn elf_header(bytes: &[u8]) -> (u16, u16, u32, u64, u16) {
         let kind = u16::from_le_bytes(bytes[16..18].try_into().unwrap());

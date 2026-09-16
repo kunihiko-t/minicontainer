@@ -95,6 +95,7 @@ SIGTERM経路では`minictr`のPIDだけへsignalを送り、125終了と同じ�
 crash経路では`minictr`をSIGKILLしてcleanupを回避させ、孤児QEMUを殺したあと`ps`がそのinstanceをstaleと表示することを確認する。
 detached経路では`run --detach`が`i-<pid>`だけを出力し、`stop`がQEMUとpayloadとstate fileを回収することを確認する。
 stdin echo経路では、pipeしたbinary入力がguest-echoからそのまま戻り、EOF後に終了code 42になることを確認する。
+cli surface passでは、QEMUを要しない公開commandを一時storeへ一回ずつ実行する。`--version`と`help`の出力、`image list`の列、`image export`から`image import`への往復、`image remove`後の一覧と`image prune`の候補表示と実削除を確認する。`image pull-oci`だけは実registryを要するため対象外であり、unit testが担保する。
 プロセス残存検査には`ps`が必要であり、実行制限のあるサンドボックスでは権限エラーになることがある。
 通常は`target/e2e/minios`へ固定リビジョンを取得するため、初回はネットワーク接続も必要になる。
 既存の取得済みソースを使う場合は、`MINICTR_E2E_MINIOS_DIR`に固定リビジョンと一致する、未変更のチェックアウトを指定する。
