@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-const REQUIRED_PUBLICATION_FILES: [&str; 9] = [
+const REQUIRED_PUBLICATION_FILES: [&str; 10] = [
     "LICENSE-MIT",
     "LICENSE-APACHE",
     "SECURITY.md",
@@ -13,6 +13,7 @@ const REQUIRED_PUBLICATION_FILES: [&str; 9] = [
     "docs/design/architecture.md",
     "docs/guide/README.md",
     "docs/reference/compatibility.md",
+    "docs/reference/public-contract.md",
     "docs/reference/threat-model.md",
 ];
 
@@ -1748,6 +1749,7 @@ mod tests {
                 "docs/design/architecture.md",
                 "docs/guide/README.md",
                 "docs/reference/compatibility.md",
+                "docs/reference/public-contract.md",
                 "docs/reference/threat-model.md",
             ] {
                 repo.write(
@@ -1924,6 +1926,7 @@ mod tests {
             "docs/design/architecture.md",
             "docs/guide/README.md",
             "docs/reference/compatibility.md",
+            "docs/reference/public-contract.md",
             "docs/reference/threat-model.md",
         ] {
             let repo = TestRepo::public_fixture();

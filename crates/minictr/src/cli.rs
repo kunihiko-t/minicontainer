@@ -2263,6 +2263,141 @@ mod tests {
         );
     }
 
+    // Catches drift between the public commands in `help()` and the commands
+    // named in the tracked Markdown documentation.
+    #[test]
+    fn documented_commands_match_the_public_help_surface() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let expected = public_command_paths();
+        let documented = documented_command_paths(&root);
+        for path in &expected {
+            assert!(
+                documented.contains(path),
+                "command `{path}` is not documented"
+            );
+        }
+        for path in &documented {
+            assert!(
+                expected.contains(path),
+                "docs name unknown command `{path}`"
+            );
+        }
+    }
+
+    /// `help()`のusage行から公開commandのpathを抽出する。`help`と
+    /// `--version`はusage行に出ないので明示的に加える。
+    fn public_command_paths() -> std::collections::BTreeSet<String> {
+        let mut paths = std::collections::BTreeSet::from(["help".to_owned(), "version".to_owned()]);
+        for line in help().lines() {
+            let Some(usage) = line.strip_prefix("usage: minictr ") else {
+                continue;
+            };
+            let verbs: Vec<&str> = usage
+                .split_whitespace()
+                .take_while(|token| is_verb_token(token))
+                .collect();
+            assert!(!verbs.is_empty(), "usage line has no verb: {line}");
+            paths.insert(verbs.join(" "));
+        }
+        paths
+    }
+
+    /// tracked Markdown中の`minictr`呼び出しからcommandのpathを抽出する。
+    /// flagと`--`を読み飛ばした後の最初の裸tokenが既知のtop verbならcommand
+    /// 記述とみなす。`minictr not found`のような診断文はtop verbが一致
+    /// しないのでproseとして捨てる。
+    fn documented_command_paths(root: &std::path::Path) -> std::collections::BTreeSet<String> {
+        const TOP_VERBS: [&str; 6] = ["run", "doctor", "ps", "stop", "image", "help"];
+        let mut paths = std::collections::BTreeSet::new();
+        for file in markdown_files(root) {
+            let Ok(contents) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for line in contents.lines() {
+                for (offset, _) in line.match_indices("minictr") {
+                    let tokens: Vec<&str> = line[offset + "minictr".len()..]
+                        .split_whitespace()
+                        .collect();
+                    let mut index = 0;
+                    while index < tokens.len() && tokens[index].starts_with('-') {
+                        match tokens[index] {
+                            "--help" => {
+                                paths.insert("help".to_owned());
+                            }
+                            "--version" => {
+                                paths.insert("version".to_owned());
+                            }
+                            _ => {}
+                        }
+                        index += 1;
+                    }
+                    if index >= tokens.len() {
+                        continue;
+                    }
+                    let first = verb_prefix(tokens[index]);
+                    if first.is_empty() {
+                        continue;
+                    }
+                    if first == "image" {
+                        let subverb = tokens
+                            .get(index + 1)
+                            .map(|token| verb_prefix(token))
+                            .filter(|token| !token.is_empty())
+                            .unwrap_or("image");
+                        paths.insert(format!("image {subverb}"));
+                    } else if TOP_VERBS.contains(&first) {
+                        paths.insert(first.to_owned());
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    /// tokenの先頭にあるverb部分。backtickや句読点が末尾に付いたtokenを
+    /// そのままverbへ写す。
+    fn verb_prefix(token: &str) -> &str {
+        let end = token
+            .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+            .unwrap_or(token.len());
+        &token[..end]
+    }
+
+    /// command位置に来る小文字verbか。`[--flag]`や`IMAGE`のような
+    /// positional placeholderはverbではない。
+    fn is_verb_token(token: &str) -> bool {
+        !token.is_empty()
+            && token
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+
+    /// repo root配下のtracked Markdown file。hidden dirとbuild产物は除く。
+    fn markdown_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        const SKIP_DIRS: [&str; 4] = [".git", ".worktrees", "target", "node_modules"];
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if path.is_dir() {
+                    if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref()) {
+                        pending.push(path);
+                    }
+                } else if name.ends_with(".md") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
     // Catches rejecting a bare `doctor`: both paths resolve later from
     // options, environment, or HOME.
     #[test]

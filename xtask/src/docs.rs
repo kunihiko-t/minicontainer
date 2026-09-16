@@ -224,7 +224,7 @@ fn has_uri_scheme(destination: &str) -> bool {
         })
 }
 
-fn markdown_files(root: &Path) -> Result<Vec<PathBuf>, DocsError> {
+pub(crate) fn markdown_files(root: &Path) -> Result<Vec<PathBuf>, DocsError> {
     let mut files = Vec::new();
     collect_markdown_files(root, root, &mut files)?;
     files.sort();
@@ -253,7 +253,7 @@ fn collect_markdown_files(
         if file_type.is_dir() {
             if matches!(
                 path.file_name().and_then(|name| name.to_str()),
-                Some(".git" | "target")
+                Some(".git" | ".worktrees" | "target")
             ) {
                 continue;
             }

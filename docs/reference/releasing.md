@@ -6,21 +6,13 @@ notarizationは行わない。
 
 ## tag前の検証
 
-tagを打つ前に、`main`の先端で次が成功していることを確認する。
+tagを打つ前に、`main`の先端で次のchecklistが全て成功していることを確認する。
 
-```sh
-cargo xtask setup
-cargo xtask check-host
-cargo xtask check
-```
-
-Ubuntu CIの`check`とmacOS CIの`check-host`も同じcommitで成功させる。
-Ubuntu CIは配布archiveのsmokeも実行するため、その成功も確認する。
-`check`のE2E末尾には反復・中断・強制終了後のcleanupを反復検証するstress節が含まれるため、resource漏れの退行もこの確認で担保する。
-tag、Cargo package version、archive名のversionは一致させる。
-
-releaseに含まれる契約変更は、release notesでbreakingと互換に分類して記載する。
-分類の基準は[互換性と移行の方針](compatibility.md)に従い、Ubuntu CIの互換性fixture検証が同じcommitで成功していることを確認する。
+1. localで`cargo xtask setup`、`cargo xtask check-host`、`cargo xtask check`が成功する。`check`の18段階には、tracked file全体へのlocal pathとsecretの走査、固定seedのbounded fuzz smoke、全crateのtest、lockfileを使ったbuild、実QEMU E2Eが含まれる。E2Eはcli surface passと、反復・中断・強制終了後のcleanupを検証するstress節を含む。
+2. Ubuntu CIの`check`とmacOS CIの`check-host`が同じcommitで成功する。Ubuntu CIは配布archiveのsmoke、OCI interop、互換性fixtureの検証も実行するため、その成功も確認する。
+3. tag、Cargo package version、archive名のversionが一致する。
+4. [公開契約の監査表](public-contract.md)の記述が現行実装と一致し、契約を変える変更が検証根拠と表の更新を同じPRへ含んでいることを確認する。
+5. release notesが、含まれる契約変更をbreakingと互換に分類して記載する。分類の基準は[互換性と移行の方針](compatibility.md)に従う。
 
 ## 配布内容
 
@@ -44,7 +36,7 @@ minicontainer-<version>-<target>/
 ```
 
 `minictr`はrelease buildであり、実行bitを付けて格納する。
-`kernel/minios.bin`は固定revision `9be99255a59d58d19db25b835af0e28a8d2a4036` のminiOSを`--release --locked --target riscv64gc-unknown-none-elf`でbuildしたものである。
+`kernel/minios.bin`は固定revision `4865f9be97a6cdcd77c71e36b1ba426b49bd73d7` のminiOSを`--release --locked --target riscv64gc-unknown-none-elf`でbuildしたものである。
 配布kernelは[脅威モデル](threat-model.md)の信頼する計算基盤と同じ前提で扱う。
 `MANIFEST.txt`はarchive version、target、各fileのmodeとSHA-256を記録する。
 `SHA256SUMS`は`sha256sum -c`形式でpayloadと`MANIFEST.txt`を検査できる。

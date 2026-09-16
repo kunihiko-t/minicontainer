@@ -22,7 +22,7 @@ Ubuntu 24.04のCIはsetupと同じcheck、Apple SiliconのmacOS CIはQEMUを除�
 開発上の節目「M1」は、このゲスト実行機能を指す。AppleのM1チップ限定という意味ではない。
 
 依存先のminiOSでは、Sv39、実行前ELF loader、U-mode実行、`write`、`exit`、終了後のresource回収の節目が完了した。
-実行kernelは固定revision (`9be99255a59d58d19db25b835af0e28a8d2a4036`) からbuildする。
+実行kernelは固定revision (`4865f9be97a6cdcd77c71e36b1ba426b49bd73d7`) からbuildする。
 この到達点はMiniContainerがpage tableやELF loaderを実装したことを意味しない。
 MiniContainerは検証済みbundleをboot payload予約領域へ渡し、QEMU子process、UART標準入出力、終了status、timeout、cleanupを一つのruntime lifecycleへ接続し、`minictr run`から呼び出す。
 一つのcontainerにつき一つのQEMU仮想machineでRISC-V 64 applicationを実行できる。
@@ -111,7 +111,7 @@ v1.0.0では、学習用マイクロVMランタイムとして利用者が更新
 
 v1.0.0はDocker互換や本番向けマルチテナント分離の宣言ではない。
 安定化する対象は、文書で公開したMiniBundle、Guest ABI、CLI、終了code、cleanupの契約である。
-変更時の解釈基準は[互換性と移行の方針](compatibility.md)が定める。
+変更時の解釈基準は[互換性と移行の方針](compatibility.md)が定め、各契約の保証と検証根拠の対応は[公開契約の監査表](public-contract.md)が固定する。
 
 ## マイルストーン間の依存関係
 
