@@ -12,12 +12,12 @@ Rustは1.98.0 stableの完全一致を要求し、`riscv64gc-unknown-none-elf` t
 QEMUは8.2.0以上を要求し、Gitはversionの読み取りを確認する。
 不足があれば、導入手順つきの診断を出して失敗する。
 
-## checkは17段階を順に実行する
+## checkは18段階を順に実行する
 
-`cargo xtask check`は17段階の検査を番号順に実行し、最初の失敗で停止する。
-`cargo xtask check-host`は実QEMUの最終段階を除く16段階を同じ順序で実行する。
+`cargo xtask check`は18段階の検査を番号順に実行し、最初の失敗で停止する。
+`cargo xtask check-host`は実QEMUの最終段階を除く17段階を同じ順序で実行する。
 依存関係を解決するすべてのCargo phaseは`--locked`で実行する。
-各段階は`[n/17]`または`[n/16]`の開始行と経過秒つきの成否行を出し、最後に全体の要約を出す。
+各段階は`[n/18]`または`[n/17]`の開始行と経過秒つきの成否行を出し、最後に全体の要約を出す。
 
 | 段階 | 検査 |
 | --- | --- |
@@ -26,10 +26,11 @@ QEMUは8.2.0以上を要求し、Gitはversionの読み取りを確認する。
 | 3 | 必須文書、禁止内容、ワークフロー、コミットのメールアドレスの検査 |
 | 4〜8 | bundle、protocol、runtime、minictr、xtaskの順にClippyを実行 |
 | 9〜13 | 同じcrate順に単体テストを実行 |
-| 14 | 同梱ゲスト例 (guest-hello) のrelease build |
-| 15 | stdin echoのゲスト例 (guest-echo) のrelease build |
-| 16 | `cargo build --workspace --locked`によるビルド |
-| 17 | 実QEMUによるエンドツーエンド検証 |
+| 14 | 固定seedによるbounded fuzz smoke (bundle 500、uart 2000入力) |
+| 15 | 同梱ゲスト例 (guest-hello) のrelease build |
+| 16 | stdin echoのゲスト例 (guest-echo) のrelease build |
+| 17 | `cargo build --workspace --locked`によるビルド |
+| 18 | 実QEMUによるエンドツーエンド検証 |
 
 Clippyには`--all-targets --locked -- -D warnings`、単体テストには`--locked`を指定する。
 

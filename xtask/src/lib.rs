@@ -31,6 +31,7 @@ enum Phase {
     RuntimeTests,
     MinictrTests,
     XtaskTests,
+    FuzzSmoke,
     GuestExampleBuild,
     GuestEchoBuild,
     LockedBuild,
@@ -41,7 +42,7 @@ impl Phase {
     fn cargo_args(self) -> Option<&'static [&'static str]> {
         match self {
             Self::Format => Some(&["fmt", "--all", "--", "--check"]),
-            Self::DocsLinks | Self::PublicationFiles => None,
+            Self::DocsLinks | Self::PublicationFiles | Self::FuzzSmoke => None,
             Self::ClippyBundle => Some(&[
                 "clippy",
                 "-p",
@@ -133,6 +134,7 @@ impl Phase {
             || match self {
                 Self::DocsLinks => "check local Markdown links".to_owned(),
                 Self::PublicationFiles => "check publication policy".to_owned(),
+                Self::FuzzSmoke => "run bounded fuzz smoke".to_owned(),
                 Self::EndToEnd => "run real QEMU end-to-end verification".to_owned(),
                 _ => unreachable!("Cargo phases returned above"),
             },
@@ -161,6 +163,7 @@ fn check_phases() -> Vec<Phase> {
         Phase::RuntimeTests,
         Phase::MinictrTests,
         Phase::XtaskTests,
+        Phase::FuzzSmoke,
         Phase::GuestExampleBuild,
         Phase::GuestEchoBuild,
         Phase::LockedBuild,
@@ -378,6 +381,7 @@ fn execute_phase(workspace: &Path, phase: Phase) -> Result<String, XtaskError> {
     match phase {
         Phase::DocsLinks => docs::check_local_links(workspace)?,
         Phase::PublicationFiles => publication::check(workspace)?,
+        Phase::FuzzSmoke => return fuzz::smoke(workspace).map_err(XtaskError::Fuzz),
         Phase::EndToEnd => return runtime::run_e2e(workspace).map_err(XtaskError::Runtime),
         _ => unreachable!("Cargo phases returned above"),
     }
@@ -475,13 +479,14 @@ mod tests {
                 Phase::RuntimeTests,
                 Phase::MinictrTests,
                 Phase::XtaskTests,
+                Phase::FuzzSmoke,
                 Phase::GuestExampleBuild,
                 Phase::GuestEchoBuild,
                 Phase::LockedBuild,
                 Phase::EndToEnd,
             ]
         );
-        assert_eq!(check_phases().len(), 17);
+        assert_eq!(check_phases().len(), 18);
     }
 
     #[test]
@@ -492,7 +497,7 @@ mod tests {
             .collect();
 
         assert_eq!(check_host_phases(), expected);
-        assert_eq!(check_host_phases().len(), 16);
+        assert_eq!(check_host_phases().len(), 17);
         assert!(check_host_phases().contains(&Phase::GuestExampleBuild));
         assert!(check_host_phases().contains(&Phase::GuestEchoBuild));
         assert!(!check_host_phases().contains(&Phase::EndToEnd));

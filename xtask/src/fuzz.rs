@@ -104,6 +104,13 @@ pub enum InputOutcome {
     },
 }
 
+/// gate内smokeのbundle入力数。
+pub const SMOKE_BUNDLE_ITERS: u64 = 500;
+/// gate内smokeのuart入力数。decoderはbundle parseより高速なため多めに取る。
+pub const SMOKE_UART_ITERS: u64 = 2_000;
+/// gate内smokeの全体制限時間(秒)。対象ごとに適用する。
+pub const SMOKE_TIME_LIMIT: Duration = Duration::from_secs(60);
+
 /// findingのないfuzz実行の報告。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuzzReport {
@@ -227,6 +234,31 @@ pub fn run(config: &FuzzConfig) -> Result<FuzzReport, FuzzError> {
         seed: config.seed,
         iters_run,
     })
+}
+
+/// gateの一phaseとして両targetへ固定seedの変異smokeを実行する。
+/// 入力数と時間を抑えて決定性を保つため、毎回同じseedとcorpusで実行する。
+pub fn smoke(workspace: &Path) -> Result<String, FuzzError> {
+    let mut parts = Vec::new();
+    for (target, iters) in [
+        (FuzzTarget::Bundle, SMOKE_BUNDLE_ITERS),
+        (FuzzTarget::Uart, SMOKE_UART_ITERS),
+    ] {
+        let report = run(&FuzzConfig {
+            target,
+            seed: DEFAULT_SEED,
+            iters,
+            max_bytes: DEFAULT_MAX_BYTES,
+            input_timeout: DEFAULT_INPUT_TIMEOUT,
+            time_limit: Some(SMOKE_TIME_LIMIT),
+            alloc_cap: DEFAULT_ALLOC_CAP,
+            corpus_dir: workspace.join("xtask/corpus"),
+            output_dir: workspace.join("target/fuzz"),
+            replay_input: None,
+        })?;
+        parts.push(format!("{}: {} inputs", target.name(), report.iters_run));
+    }
+    Ok(parts.join(", "))
 }
 
 /// 一つのfileを変異なしで再生する。replayは入力を切り詰めない。
@@ -1191,6 +1223,16 @@ mod tests {
             }
             other => panic!("1-byte cap must produce a finding, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn smoke_runs_both_targets_against_the_checked_in_corpus() {
+        let summary = smoke(&crate::workspace_root()).expect("gate smoke must pass");
+
+        assert_eq!(
+            summary,
+            format!("bundle: {SMOKE_BUNDLE_ITERS} inputs, uart: {SMOKE_UART_ITERS} inputs")
+        );
     }
 
     #[test]

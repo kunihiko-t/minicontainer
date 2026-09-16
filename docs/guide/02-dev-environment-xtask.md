@@ -21,8 +21,8 @@ Rustは1.98.0 stableの完全一致を要求する。
 ## checkで検証する
 
 次に`cargo xtask check`を実行する。
-書式、文書link、公開条件、crateごとのClippyと単体試験、同梱ゲストのbuild、workspace build、実QEMU end-to-end検証を16段階で順に実行し、最初の失敗で停止する。
-QEMUを使わない確認には、最終段階を除く15段階の`cargo xtask check-host`を使う。
+書式、文書link、公開条件、crateごとのClippyと単体試験、固定seedのbounded fuzz smoke、同梱ゲストのbuild、workspace build、実QEMU end-to-end検証を18段階で順に実行し、最初の失敗で停止する。
+QEMUを使わない確認には、最終段階を除く17段階の`cargo xtask check-host`を使う。
 依存解決を伴うphaseはすべて`--locked`で実行する。
 
 CIはUbuntu 24.04で`setup`と`check`、Apple SiliconのmacOSで`check-host`を実行する。
