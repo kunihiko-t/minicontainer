@@ -16,6 +16,7 @@ cargo xtask check
 
 Ubuntu CIの`check`とmacOS CIの`check-host`も同じcommitで成功させる。
 Ubuntu CIは配布archiveのsmokeも実行するため、その成功も確認する。
+`check`のE2E末尾には反復・中断・強制終了後のcleanupを反復検証するstress節が含まれるため、resource漏れの退行もこの確認で担保する。
 tag、Cargo package version、archive名のversionは一致させる。
 
 releaseに含まれる契約変更は、release notesでbreakingと互換に分類して記載する。

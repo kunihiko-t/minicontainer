@@ -85,14 +85,33 @@ Pull Requestの統合条件は[コントリビュート](../../CONTRIBUTING.md)�
 
 ## E2Eは最終段階である
 
-第16段階は、pin留めしたminiOS revisionからguest kernelをbuildし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了code 42を確認する。
+第18段階は、pin留めしたminiOS revisionからguest kernelをbuildし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了code 42を確認する。
 resources経路では`--memory 256 --cpus 2`の非既定値でも同じ出力と終了codeになり、QEMUと一時領域の残留がないことを確認する。
 timeout経路、malformed-frame経路、出力上限経路では、非0終了に加えてQEMUと一時領域の残留がないことを確認する。
 timeout経路とmalformed-frame経路では失敗時にguest出力を転送しない。
 出力上限経路では拒否までに1 MiB以内の出力が逐次転送されるため、125終了と診断の一致に加えて転送量が1 MiB以内であることを確認する。
 割り込み経路では、回転中のguestへprocess group宛のSIGINTを送り、`minictr`が125で終わりQEMUと一時領域の残留がないことを確認する。
-SIGTERMとSIGKILLは捕捉せず、子processと一時fileの後始末も保証しないため、この割り込み経路の検証対象外である。
+SIGTERM経路では`minictr`のPIDだけへsignalを送り、125終了と同じ非残留を確認する。
+crash経路では`minictr`をSIGKILLしてcleanupを回避させ、孤児QEMUを殺したあと`ps`がそのinstanceをstaleと表示することを確認する。
+detached経路では`run --detach`が`i-<pid>`だけを出力し、`stop`がQEMUとpayloadとstate fileを回収することを確認する。
+stdin echo経路では、pipeしたbinary入力がguest-echoからそのまま戻り、EOF後に終了code 42になることを確認する。
 プロセス残存検査には`ps`が必要であり、実行制限のあるサンドボックスでは権限エラーになることがある。
 通常は`target/e2e/minios`へ固定リビジョンを取得するため、初回はネットワーク接続も必要になる。
 既存の取得済みソースを使う場合は、`MINICTR_E2E_MINIOS_DIR`に固定リビジョンと一致する、未変更のチェックアウトを指定する。
 失敗の分類は[第10章](10-failure-diagnostics.md)を参照する。
+
+## E2E末尾のstress節
+
+単発経路のあと、一つの共有storeに対して反復と中断のscenarioをbounded回だけ実行する。
+`hello`と`spin`の二つのtagを同じstoreへ登録し、全scenarioが同じ`run/` state directoryを使う。
+反復数は次のとおりであり、全体で数十秒に収まる。
+
+- foreground: 5回。`run hello`が終了code 42を返す。
+- timeout: 5回。`run spin`が800 msの期限で125を返す。
+- SIGINTとSIGTERM: 各3回。回転中のrunへsignalを送り、125とsignal名の診断を確認する。
+- detach: 3回。`run --detach`のidを`stop`で回収する。
+- crash: 2回。`minictr`をSIGKILLし、孤児QEMUを殺したあと`stop`がstale instanceを回収する。
+
+各iterationのあとでQEMU processと`minicontainer-run-*` payload directoryの残留を検査する。
+失敗は`stress <scenario> iteration <n> failed: <原因>`の形で、scenario名・iteration番号・残留対象つきで報告する。
+節の終わりに、共有storeの`run/`にinstance state fileが残っていないこと、`ps`がinstance行を出さないこと、QEMUとpayloadの差分が開始時snapshotからゼロであることを確認する。

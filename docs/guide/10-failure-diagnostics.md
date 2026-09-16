@@ -135,3 +135,11 @@ Exit後の成功markerもここに集まる。
 QEMU processの標準エラー出力は読み捨てにする。
 ホスト標準エラー出力には、実行成功時のゲスト標準エラー出力と、CLIが生成する失敗診断が届く。
 ランタイムの失敗時には`RunOutcome`が返らないため、途中まで蓄積したゲスト出力と診断は表示されない。
+
+## stress節の失敗
+
+E2E末尾のstress節は、反復実行で累積するresource漏れを検出する。
+失敗は`stress <scenario> iteration <n> failed: <原因>`の形で報告され、原因には残留したQEMUのPID、payload directory、instance state fileが含まれる。
+iteration番号は0始まりであり、複数iteration目で失敗した場合は、それまでの実行で枯渇したresource (file descriptor、一時directory) が原因の候補になる。
+節の最終検査で失敗した場合はiteration行が出ず、共有storeの`run/`に残ったstate fileや`ps`のinstance行が直接の原因になる。
+scenarioとiterationの内訳は[第11章](11-test-harness-gate.md#e2e末尾のstress節)を参照する。
