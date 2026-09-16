@@ -11,6 +11,7 @@ permissions:
 jobs:
   build-archives:
     permissions:
+      contents: read
       attestations: write
       id-token: write
     strategy:
