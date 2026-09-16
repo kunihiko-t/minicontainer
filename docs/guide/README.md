@@ -39,4 +39,5 @@
 安全性の前提と保証しない範囲は[脅威モデル](../reference/threat-model.md)を参照する。
 配布物の構築と確認は[配布手順](../reference/releasing.md)を参照する。
 各公開契約の保証と検証根拠の対応は[公開契約の監査表](../reference/public-contract.md)を参照する。
+v1.0.0の変更と契約の固定は[v1.0.0 release notes](../reference/v1.0.0-release-notes.md)を参照する。
 v0.1.0の機能と制約の一覧は[v0.1.0 release notes](../reference/v0.1.0-release-notes.md)を参照する。

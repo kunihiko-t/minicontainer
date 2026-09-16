@@ -2702,7 +2702,7 @@ mod tests {
         );
 
         assert_eq!(code, 0);
-        assert_eq!(stdout, b"minictr 0.1.0\n");
+        assert_eq!(stdout, b"minictr 1.0.0\n");
         assert!(stderr.is_empty());
     }
 

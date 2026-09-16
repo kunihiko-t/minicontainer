@@ -77,7 +77,8 @@ handshake中のSIGINTとSIGTERMはforegroundと同じくQEMUのprocess groupへ�
 
 detached QEMUにsupervisorは居ない。
 stdin経路も無いため、`read`で待つguestは`stop`されるまで止まったままである。
-guestがExit frameを書いて終了しても誰も読まず、QEMUは動き続け、`ps`は`stop`するまでliveを出し続ける。
+guestがExit frameを書いて終了しても誰も読まないため、終了codeはhostへ届かない。
+guestの終了でkernelはQEMUを停止させるため、終了後の`ps`は`stale`を出し、`stop`はstate fileだけを回収する。動き続けるguestは`live`のままであり、`stop`がQEMUの終了まで行う。
 `uart.log`と`qemu.log`には合計量の上限がなく、長時間放置すればdiskを消費する。
 回収は`minictr stop`の役目であり、identity照合つきのSIGTERM、grace、SIGKILL、payloadとstate fileの削除までを行う。
 detached runでもforeground runでも、`stop`は同じ規則で動く。

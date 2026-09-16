@@ -2,7 +2,15 @@
 
 MiniContainerは、miniOSをゲストカーネルとして使い、一つのRISC-V 64アプリケーションを一つのQEMU仮想マシンで実行する学習用マイクロVMランタイムである。
 仕組みを追える実装を軸に、信頼できる静的RISC-V 64ゲストをローカルで動かす個人開発、デモ、OS教材、ランタイム実験に使う。
-DockerやOCI、Linuxコンテナとの互換性はない。
+
+`minictr` binary一つで、静的ELFをMiniBundleとして登録し、QEMU上のminiOSで実行し、終了コードと標準入出力をホストへ透過する。
+imageはcontent-addressed storeに置き、ファイルとOCI Image Layoutの両方で持ち出しと取り込みができる。
+v1.0.0で公開契約（MiniBundle format、Guest ABI、CLI構文と終了コード、instance state、OCI対応）を固定した。
+変更は[v1.0.0 release notes](docs/reference/v1.0.0-release-notes.md)に、保証と検証根拠の対応は[公開契約の監査表](docs/reference/public-contract.md)に記載している。
+
+DockerやOCI runtime、Linuxコンテナとの互換性はない。
+OCI対応はMiniBundle用artifactの配布形式に限る。
+MiniContainerは本番用のセキュリティー境界ではありません。
 
 ## 対応環境
 
@@ -11,44 +19,64 @@ DockerやOCI、Linuxコンテナとの互換性はない。
 Windowsは対象外である。
 
 必要なツールはRust 1.98.0、`riscv64gc-unknown-none-elf`ターゲット、QEMU 8.2.0以上、Gitである。
-`xtask setup`自体はツールの導入や更新を行わず、環境を診断する。
-初回は起動元のCargoやrustupによる依存取得やツールチェーンの導入が発生することがある。
+`cargo xtask setup`はツールの導入や更新を行わず、環境を診断する。
+ツールの導入手順は[開発環境](docs/guide/02-dev-environment-xtask.md)を参照する。
+
+## 配布物から始める
+
+`v*`タグごとに、macOS arm64用とLinux x86_64用のarchiveをGitHub Releaseへ添付している。
+archiveは`minictr`、固定revisionのminiOS kernel（`kernel/minios.bin`）、ライセンス、`MANIFEST.txt`、`SHA256SUMS`を含む。
+導入前にchecksumとbuild provenanceを確認する。
+
+```sh
+sha256sum -c 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256'
+gh attestation verify 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz' --owner kunihiko-t
+tar xzf 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz'
+cd 'minicontainer-<version>-x86_64-unknown-linux-gnu'
+./minictr --version
+```
+
+展開後は`./minictr run --kernel kernel/minios.bin IMAGE`の形で実行する。
+archiveにはゲスト例のsourceを含まないため、実行するELFは利用者が用意するか、次節の手順でこのリポジトリのゲスト例をビルドする。
+checksumはファイルの完全性だけを示し、生成元の証明にはならない。
+出所まで確認する場合は`gh attestation verify`を必ず通す。
+詳細は[配布手順](docs/reference/releasing.md)を参照する。
 
 ## クイックスタート
 
-RustとGit、QEMUを用意し、このリポジトリを取得する。
-ツールの導入と診断は[開発環境](docs/guide/02-dev-environment-xtask.md)を参照する。
-
-```sh
-git clone https://github.com/kunihiko-t/minicontainer.git
-cd minicontainer
-```
-
-同梱の最小ゲスト例をビルドし、`image build`で登録して`minictr run`で実行する。
+sourceからビルドし、同梱の最小ゲスト例を登録して実行する。
 以下は同じシェルで、MiniContainerのリポジトリ直下から順に実行する。
 作業用のminiOSとストアは一時ディレクトリーに作成するため、長期保存には別の保存先を指定する。
 
 ```sh
+git clone https://github.com/kunihiko-t/minicontainer.git
+cd minicontainer
 MINIOS="$(mktemp -d)/minios"
 STORE="$(mktemp -d)/store"
+KERNEL="$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel"
 ```
 
-まず開発用バイナリーをビルドする。
+### ホスト側と同梱ゲストのビルド
+
+`cargo xtask setup`で環境を診断し、`minictr`をビルドする。
 
 ```sh
 cargo xtask setup
 cargo build -p minictr --locked
 ```
 
-次に同梱ゲスト例を静的RISC-V 64 ELFへビルドする。
+同梱ゲスト例`guest-hello`を静的RISC-V 64 ELFへビルドする。
+`guest-hello`は標準出力へ`hello from guest`、標準エラー出力へ`guest stderr`と書いて42で終わる。
 
 ```sh
 cargo build --manifest-path examples/guest-hello/Cargo.toml --target riscv64gc-unknown-none-elf --release --locked --config 'target.riscv64gc-unknown-none-elf.rustflags=["-C", "link-arg=-Tlinker.ld"]' --config 'build.target-dir="target/guest-hello"'
 GUEST="target/guest-hello/riscv64gc-unknown-none-elf/release/guest-hello"
 ```
 
+### ゲストカーネルのビルド
+
 ゲストカーネルはminiOSの固定リビジョンからビルドする。
-`$MINIOS`はminiOSのチェックアウト先であり、この時点では存在しないパスである。
+Guest ABIは`minios-abi-v0.2.0`に固定している。
 
 ```sh
 git clone https://github.com/kunihiko-t/minios.git "$MINIOS"
@@ -56,14 +84,13 @@ git -C "$MINIOS" checkout 4865f9be97a6cdcd77c71e36b1ba426b49bd73d7
 cargo build --manifest-path "$MINIOS/Cargo.toml" --target-dir "$MINIOS/target" -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --locked
 ```
 
-ビルド成果物`$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel`が実行カーネルである。
-Guest ABIは`minios-abi-v0.2.0`に固定している。
+ビルド成果物が`$KERNEL`である。
 
-次にゲストELFを`image build`で`store`へ登録し、`hello`タグを付ける。
-`$STORE`は絶対パスで指定した保存先であり、`Store::new`が作成する。
-6 MiBはbundle全体の上限であり、ELF単体で超える入力は本体を読む前に拒否する。
-実際に収まる最大のELFはheader・manifest・padding分だけ小さい。
-ELFの中身はhostでは検証せずguestのloaderが検証する。
+### imageの登録と確認
+
+ゲストELFを`image build`でstoreへ登録し、`hello`タグを付ける。
+bundle全体の上限は6 MiBであり、ELF単体で超える入力は本体を読む前に拒否する。
+ELFの中身はホストでは検証せず、ゲストのloaderが検証する。
 
 ```sh
 cargo run -p minictr --locked -- image build --store "$STORE" hello "$GUEST"
@@ -75,10 +102,11 @@ cargo run -p minictr --locked -- image build --store "$STORE" hello "$GUEST"
 hello sha256:<64桁の小文字16進数>
 ```
 
-登録内容は`image inspect`で確認する。
+登録内容は`image inspect`で、環境は`doctor`で確認する。
 
 ```sh
 cargo run -p minictr --locked -- image inspect --store "$STORE" hello
+cargo run -p minictr --locked -- doctor --store "$STORE" --kernel "$KERNEL"
 ```
 
 ```text
@@ -87,69 +115,91 @@ name: hello
 digest: sha256:<buildと同じ64桁の小文字16進数>
 args: 0
 elf-bytes: <ゲストELFのbyte数>
-```
-
-実行前に`doctor`で環境を確認する。`run`と同じ`--store`と`--kernel`を渡す。
-
-```sh
-cargo run -p minictr --locked -- doctor --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel"
-```
-
-```text
 qemu: ok qemu-system-riscv64 <8.2.0以上>
 kernel: ok <kernelのpath> (<byte数> bytes)
 store: ok <storeのpath>
 summary: passed 3/3 checks
 ```
 
-全検査の成功で終了コード0、一つでも失敗したら`fail`行をすべて出して終了コード1になる。
-診断は環境を変更しない。失敗行の`fix:`に従って直してから実行する。
+`doctor`は全検査の成功で終了コード0、一つでも失敗したら`fail`行をすべて出して終了コード1になる。
+診断は環境を変更しないため、`fail`行の`fix:`に従って直してから再実行できる。
 
-登録したimageは`image export`でファイルへ取り出す。タグの代わりに`sha256:`付きdigestでも指定できる。
+### 実行
 
-```sh
-cargo run -p minictr --locked -- image export --store "$STORE" hello --output ./hello.mcb
-```
-
-`hello sha256:<64桁>`と表示され、`./hello.mcb`にbundleバイト列がそのまま書き出される。
-出力先にファイルがある場合は上書きせず失敗する。
-
-最後に`minictr run`で実行する。
+`minictr run`で実行する。
+ゲストの標準出力と標準エラー出力はそれぞれ`minictr`の標準出力と標準エラー出力へ届き、ゲストの終了コードがそのまま返る。
 
 ```sh
 exit_code=0
-cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" hello || exit_code=$?
+cargo run -p minictr --locked -- run --store "$STORE" --kernel "$KERNEL" hello || exit_code=$?
 echo "exit=$exit_code"
 ```
-
-期待する結果は、ゲストの標準出力がそのまま表示され、`exit=`にゲストの終了コードが入ることである。
-同梱ゲストは標準出力へ`hello from guest`、標準エラー出力へ`guest stderr`と書いて42で終わる。
 
 ```text
 hello from guest
 exit=42
 ```
 
-guest resourceを変える場合は`--memory`と`--cpus`を付ける。どちらも省略時は128 MiBと1 vCPUのままである。
+この例の42は意図した終了コードであり、シェルの`set -e`が有効でも結果を確認できる形にしている。
+Cargoのビルド状況も標準エラー出力に表示される。
+
+guest resourceを変える場合は`--memory`と`--cpus`を付ける。
+省略時は128 MiBと1 vCPUである。
 
 ```sh
-cargo run -p minictr --locked -- run --store "$STORE" --kernel "$MINIOS/target/riscv64gc-unknown-none-elf/debug/minios-kernel" --memory 256 --cpus 2 hello
+cargo run -p minictr --locked -- run --store "$STORE" --kernel "$KERNEL" --memory 256 --cpus 2 hello
 ```
 
-ゲストの標準エラー出力は`minictr`の標準エラー出力に届く。Cargoのビルド状況も標準エラー出力に表示される。
-この例の42は意図した終了コードであり、シェルの`set -e`が有効でも結果を確認できる形にしている。
+### 標準入力の転送
 
-標準入力が端末でなければ、その内容はguestのstdinへ転送される。
-`examples/guest-echo`は入力をechoして42で終わるguestであり、`printf 'ping' | minictr run echo`で往復を確認できる。
-端末からの起動や`--detach`では入力経路がなく、端末起動ではguestの`read`は直ちに0を返す。
-`minictr`は0〜255のゲスト終了コードをそのまま返し、範囲外はホスト側の失敗として扱う。
-使い方の誤りは終了コード2、ホスト側の失敗（`image build`の失敗、`store`の解決失敗、QEMUの失敗、タイムアウトを含む）は終了コード125になる。
-実行中のCtrl-C (SIGINT) とSIGTERMは`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののち必要ならSIGKILLで回収する。中断されたrunは後始末を経て終了コード125で終わる。
+標準入力が端末でなければ、その内容はゲストのstdinへ転送される。
+同梱の`guest-echo`は入力をそのまま書き戻し、EOFの後に42で終わる。
 
-## 現在の機能と制限
+```sh
+cargo build --manifest-path examples/guest-echo/Cargo.toml --target riscv64gc-unknown-none-elf --release --locked --config 'target.riscv64gc-unknown-none-elf.rustflags=["-C", "link-arg=-Tlinker.ld"]' --config 'build.target-dir="target/guest-echo"'
+cargo run -p minictr --locked -- image build --store "$STORE" echo target/guest-echo/riscv64gc-unknown-none-elf/release/guest-echo
+printf 'ping' | cargo run -p minictr --locked -- run --store "$STORE" --kernel "$KERNEL" echo
+```
+
+端末からの起動ではゲストの`read`は直ちに0を返し、`--detach`では入力経路がない。
+
+### detached実行と回収
+
+`run --detach`はゲストの起動を確認してinstance idだけを出して終わり、QEMUをsupervisorなしで残す。
+`ps`で一覧し、`stop`で回収する。
+
+```sh
+id="$(cargo run -p minictr --locked -- run --detach --store "$STORE" --kernel "$KERNEL" hello)"
+cargo run -p minictr --locked -- ps --store "$STORE"
+cargo run -p minictr --locked -- stop --store "$STORE" "$id"
+```
+
+```text
+INSTANCE	PID	IMAGE	STATE	AGE
+i-<pid>	<pid>	hello	stale	<経過時間>
+i-<pid>
+```
+
+detached実行にはsupervisorが居ないため、ゲストが書いたExit frameは誰も読まず、終了コードはホストへ届かない。
+`guest-hello`のようにすぐ終わるゲストではQEMUも終了しているため`ps`は`stale`を出し、`stop`はstate fileだけを回収する。
+ゲストが動き続けている間は`live`を出し、`stop`がQEMUの終了まで行う。
+ゲスト出力はpayload directoryの`uart.log`へ落ち、`stop`がそのdirectoryごと回収する。
+
+### imageの持ち出しと取り込み
+
+登録したimageは`image export`でファイルへ、`image export-oci`でOCI Image Layoutへ書き出す。
+どちらもbundleのバイト列をそのまま保持し、`image import`と`image import-oci`で同じdigestのまま戻せる。
+
+```sh
+cargo run -p minictr --locked -- image export --store "$STORE" hello --output ./hello.mcb
+cargo run -p minictr --locked -- image export-oci --store "$STORE" hello --output ./hello-oci
+cargo run -p minictr --locked -- image import --store "$STORE" hello-copy ./hello.mcb
+```
+
+## コマンドと終了コード
 
 `minictr`が実装するコマンドは`run`、`ps`、`stop`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
-構文と解決、登録と確認の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
+構文と解決の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
 usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
@@ -169,44 +219,60 @@ usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
-`--version`は`minictr 0.1.0`を標準出力へ出して0で終わる。
+`--version`は`minictr 1.0.0`を標準出力へ出して0で終わる。
+`--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
+`--timeout-ms`の既定値は5000である。
 
-`image build`は静的RISC-V 64 ELFからMiniBundleを構築し、指定したタグでローカルストアへ登録する。
-成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
+scriptが依存してよいのは終了コードと標準出力の契約行だけであり、標準エラー出力の診断文言は契約に含めない。
+
+| 終了コード | 意味 |
+| --- | --- |
+| 0から255 | ゲストの終了コードをそのまま返す |
+| 2 | 使い方の誤り（未知のコマンド、引数不足、不正な値） |
+| 125 | ホスト側の失敗。`image build`の失敗、storeの解決失敗、QEMUの失敗、タイムアウト、SIGINTとSIGTERMによる中断を含む |
+| 1 | `doctor`の診断失敗だけに使う |
+
+### imageの操作
+
+`image build`は静的RISC-V 64 ELFからMiniBundleを構築し、指定したタグでstoreへ登録する。
 `image import`は配布されたMiniBundleファイルを検証してから同じ形で登録し、manifestの名前は書き換えない。
 `image export`はタグまたは`sha256:`付きdigestで解決したbundleを検証して`--output`へ書き出す。出力先の上書きはしない。
 `image list`はタグの一覧、`image inspect`は`tag`、`name`、`digest`、`args`、`elf-bytes`の5行を出す。
-`ps`はrunが記録したinstanceを`live`、`stale`、`corrupt`の状態つきで一覧する。形式は[instance state](docs/reference/instance-state.md)を参照する。
-`run --detach`はguestの`Ready`を確認してinstance idだけを出して終わり、QEMUをsupervisorなしで残す。guest出力はpayload directoryの`uart.log`へ落ち、guestの終了は誰も観測しないため`ps`は`stop`まで`live`を出し続ける。
-`stop`はpid identityを照合してからQEMUのprocess groupへSIGTERMを送り、2秒のgrace (既定値、`--timeout-ms`で変更) の後も残ればSIGKILLし、payload directoryとstate fileを回収してinstance idを標準出力へ出す。
-`doctor`はQEMUのversion、kernel file、store rootを診断し、各検査の`ok`または`fail`と`summary`の4行を標準出力へ出す。全検査の成功で終了コード0、一つでも失敗したら終了コード1になり、診断自体は環境を変更しない。
-`image remove`は指定タグだけを削除して`IMAGE removed`と出し、blobと他のタグは保持する。存在しないタグは型付きエラーで失敗する。
+`image remove`は指定タグだけを削除して`IMAGE removed`と出し、blobと他のタグは保持する。
 `image prune`は未参照blobの検出だけが既定動作であり、`--force`の指定時だけ削除する。削除前に参照を再確認し、部分失敗は個別に報告する。
 
 `image export-oci`はstoreのimageをOCI Image Layoutのdirectoryへ書き出し、`image import-oci`はlayoutを検証してstoreへ登録する。
 `image pull-oci`はregistryからdigest pinで匿名pullし、指定したタグで登録する。
-成功すると`IMAGE sha256:<digest>`の一行だけを標準出力へ出す。
+pullはHTTPSだけを使い、認証はしない。
+参照はtagではなくdigest pinだけを受け入れ、redirectは5回まで、接続10秒と要求60秒のtimeout、manifestとconfigは64 KiB、layerは6 MiBの上限で取得する。
 
 ```sh
 cargo run -p minictr --locked -- image pull-oci --store "$STORE" hello registry.example.com:5000/demo/hello@sha256:<64桁の小文字16進数>
 ```
 
-pullはHTTPSだけを使い、認証はしない。参照はtagではなくdigest pinだけを受け入れる。
-redirectは5回まで、接続10秒・要求60秒のtimeout、manifestとconfigは64 KiB・layerは6 MiBの上限で取得する。
-詳細は[第12章](docs/guide/12-oci-image-spec.md)を参照する。
+詳細は[第12章](docs/guide/12-oci-image-spec.md)と[MiniBundleとOCIの対応](docs/reference/minibundle-oci-mapping.md)を参照する。
 
-`--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
-`--timeout-ms`の既定値は5000である。
+### 実行と後始末
 
-MiniBundleの構築と検証、SHA-256ダイジェスト、manifestの制限、content-addressed storeへの取り込み、タグ付け、解決、一覧ができる。
-UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
-QEMUバックエンドは固定した引数で起動し、通常の成功経路とエラー経路で子プロセスの回収と一時領域の削除を試みる。
-後始末の失敗もエラーとして返す。ホストの停止や捕捉できない`SIGKILL`による強制終了では、後始末を実行できない場合がある。
-ゲスト出力はdecodeされ次第、標準出力と標準エラー出力へ区別して逐次表示する。stdout、stderr、診断の合計は表示済みも含めて1 MiBが上限であり、超過はホスト側の失敗として扱う。対話入力には対応していない。
+`run`はゲスト出力をdecodeされ次第、標準出力と標準エラー出力へ区別して逐次表示する。
+stdout、stderr、診断の合計は表示済みも含めて1 MiBが上限であり、超過はホスト側の失敗として扱う。
+実行中のCtrl-C（SIGINT）とSIGTERMは`minictr`が捕捉してQEMUのprocess groupへ転送し、2秒のgraceののち必要ならSIGKILLで回収する。
+中断されたrunは後始末を経て終了コード125で終わる。
+ホストの停止や捕捉できない`SIGKILL`による強制終了では、後始末を実行できない場合がある。
 
-OCI互換はMiniBundle用artifactの配布形式（export、import、匿名pull）だけであり、Docker runtime互換とLinuxアプリケーション実行互換ではない。
-ネットワークはregistry pullのHTTPS clientだけであり、ゲストへの提供、永続ボリューム、マルチテナント分離は現在の機能ではない。
-詳細は[脅威モデル](docs/reference/threat-model.md)で確認できる。
+`ps`はrunが記録したinstanceを`live`、`stale`、`corrupt`の状態つきで一覧する。
+`stop`はpid identityを照合してからQEMUのprocess groupへSIGTERMを送り、2秒のgrace（`--timeout-ms`で変更）の後も残ればSIGKILLし、payload directoryとstate fileを回収する。
+形式は[instance state](docs/reference/instance-state.md)を参照する。
+
+## 保証しない範囲
+
+- Docker API互換、Linuxアプリケーション互換、OCI runtime互換。OCI対応はMiniBundle用artifactの配布形式（export、import、匿名pull）に限る。
+- ゲストへのネットワーク、永続ボリューム、複数image実行。ネットワークはregistry pullのHTTPS clientだけである。
+- 未信頼コードを扱うマルチテナント分離とguest escapeの防止。
+- `minicontainer-*` crateのRust API。利用者が依存してよい公開面は`minictr` binaryだけである。
+- Windowsでの動作。
+
+安全境界の前提は[脅威モデル](docs/reference/threat-model.md)、非保証の全体は[互換性と移行の方針](docs/reference/compatibility.md)を参照する。
 
 ## 検証
 
@@ -220,38 +286,26 @@ cargo xtask check
 
 `check`はrustfmt、Markdownリンク、公開対象ファイル、crateごとのClippyと単体テスト、固定seedのbounded fuzz smoke、同梱ゲストのビルド、lockfileを使ったworkspaceのビルド、実QEMU end-to-end検証を18段階で実行する。
 `check-host`は実QEMU検証を除く17段階を実行する。
-CIはUbuntu 24.04で`setup`と`check`、Apple SiliconのmacOSで`check-host`を実行する。
-E2Eは固定リビジョンのminiOSカーネルをビルドし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了コード42、QEMUの回収、一時ディレクトリーの後始末を確認する。
-タイムアウト、不正フレーム、出力上限、割り込みの失敗経路では、非0終了と残留物がないことも確認する。
-parserのfuzzは`cargo xtask fuzz --target <bundle|uart>`で実行し、findingは決定性のreplayで再現する。詳細は[セキュリティテスト](docs/reference/security-testing.md)を参照する。
+CIはUbuntu 24.04で`setup`と`check`に加えて配布archiveのsmoke、OCI interop、互換性fixtureを検証し、Apple SiliconのmacOSで`check-host`を実行する。
 
-## 配布物
+E2Eは固定リビジョンのminiOSカーネルをビルドし、同梱ゲストを公開CLIへ一続きで通して、標準出力、標準エラー出力、終了コード、QEMUの回収、一時ディレクトリーの後始末を確認する。
+タイムアウト、不正フレーム、出力上限、SIGINT、SIGTERM、強制終了、detached、stdinの各経路に加えて、公開コマンドのsurface passと反復と中断のcleanup stress節を含む。
+parserのfuzzは`cargo xtask fuzz --target <bundle|uart>`で実行し、findingは決定性のreplayで再現する。
+詳細は[第11章](docs/guide/11-test-harness-gate.md)と[セキュリティテスト](docs/reference/security-testing.md)を参照する。
 
-`v*`タグのpushで、`minicontainer-<version>-aarch64-apple-darwin.tar.gz`と`minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz`を`cargo xtask dist`で構築し、tagのGitHub Releaseへ添付する。
-archiveは`minictr`、固定revisionのminiOS kernel、ライセンス、`MANIFEST.txt`、`SHA256SUMS`を含む。
-展開後は`minictr run --kernel kernel/minios.bin`の形で実行する。
-詳細は[配布手順](docs/reference/releasing.md)を参照する。
+## 文書
 
-導入前に、checksumとbuild provenanceを確認する。
-
-```sh
-sha256sum -c 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256'
-gh attestation verify 'minicontainer-<version>-x86_64-unknown-linux-gnu.tar.gz' --owner kunihiko-t
-```
-
-## 教材
-
-設計の全体像は[アーキテクチャ](docs/design/architecture.md)に記載している。
-学習の入口は[ガイド索引](docs/guide/README.md)である。
-ゲストとの境界と制約は[脅威モデル](docs/reference/threat-model.md)で確認できる。
-公開契約の変更ルールは[互換性と移行の方針](docs/reference/compatibility.md)が定め、各契約の保証と検証根拠は[公開契約の監査表](docs/reference/public-contract.md)が対応付ける。
-実装済みの節目と次の実装順は[ロードマップ](docs/reference/roadmap.md)に記載している。
-
-## 制約とセキュリティー
-
-MiniContainerは本番用のセキュリティー境界ではありません。
-未信頼コードを扱うマルチテナント環境には使用しない。
-脆弱性の報告方法は[Security Policy](SECURITY.md)を参照する。
+| 目的 | 文書 |
+| --- | --- |
+| 段階的に学ぶ | [ガイド索引](docs/guide/README.md)（全12章） |
+| 設計の全体像 | [アーキテクチャ](docs/design/architecture.md) |
+| 公開契約と検証根拠 | [公開契約の監査表](docs/reference/public-contract.md) |
+| 変更時の解釈基準 | [互換性と移行の方針](docs/reference/compatibility.md) |
+| 安全境界 | [脅威モデル](docs/reference/threat-model.md)、[Security Policy](SECURITY.md) |
+| 配布と導入 | [配布手順](docs/reference/releasing.md) |
+| 版ごとの変更 | [v1.0.0 release notes](docs/reference/v1.0.0-release-notes.md)、[v0.1.0 release notes](docs/reference/v0.1.0-release-notes.md) |
+| 到達した節目 | [ロードマップ](docs/reference/roadmap.md) |
+| 開発への参加 | [CONTRIBUTING](CONTRIBUTING.md) |
 
 ## ライセンス
 
