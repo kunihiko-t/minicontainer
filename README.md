@@ -218,8 +218,8 @@ cargo xtask check-host
 cargo xtask check
 ```
 
-`check`はrustfmt、Markdownリンク、公開対象ファイル、crateごとのClippyと単体テスト、同梱ゲストのビルド、lockfileを使ったworkspaceのビルド、実QEMU end-to-end検証を16段階で実行する。
-`check-host`は実QEMU検証を除く15段階を実行する。
+`check`はrustfmt、Markdownリンク、公開対象ファイル、crateごとのClippyと単体テスト、固定seedのbounded fuzz smoke、同梱ゲストのビルド、lockfileを使ったworkspaceのビルド、実QEMU end-to-end検証を18段階で実行する。
+`check-host`は実QEMU検証を除く17段階を実行する。
 CIはUbuntu 24.04で`setup`と`check`、Apple SiliconのmacOSで`check-host`を実行する。
 E2Eは固定リビジョンのminiOSカーネルをビルドし、同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了コード42、QEMUの回収、一時ディレクトリーの後始末を確認する。
 タイムアウト、不正フレーム、出力上限、割り込みの失敗経路では、非0終了と残留物がないことも確認する。

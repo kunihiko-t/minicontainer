@@ -14,8 +14,8 @@ system call番号と呼び出し規約もGuest ABIに定義済みであり、run
 MiniBundleはcanonicalなbundleを構築してparseし、digestとmanifestを検証してcontent-addressed storeへimport、tag、resolveできる。
 同梱の最小ゲスト例はsourceから静的RISC-V 64 ELFへbuildでき、E2Eのhappy pathとquick startの入力になる。
 UART control frame decoderは分割入力を復元し、不正なheaderと64 KiBを超えるpayloadを拒否する。
-`cargo xtask setup`は開発環境を変更せずに診断し、`cargo xtask check`は16段階の検査を実行する。
-Ubuntu 24.04のCIはsetupと同じcheck、Apple SiliconのmacOS CIはQEMUを除く15段階のcheck-hostを実行する。
+`cargo xtask setup`は開発環境を変更せずに診断し、`cargo xtask check`は18段階の検査を実行する。
+Ubuntu 24.04のCIはsetupと同じcheck、Apple SiliconのmacOS CIはQEMUを除く17段階のcheck-hostを実行する。
 
 ### QEMU上でのゲスト実行
 

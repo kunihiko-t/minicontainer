@@ -30,6 +30,9 @@ cargo xtask fuzz --target uart --input 'target/fuzz/uart-000000000000001b-1234.b
 
 `--input`は変異なしで一つのfileをそのまま再生する。
 CIではchecked-in corpusの決定性replayをxtask単体テスト段階で実行する。
+`cargo xtask check`と`check-host`はその後のphaseとして、固定seed・上限付きの
+変異smoke (bundle 500入力、uart 2000入力、各60秒上限) を実行する。
+corpusが同じならsmokeも決定的であり、CIでは毎回同じ入力列を試す。
 
 ## 制限
 
@@ -58,7 +61,13 @@ replayはfileを切り詰めず、そのまま実行する。
   (切詰め、不正magic、不正length、空入力)を両方置く。
 - 追加前に内容を確認してから`git add`する。
   公開条件の検査は非UTF-8のfileを読み飛ばすが、目視確認は省略しない。
-- 互換対象のcorpusは、互換方針の確定後に追加する。
+- 後方互換を保証する旧version入力はcorpusへ残す。
+  `xtask/corpus/bundle/abi-v1.0.bin`はABI v1.0のMiniBundleで、
+  [互換性ポリシー](compatibility.md)が定める受理範囲を固定する。
+  `tests/fixtures/compat/`のfixtureと同じbyte列である。
+- protocolの新版で追加されたframe kindは、受理形と拒否形の両方をseedへ置く。
+  uart corpusはABI v1.1の`Stdin` (`stdin-*.bin`) とv1.2の`ProcExit`
+  (`proc-exit*.bin`) を含む。
 
 ## 対象外
 
