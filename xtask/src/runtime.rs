@@ -81,6 +81,14 @@ const INTERRUPT_BOOT_TIMEOUT: Duration = Duration::from_secs(20);
 const INTERRUPT_SETTLE: Duration = Duration::from_secs(2);
 /// SIGINT後の`minictr`終了を待つ上限。
 const INTERRUPT_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// stress節の反復回数。全scenario合計21回、E2E全体に数十秒を足す量に抑える。
+const STRESS_RUN_ITERS: usize = 5;
+const STRESS_TIMEOUT_ITERS: usize = 5;
+const STRESS_SIGNAL_ITERS: usize = 3;
+const STRESS_DETACH_ITERS: usize = 3;
+const STRESS_CRASH_ITERS: usize = 2;
+/// stress節で回転するguestのimage tag。`hello`は正常終了するguestへ使う。
+const E2E_SPIN_IMAGE: &str = "spin";
 
 /// 実QEMU E2Eが失敗した理由。
 #[derive(Debug)]
@@ -114,6 +122,15 @@ pub enum E2EError {
     PayloadLeftover(Vec<PathBuf>),
     /// run後にQEMU processが残留した。
     QemuLeftover(Vec<u32>),
+    /// stress節の一iterationが失敗した。scenarioとiteration番号を残す。
+    StressIteration {
+        /// 失敗したscenario名。
+        scenario: &'static str,
+        /// 失敗したiteration番号(0始まり)。
+        iteration: usize,
+        /// 内側の失敗。
+        source: Box<E2EError>,
+    },
     /// 一時storeの準備または後始末が失敗した。
     Store(String),
     /// 制限時間内に操作が終わらなかった。
@@ -198,6 +215,14 @@ impl fmt::Display for E2EError {
                 }
                 Ok(())
             }
+            Self::StressIteration {
+                scenario,
+                iteration,
+                source,
+            } => write!(
+                formatter,
+                "stress {scenario} iteration {iteration} failed: {source}"
+            ),
             Self::Store(message) => write!(formatter, "E2E store failure: {message}"),
             Self::TimedOut { command } => {
                 write!(formatter, "{command} did not finish within the E2E limit")
@@ -211,6 +236,7 @@ impl std::error::Error for E2EError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Tool(error) => Some(error),
+            Self::StressIteration { source, .. } => Some(source.as_ref()),
             Self::Output(error) => Some(error),
             _ => None,
         }
@@ -349,6 +375,10 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         echoed.qemu_after,
         echoed.elapsed.as_secs_f64()
     ));
+
+    log("e2e: stress section (bounded loops over a shared store)");
+    let stress = run_stress(&minictr, &kernel, workspace)?;
+    log(&format!("e2e: stress passed ({stress})"));
 
     Ok(transcript)
 }
@@ -558,8 +588,13 @@ fn prepare_store(elf: &[u8]) -> Result<TempStore, E2EError> {
 
 /// 決定的なhello MiniBundle bytesを作る。
 fn hello_bundle_bytes(elf: &[u8]) -> Result<Vec<u8>, E2EError> {
+    bundle_bytes(E2E_IMAGE, elf)
+}
+
+/// manifest名`name`の決定的なMiniBundle bytesを作る。
+fn bundle_bytes(name: &str, elf: &[u8]) -> Result<Vec<u8>, E2EError> {
     minicontainer_bundle::build(minicontainer_bundle::ImageSpec {
-        name: E2E_IMAGE,
+        name,
         args: &[],
         elf,
     })
@@ -1121,7 +1156,7 @@ fn run_orphan_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError
         };
         // run中のinstanceはliveとして見えなければならない。登録はQEMU起動
         // 直後に行われるため、boot観測からの僅かな遅れを許す。
-        if let Err(error) = wait_for_ps_row(minictr, &store_path, qemu_pid, "live") {
+        if let Err(error) = wait_for_ps_row(minictr, &store_path, E2E_IMAGE, qemu_pid, "live") {
             // 行が出なかった理由をrun側の状態から絞る。minictrが既に終わって
             // いれば登録失敗、走っていれば表示かidentity照合の問題である。
             let _ = signal_process_group(spawned.pid, libc::SIGKILL);
@@ -1168,7 +1203,7 @@ fn run_orphan_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EError
         let stderr = join_reader(spawned.stderr_reader, &spawned.command_line);
         // 孤児になったQEMUを殺し、pid死亡をpsのstale表示へ繋ぐ。
         let _ = signal_process(qemu_pid, libc::SIGKILL);
-        wait_for_ps_row(minictr, &store_path, qemu_pid, "stale")?;
+        wait_for_ps_row(minictr, &store_path, E2E_IMAGE, qemu_pid, "stale")?;
         Ok(CompletedProcess {
             pid: spawned.pid,
             status,
@@ -1244,7 +1279,7 @@ fn run_detached_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EErr
             });
         };
         qemu_pid = Some(pid);
-        wait_for_ps_row(minictr, &store_path, pid, "live")?;
+        wait_for_ps_row(minictr, &store_path, E2E_IMAGE, pid, "live")?;
         // `stop`はidをechoして0で終わる。QEMUはorphanとしてlaunchdに
         // reapされるため、stop内の消失待ちは実経路どおりに動く。
         let stop_args = [
@@ -1420,17 +1455,459 @@ fn run_case_stdin(
     })
 }
 
+/// stress節の開始時に取るhost snapshot。各iteration後と節の終わりに、
+/// QEMUとpayload directoryの差分が無いことを確認する。
+struct StressBaseline {
+    qemu: Vec<u32>,
+    payload: Vec<PathBuf>,
+}
+
+fn stress_baseline() -> Result<StressBaseline, E2EError> {
+    Ok(StressBaseline {
+        qemu: qemu_pids()?,
+        payload: payload_temp_leftovers(),
+    })
+}
+
+/// snapshot以降に増えたQEMUとpayload directoryを両方報告する。
+/// QEMUの掃除に失敗してもpayload側の残留も見るため、失敗はまとめて拾う。
+fn check_stress_leftovers(baseline: &StressBaseline) -> Result<(), E2EError> {
+    let mut failure: Option<E2EError> = None;
+    let mut check = |result: Result<(), E2EError>| {
+        if failure.is_none() {
+            failure = result.err();
+        }
+    };
+    match qemu_pids() {
+        Ok(pids) => check(check_no_new_qemu(&baseline.qemu, &pids)),
+        Err(error) => check(Err(error)),
+    }
+    check(check_no_leftovers(&baseline.payload));
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// scenario名とiteration番号つきで失敗を包み、成功時は値をそのまま返す。
+fn stress_iter<T>(
+    scenario: &'static str,
+    iteration: usize,
+    result: Result<T, E2EError>,
+) -> Result<T, E2EError> {
+    result.map_err(|source| E2EError::StressIteration {
+        scenario,
+        iteration,
+        source: Box::new(source),
+    })
+}
+
+/// stress節用の共有store。正常終了する`hello`と回転する`spin`の二tagを
+/// 登録し、全scenarioが同じstore (と同じ`run/` state directory) を使う。
+fn stress_store(hello_elf: &[u8]) -> Result<TempStore, E2EError> {
+    let store = TempStore::empty();
+    let inner = minicontainer_bundle::Store::new(&store.path)
+        .map_err(|error| E2EError::Store(error.to_string()))?;
+    for (tag, bytes) in [
+        (E2E_IMAGE, hello_bundle_bytes(hello_elf)?),
+        (
+            E2E_SPIN_IMAGE,
+            bundle_bytes(E2E_SPIN_IMAGE, &spin_elf_bytes())?,
+        ),
+    ] {
+        let digest = inner
+            .import(&bytes)
+            .map_err(|error| E2EError::Store(error.to_string()))?;
+        inner
+            .tag(tag, digest)
+            .map_err(|error| E2EError::Store(error.to_string()))?;
+    }
+    Ok(store)
+}
+
+/// 正常終了するguestを1回runし、exit 42を確認する。
+fn stress_foreground_once(minictr: &Path, store: &Path, kernel: &Path) -> Result<(), E2EError> {
+    let completed = run_minictr(minictr, store, kernel, HAPPY_PATH_TIMEOUT_MS, E2E_IMAGE)?;
+    if completed.status.code() != Some(E2E_EXIT_CODE) {
+        return Err(E2EError::UnexpectedRun {
+            case: "stress foreground exit code",
+            expected: format!("exit {E2E_EXIT_CODE}"),
+            actual: format!(
+                "status {:?} (stderr: {})",
+                completed.status.code(),
+                String::from_utf8_lossy(&completed.stderr)
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// timeoutで打ち切られるspin guestを1回runし、125を確認する。
+fn stress_timeout_once(minictr: &Path, store: &Path, kernel: &Path) -> Result<(), E2EError> {
+    let completed = run_minictr(minictr, store, kernel, SPIN_TIMEOUT_MS, E2E_SPIN_IMAGE)?;
+    if completed.status.code() != Some(125) {
+        return Err(E2EError::UnexpectedRun {
+            case: "stress timeout exit code",
+            expected: "exit 125".to_owned(),
+            actual: format!(
+                "status {:?} (stderr: {})",
+                completed.status.code(),
+                String::from_utf8_lossy(&completed.stderr)
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// 回転中のrunへsignalを1回送り、125とsignal名の診断を確認する。
+fn stress_signal_once(
+    minictr: &Path,
+    store: &Path,
+    kernel: &Path,
+    qemu_before: &[u32],
+    signal_name: &'static str,
+    send: impl FnOnce(u32) -> io::Result<()>,
+) -> Result<(), E2EError> {
+    let spawned = spawn_minictr(
+        minictr,
+        store,
+        kernel,
+        HAPPY_PATH_TIMEOUT_MS,
+        E2E_SPIN_IMAGE,
+    )?;
+    let outcome = (|| {
+        let spawned = wait_for_qemu_boot(spawned, qemu_before)?;
+        thread::sleep(INTERRUPT_SETTLE);
+        let spawned = assert_minictr_running(spawned)?;
+        if let Err(error) = send(spawned.pid) {
+            let failure = E2EError::Command {
+                command: format!("send {signal_name} to minictr {}", spawned.pid),
+                message: error.to_string(),
+            };
+            terminate_spawned(spawned);
+            return Err(failure);
+        }
+        wait_for_exit(spawned, INTERRUPT_EXIT_TIMEOUT)
+    })();
+    let completed = outcome?;
+    if completed.status.code() != Some(125)
+        || !String::from_utf8_lossy(&completed.stderr)
+            .contains(&format!("run interrupted by {signal_name}"))
+    {
+        return Err(E2EError::UnexpectedRun {
+            case: "stress signal exit",
+            expected: format!("exit 125 with a {signal_name} diagnostic"),
+            actual: format!(
+                "status {:?} (stderr: {})",
+                completed.status.code(),
+                String::from_utf8_lossy(&completed.stderr)
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// detached runを1回行い、`stop`で回収する。失敗経路でもQEMUを孤児に
+/// しないため、判明したpidは必ずSIGKILLで落とす。
+fn stress_detach_once(minictr: &Path, store: &Path, kernel: &Path) -> Result<(), E2EError> {
+    let mut qemu_pid = None;
+    let result = (|| {
+        let completed = run_minictr_with_extra_args(
+            minictr,
+            store,
+            kernel,
+            HAPPY_PATH_TIMEOUT_MS,
+            E2E_SPIN_IMAGE,
+            &[OsString::from("--detach")],
+        )?;
+        if !completed.status.success() {
+            return Err(E2EError::UnexpectedRun {
+                case: "stress detach run",
+                expected: "exit 0 with an instance id".to_owned(),
+                actual: format!(
+                    "status {:?} (stderr: {})",
+                    completed.status.code(),
+                    String::from_utf8_lossy(&completed.stderr)
+                ),
+            });
+        }
+        let id = String::from_utf8_lossy(&completed.stdout).trim().to_owned();
+        let pid = id
+            .strip_prefix("i-")
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .filter(|pid| id == format!("i-{pid}"));
+        let Some(pid) = pid else {
+            return Err(E2EError::UnexpectedRun {
+                case: "stress detach output",
+                expected: "a bare i-<pid> instance id".to_owned(),
+                actual: format!(
+                    "stdout: {:?}, stderr: {}",
+                    String::from_utf8_lossy(&completed.stdout),
+                    String::from_utf8_lossy(&completed.stderr)
+                ),
+            });
+        };
+        qemu_pid = Some(pid);
+        wait_for_ps_row(minictr, store, E2E_SPIN_IMAGE, pid, "live")?;
+        let stop_args = [
+            OsString::from("stop"),
+            OsString::from("--store"),
+            store.as_os_str().to_owned(),
+            OsString::from(&id),
+        ];
+        let stopped = run_with_timeout(minictr, &stop_args, None, &[], COMMAND_TIMEOUT)?;
+        if !stopped.status.success() || String::from_utf8_lossy(&stopped.stdout).trim() != id {
+            return Err(E2EError::UnexpectedRun {
+                case: "stress detach stop",
+                expected: format!("exit 0 echoing {id}"),
+                actual: format!(
+                    "status {:?} (stdout: {:?}, stderr: {})",
+                    stopped.status.code(),
+                    String::from_utf8_lossy(&stopped.stdout),
+                    String::from_utf8_lossy(&stopped.stderr)
+                ),
+            });
+        }
+        Ok(())
+    })();
+    if let Some(pid) = qemu_pid {
+        let _ = signal_process(pid, libc::SIGKILL);
+    }
+    result
+}
+
+/// `minictr`をSIGKILLしてhost crashを真似し、孤児QEMUも落としたあと
+/// `stop`がstale instanceを回収することを1回確認する。
+fn stress_crash_once(
+    minictr: &Path,
+    store: &Path,
+    kernel: &Path,
+    qemu_before: &[u32],
+) -> Result<(), E2EError> {
+    let spawned = spawn_minictr(
+        minictr,
+        store,
+        kernel,
+        HAPPY_PATH_TIMEOUT_MS,
+        E2E_SPIN_IMAGE,
+    )?;
+    let mut qemu_pid = None;
+    let result = (|| {
+        let mut spawned = wait_for_qemu_boot(spawned, qemu_before)?;
+        let pid = match qemu_pids() {
+            Ok(pids) => pids.into_iter().find(|pid| !qemu_before.contains(pid)),
+            Err(error) => {
+                terminate_spawned(spawned);
+                return Err(error);
+            }
+        };
+        let Some(pid) = pid else {
+            terminate_spawned(spawned);
+            return Err(E2EError::UnexpectedRun {
+                case: "stress crash QEMU discovery",
+                expected: "a freshly booted QEMU pid".to_owned(),
+                actual: "no new QEMU process".to_owned(),
+            });
+        };
+        qemu_pid = Some(pid);
+        if let Err(error) = wait_for_ps_row(minictr, store, E2E_SPIN_IMAGE, pid, "live") {
+            terminate_spawned(spawned);
+            let _ = signal_process(pid, libc::SIGKILL);
+            return Err(error);
+        }
+        if let Err(error) = signal_process(spawned.pid, libc::SIGKILL) {
+            let failure = E2EError::Command {
+                command: format!("send SIGKILL to minictr {}", spawned.pid),
+                message: error.to_string(),
+            };
+            terminate_spawned(spawned);
+            let _ = signal_process(pid, libc::SIGKILL);
+            return Err(failure);
+        }
+        if let Err(error) = spawned.child.wait() {
+            let failure = E2EError::Command {
+                command: spawned.command_line.clone(),
+                message: error.to_string(),
+            };
+            let _ = signal_process(pid, libc::SIGKILL);
+            return Err(failure);
+        }
+        let _ = join_reader(spawned.stdout_reader, &spawned.command_line);
+        let _ = join_reader(spawned.stderr_reader, &spawned.command_line);
+        // 孤児QEMUを落としてinstanceをstaleへ倒し、記録された回復経路
+        // (`stop`)でpayloadとstateを回収する。
+        let _ = signal_process(pid, libc::SIGKILL);
+        wait_for_ps_row(minictr, store, E2E_SPIN_IMAGE, pid, "stale")?;
+        let id = format!("i-{pid}");
+        let stop_args = [
+            OsString::from("stop"),
+            OsString::from("--store"),
+            store.as_os_str().to_owned(),
+            OsString::from(&id),
+        ];
+        let stopped = run_with_timeout(minictr, &stop_args, None, &[], COMMAND_TIMEOUT)?;
+        if !stopped.status.success() || String::from_utf8_lossy(&stopped.stdout).trim() != id {
+            return Err(E2EError::UnexpectedRun {
+                case: "stress crash stop",
+                expected: format!("exit 0 echoing {id}"),
+                actual: format!(
+                    "status {:?} (stdout: {:?}, stderr: {})",
+                    stopped.status.code(),
+                    String::from_utf8_lossy(&stopped.stdout),
+                    String::from_utf8_lossy(&stopped.stderr)
+                ),
+            });
+        }
+        Ok(())
+    })();
+    if let Some(pid) = qemu_pid {
+        let _ = signal_process(pid, libc::SIGKILL);
+    }
+    result
+}
+
+/// 共有storeの`run/`にinstance state fileが残っていないことを確認する。
+fn check_no_state_files(store: &Path) -> Result<(), E2EError> {
+    let mut stray: Vec<PathBuf> = std::fs::read_dir(store.join("run"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().ends_with(".state"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    stray.sort();
+    if stray.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = stray
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    Err(E2EError::Store(format!(
+        "instance state files remain: {}",
+        names.join(", ")
+    )))
+}
+
+/// `minictr ps`がinstance行を一つも出さないことを確認する。
+fn check_ps_rows_empty(minictr: &Path, store: &Path) -> Result<(), E2EError> {
+    let args = [
+        OsString::from("ps"),
+        OsString::from("--store"),
+        store.as_os_str().to_owned(),
+    ];
+    let ps = run_with_timeout(minictr, &args, None, &[], COMMAND_TIMEOUT)?;
+    let text = String::from_utf8_lossy(&ps.stdout);
+    if !ps.status.success() || text.lines().any(|line| line.starts_with("i-")) {
+        return Err(E2EError::UnexpectedRun {
+            case: "stress final ps",
+            expected: "no instance rows".to_owned(),
+            actual: format!(
+                "status {:?}, ps output: {}",
+                ps.status.code(),
+                text.trim_end()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// 反復起動・timeout・signal・detach・crashの各scenarioを一つの共有storeへ
+/// bounded回だけ実行する。累積漏れを見るため、instance stateとps行は節の
+/// 終わりにまとめて検査し、各iterationではQEMUとpayloadの残留だけを
+/// iteration番号つきで報告する。
+fn run_stress(minictr: &Path, kernel: &Path, workspace: &Path) -> Result<String, E2EError> {
+    let elf = workspace.join(GUEST_HELLO_ELF);
+    let hello_elf = std::fs::read(&elf).map_err(|_| E2EError::MissingGuestElf(elf.clone()))?;
+    let store = stress_store(&hello_elf)?;
+    let store_path = store.path.clone();
+    let baseline = stress_baseline()?;
+    let started = Instant::now();
+
+    for iteration in 0..STRESS_RUN_ITERS {
+        let outcome = stress_foreground_once(minictr, &store_path, kernel)
+            .and_then(|()| check_stress_leftovers(&baseline));
+        stress_iter("foreground", iteration, outcome)?;
+    }
+    for iteration in 0..STRESS_TIMEOUT_ITERS {
+        let outcome = stress_timeout_once(minictr, &store_path, kernel)
+            .and_then(|()| check_stress_leftovers(&baseline));
+        stress_iter("timeout", iteration, outcome)?;
+    }
+    for iteration in 0..STRESS_SIGNAL_ITERS {
+        let outcome = stress_signal_once(
+            minictr,
+            &store_path,
+            kernel,
+            &baseline.qemu,
+            "SIGINT",
+            |pid| signal_process_group(pid, libc::SIGINT),
+        )
+        .and_then(|()| check_stress_leftovers(&baseline));
+        stress_iter("SIGINT", iteration, outcome)?;
+    }
+    for iteration in 0..STRESS_SIGNAL_ITERS {
+        let outcome = stress_signal_once(
+            minictr,
+            &store_path,
+            kernel,
+            &baseline.qemu,
+            "SIGTERM",
+            |pid| signal_process(pid, libc::SIGTERM),
+        )
+        .and_then(|()| check_stress_leftovers(&baseline));
+        stress_iter("SIGTERM", iteration, outcome)?;
+    }
+    for iteration in 0..STRESS_DETACH_ITERS {
+        let outcome = stress_detach_once(minictr, &store_path, kernel)
+            .and_then(|()| check_stress_leftovers(&baseline));
+        stress_iter("detach", iteration, outcome)?;
+    }
+    for iteration in 0..STRESS_CRASH_ITERS {
+        let outcome = stress_crash_once(minictr, &store_path, kernel, &baseline.qemu)
+            .and_then(|()| check_stress_leftovers(&baseline));
+        stress_iter("crash", iteration, outcome)?;
+    }
+
+    check_no_state_files(&store_path)?;
+    check_ps_rows_empty(minictr, &store_path)?;
+    check_stress_leftovers(&baseline)?;
+    drop(store);
+    if store_path.exists() {
+        return Err(E2EError::Store(format!(
+            "stress store was not removed: {}",
+            store_path.display()
+        )));
+    }
+    let total = STRESS_RUN_ITERS
+        + STRESS_TIMEOUT_ITERS
+        + 2 * STRESS_SIGNAL_ITERS
+        + STRESS_DETACH_ITERS
+        + STRESS_CRASH_ITERS;
+    Ok(format!(
+        "{total} iterations in {:.1}s",
+        started.elapsed().as_secs_f64()
+    ))
+}
+
 /// `minictr ps`が`qemu_pid`の行を`status`で表示するまでpollする。QEMUの
 /// 登録と死亡の観測には僅かな遅れがあるため、即時確認ではなく期限付きで
 /// 待つ。
 fn wait_for_ps_row(
     minictr: &Path,
     store: &Path,
+    image: &str,
     qemu_pid: u32,
     status: &str,
 ) -> Result<(), E2EError> {
     let deadline = Instant::now() + INTERRUPT_BOOT_TIMEOUT;
-    let expected = format!("i-{qemu_pid}\t{qemu_pid}\t{E2E_IMAGE}\t{status}\t");
+    let expected = format!("i-{qemu_pid}\t{qemu_pid}\t{image}\t{status}\t");
     let args = [
         OsString::from("ps"),
         OsString::from("--store"),
@@ -2928,5 +3405,60 @@ mod tests {
             check_inspect_output(b"tag: hello\n", "hello", &digest, 60456).is_err(),
             "a truncated inspect output must fail"
         );
+    }
+
+    // Catches a stress wrapper that drops the scenario, iteration, or inner failure.
+    #[test]
+    fn stress_iter_reports_the_failed_iteration_and_its_cause() {
+        let inner = E2EError::PayloadLeftover(vec![PathBuf::from("/tmp/minicontainer-run-9")]);
+        let error = stress_iter("timeout", 2, Err::<(), E2EError>(inner)).unwrap_err();
+
+        let text = error.to_string();
+        assert!(text.contains("stress timeout iteration 2 failed"), "{text}");
+        assert!(text.contains("/tmp/minicontainer-run-9"), "{text}");
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    // Catches a stress wrapper that also fails successful iterations.
+    #[test]
+    fn stress_iter_passes_a_successful_value_through() {
+        assert_eq!(stress_iter("foreground", 0, Ok(7_u32)).unwrap(), 7);
+    }
+
+    // Catches a clean host reported as a leak, and a baseline that cannot be taken.
+    #[test]
+    fn stress_baseline_then_an_unchanged_host_reports_no_leftovers() {
+        let baseline = stress_baseline().expect("baseline snapshot must be readable");
+        check_stress_leftovers(&baseline).expect("an unchanged host must pass");
+    }
+
+    // Catches the final state check missing or inventing leftovers.
+    #[test]
+    fn check_no_state_files_reports_every_stray_state_file() {
+        let scratch = TempDir::create("minictr-e2e-stress-state-").expect("scratch dir must exist");
+        let run = scratch.path.join("run");
+        std::fs::create_dir(&run).expect("run dir must exist");
+        check_no_state_files(&scratch.path).expect("an empty run dir must pass");
+
+        std::fs::write(run.join("i-11.state"), b"x").expect("state file must exist");
+        std::fs::write(run.join("i-12.state"), b"x").expect("state file must exist");
+        std::fs::write(run.join("other.bin"), b"x").expect("non-state file must exist");
+        let error = check_no_state_files(&scratch.path).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("i-11.state"), "{text}");
+        assert!(text.contains("i-12.state"), "{text}");
+        assert!(!text.contains("other.bin"), "{text}");
+    }
+
+    // Catches the shared store losing one of the two tags.
+    #[test]
+    fn stress_store_registers_the_hello_and_spin_tags() {
+        let store = stress_store(b"elf-bytes").expect("stress store must build");
+        let inner = minicontainer_bundle::Store::new(&store.path).expect("store must reopen");
+        for tag in [E2E_IMAGE, E2E_SPIN_IMAGE] {
+            inner
+                .resolve(tag)
+                .unwrap_or_else(|_| panic!("tag {tag} must resolve"));
+        }
     }
 }
