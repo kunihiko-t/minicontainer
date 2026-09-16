@@ -84,5 +84,6 @@ jobs:
               sha256sum -c 'minicontainer-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256'
               gh attestation verify 'minicontainer-$VERSION-x86_64-unknown-linux-gnu.tar.gz' --owner kunihiko-t
           EOF
-          gh release create "$VERSION" --title "MiniContainer $VERSION" --notes-file "$NOTES" \
+          gh release create "$VERSION" --repo "${{ github.repository }}" \
+            --title "MiniContainer $VERSION" --notes-file "$NOTES" \
             dist/*/*.tar.gz dist/*/*.tar.gz.sha256
