@@ -94,6 +94,7 @@ timeout経路とmalformed-frame経路では失敗時にguest出力を転送し�
 SIGTERM経路では`minictr`のPIDだけへsignalを送り、125終了と同じ非残留を確認する。
 crash経路では`minictr`をSIGKILLしてcleanupを回避させ、孤児QEMUを殺したあと`ps`がそのinstanceをstaleと表示することを確認する。
 detached経路では`run --detach`が`i-<pid>`だけを出力し、`stop`がQEMUとpayloadとstate fileを回収することを確認する。
+detached exit経路では、すぐ終了するguestを`run --detach`し、QEMUが停止した後の`ps`が`stale`を出し、`stop`がidをechoしてstate fileを回収することを確認する。
 stdin echo経路では、pipeしたbinary入力がguest-echoからそのまま戻り、EOF後に終了code 42になることを確認する。
 cli surface passでは、QEMUを要しない公開commandを一時storeへ一回ずつ実行する。`--version`と`help`の出力、`image list`の列、`image export`から`image import`への往復、`image remove`後の一覧と`image prune`の候補表示と実削除を確認する。`image pull-oci`だけは実registryを要するため対象外であり、unit testが担保する。
 プロセス残存検査には`ps`が必要であり、実行制限のあるサンドボックスでは権限エラーになることがある。

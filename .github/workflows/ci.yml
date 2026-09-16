@@ -54,7 +54,9 @@ jobs:
           SMOKE_DIR=$(echo /tmp/release-smoke/extract/minicontainer-*-x86_64-unknown-linux-gnu)
           (cd "$SMOKE_DIR" && sha256sum -c SHA256SUMS)
           test -x "$SMOKE_DIR/minictr"
-          "$SMOKE_DIR/minictr" --version | grep -q "minictr 0.1.0"
+          EXPECTED_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/minictr/Cargo.toml)
+          test -n "$EXPECTED_VERSION"
+          "$SMOKE_DIR/minictr" --version | grep -qx "minictr $EXPECTED_VERSION"
           "$SMOKE_DIR/minictr" image build --store /tmp/release-smoke/store hello target/guest-hello/riscv64gc-unknown-none-elf/release/guest-hello
           set +e
           "$SMOKE_DIR/minictr" run --store /tmp/release-smoke/store --kernel "$SMOKE_DIR/kernel/minios.bin" hello > /tmp/release-smoke/guest.txt 2> /tmp/release-smoke/guest.err

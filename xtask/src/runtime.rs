@@ -366,6 +366,18 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         detached.elapsed.as_secs_f64()
     ));
 
+    log(
+        "e2e: detached exit path (a detached guest that exits leaves a stale row; stop collects it)",
+    );
+    let detached_exit = run_detached_exit_path(&minictr, &kernel, workspace)?;
+    log(&format!(
+        "e2e: detached exit path passed (minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)",
+        detached_exit.minictr_pid,
+        detached_exit.qemu_before,
+        detached_exit.qemu_after,
+        detached_exit.elapsed.as_secs_f64()
+    ));
+
     log("e2e: stdin echo path (piped bytes echo back, EOF exits 42)");
     let echoed = run_stdin_echo_path(&minictr, &kernel, workspace)?;
     log(&format!(
@@ -1490,6 +1502,128 @@ fn run_detached_path(minictr: &Path, kernel: &Path) -> Result<CaseReport, E2EErr
         {
             return Err(E2EError::UnexpectedRun {
                 case: "detached post-stop ps",
+                expected: "no instance rows".to_owned(),
+                actual: format!("ps output: {}", String::from_utf8_lossy(&ps.stdout)),
+            });
+        }
+        Ok(completed)
+    })();
+    let elapsed = started.elapsed();
+    if let Some(pid) = qemu_pid {
+        let _ = signal_process(pid, libc::SIGKILL);
+    }
+    remove_stray_payloads(&payload_before);
+    let qemu_after = check_case_leftovers(&qemu_before, &payload_before, store, &store_path)?;
+    let completed = outcome?;
+    Ok(CaseReport {
+        minictr_pid: completed.pid,
+        qemu_before,
+        qemu_after,
+        elapsed,
+        status: completed.status.code(),
+        stdout: completed.stdout,
+        stderr: completed.stderr,
+    })
+}
+
+/// detached exitの契約: detached QEMUにはsupervisorが居ないためguestの
+/// Exit frameは誰も読まず、guestの終了でkernelがQEMUを止める。`ps`は
+/// 残ったstate fileを`stale`と出し、`stop`はidをechoしてstate fileだけを
+/// 回収する。
+fn run_detached_exit_path(
+    minictr: &Path,
+    kernel: &Path,
+    workspace: &Path,
+) -> Result<CaseReport, E2EError> {
+    let elf = workspace.join(GUEST_HELLO_ELF);
+    if !elf.is_file() {
+        return Err(E2EError::MissingGuestElf(elf));
+    }
+    let store = TempStore::empty();
+    run_image_build(minictr, &store.path, &elf)?;
+    let store_path = store.path.clone();
+    let qemu_before = qemu_pids()?;
+    let payload_before = payload_temp_leftovers();
+    let started = Instant::now();
+    let mut qemu_pid = None;
+    let outcome = (|| {
+        let completed = run_minictr_with_extra_args(
+            minictr,
+            &store.path,
+            kernel,
+            HAPPY_PATH_TIMEOUT_MS,
+            E2E_IMAGE,
+            &[OsString::from("--detach")],
+        )?;
+        if !completed.status.success() {
+            return Err(E2EError::UnexpectedRun {
+                case: "detached exit run exit",
+                expected: "exit 0 with an instance id".to_owned(),
+                actual: format!(
+                    "status {:?} (stderr: {})",
+                    completed.status.code(),
+                    String::from_utf8_lossy(&completed.stderr)
+                ),
+            });
+        }
+        let id = String::from_utf8_lossy(&completed.stdout).trim().to_owned();
+        let pid = id
+            .strip_prefix("i-")
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .filter(|pid| id == format!("i-{pid}"));
+        let Some(pid) = pid else {
+            return Err(E2EError::UnexpectedRun {
+                case: "detached exit run output",
+                expected: "a bare i-<pid> instance id".to_owned(),
+                actual: format!(
+                    "stdout: {:?}, stderr: {}",
+                    String::from_utf8_lossy(&completed.stdout),
+                    String::from_utf8_lossy(&completed.stderr)
+                ),
+            });
+        };
+        qemu_pid = Some(pid);
+        // guestは即座に終了し、kernelがQEMUを止める。state fileは残るため、
+        // ps行はliveからstaleへ変わる。
+        wait_for_ps_row(minictr, &store_path, E2E_IMAGE, pid, "stale")?;
+        // QEMUは既に死んでいるため、`stop`はstate fileの回収だけを行い、
+        // idをechoして0で終わる。
+        let stop_args = [
+            OsString::from("stop"),
+            OsString::from("--store"),
+            store_path.as_os_str().to_owned(),
+            OsString::from(&id),
+        ];
+        let stopped = run_with_timeout(minictr, &stop_args, None, &[], COMMAND_TIMEOUT)?;
+        if !stopped.status.success() || String::from_utf8_lossy(&stopped.stdout).trim() != id {
+            return Err(E2EError::UnexpectedRun {
+                case: "detached exit stop",
+                expected: format!("exit 0 echoing {id}"),
+                actual: format!(
+                    "status {:?} (stdout: {:?}, stderr: {})",
+                    stopped.status.code(),
+                    String::from_utf8_lossy(&stopped.stdout),
+                    String::from_utf8_lossy(&stopped.stderr)
+                ),
+            });
+        }
+        let ps = run_with_timeout(
+            minictr,
+            &[
+                OsString::from("ps"),
+                OsString::from("--store"),
+                store_path.as_os_str().to_owned(),
+            ],
+            None,
+            &[],
+            COMMAND_TIMEOUT,
+        )?;
+        if String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .any(|line| line.starts_with(&id))
+        {
+            return Err(E2EError::UnexpectedRun {
+                case: "detached exit post-stop ps",
                 expected: "no instance rows".to_owned(),
                 actual: format!("ps output: {}", String::from_utf8_lossy(&ps.stdout)),
             });

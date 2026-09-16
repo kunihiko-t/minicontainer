@@ -60,7 +60,7 @@ foregroundのrunでは通常fileは残らない。
 孤児QEMUがまだ動いていればliveとして表示され、死んでいればstaleとして表示される。
 
 detached runにはsupervisorが居ないため、guestのExit frameは誰も読まない。
-guestが終了してもQEMUは残り、`ps`は`stop`までliveを出し続ける。
+guestの終了でQEMUも停止するため、終了後の`ps`は`stale`を出し、`stop`はstate fileだけを回収する。動き続けるguestは`live`のままである。
 
 ## 停止
 

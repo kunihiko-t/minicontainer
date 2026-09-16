@@ -184,7 +184,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "minicontainer-bundle"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "minios-abi",
  "sha2 0.11.0",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "minicontainer-oci"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "minicontainer-bundle",
  "sha2 0.11.0",
@@ -201,14 +201,14 @@ dependencies = [
 
 [[package]]
 name = "minicontainer-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "minios-abi",
 ]
 
 [[package]]
 name = "minicontainer-runtime"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "minicontainer-bundle",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "minictr"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "minicontainer-bundle",
@@ -468,7 +468,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "minicontainer-bundle",

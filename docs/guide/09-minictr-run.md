@@ -25,7 +25,7 @@ usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
-`--version`は`minictr 0.1.0`を標準出力へ出して0で終わる。
+`--version`は`minictr 1.0.0`を標準出力へ出して0で終わる。
 どちらも引数を取らず、後続のtokenは型付きerrorになる。
 
 `--store`と`--kernel`の値はOS pathとして不透明に扱う。
@@ -164,7 +164,7 @@ corrupt行は識別子だけを出し、残りの列を`-`で埋める。
 file形式とpid identityの照合は[instance state](../reference/instance-state.md)を参照する。
 
 `run --detach`で起きたinstanceは、hostの`minictr`が終わった後もstate fileを残すため、いつでも`ps`に出る。
-detached QEMUにはsupervisorが居ないため、guestが終了しても行は`stop`まで`live`のままである。
+detached QEMUにはsupervisorが居ないため終了codeは届かないが、guestの終了でQEMUも停止し、行は`stale`へ変わる。動き続けるguestの行は`stop`まで`live`のままである。
 
 ## instanceの停止
 

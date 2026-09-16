@@ -17,9 +17,9 @@ command名と引数構文は`minictr help`のusage行が正であり、tracked M
 
 | command | 保証 | 検証根拠 |
 | --- | --- | --- |
-| `run` | guestの標準出力をstdoutへ透過し、guestの終了codeをそのまま返す。`--detach`ではinstance id `i-<pid>`を1行で返す | 実QEMU E2E (happy/timeout/sigint/sigterm/crash/detached/stdin/stress)、unit test |
-| `ps` | state fileのあるinstanceを`INSTANCE`/`IMAGE`/`STATUS`列で出す。liveとstaleを区別する | 実QEMU E2E (detached、stale行、crash回復、stress終了時の空確認)、unit test |
-| `stop` | pid identityを照合してからQEMUを終了させ、payload directoryとstate fileを回収してinstance idを出す。staleとcorruptを区別する | 実QEMU E2E (detached回収、crash回収、stress)、unit test |
+| `run` | guestの標準出力をstdoutへ透過し、guestの終了codeをそのまま返す。`--detach`ではinstance id `i-<pid>`を1行で返す | 実QEMU E2E (happy/timeout/sigint/sigterm/crash/detached/detached exit/stdin/stress)、unit test |
+| `ps` | state fileのあるinstanceを`INSTANCE`、`PID`、`IMAGE`、`STATE`、`AGE`の5列で出す。liveとstaleとcorruptを区別する | 実QEMU E2E (detached、detached exit、stale行、crash回復、stress終了時の空確認)、unit test |
+| `stop` | pid identityを照合してからQEMUを終了させ、payload directoryとstate fileを回収してinstance idを出す。staleとcorruptを区別する | 実QEMU E2E (detached回収、detached exit回収、crash回収、stress)、unit test |
 | `doctor` | QEMU version、kernel file、store rootを診断し、`ok`または`fail`と`summary`を出す | CI smoke (ubuntu、macOS)、unit test |
 | `image build` | ELFと`--arg`からcanonical bundleをbuildし、digest行`sha256:<hex>`を出す | 実QEMU E2E、CI OCI interop step、unit test |
 | `image import` | bundle fileを検証してstoreへ登録する | CI互換性fixture step (ABI v1.0受理)、unit test |
