@@ -30,6 +30,7 @@ MiniContainerは検証済みbundleをboot payload予約領域へ渡し、QEMU子
 実QEMU end-to-end検証はrelease gateの最終段階として実行する。
 同梱ゲストを公開CLIの`image build`、`image inspect`、`run`へ一続きで通して、標準出力、標準エラー出力、終了code 42、QEMU回収、一時directory cleanupを確認する。
 timeout、malformed-frame、出力上限、割り込みの失敗経路では非0終了と残留の不在も確認する。
+cli surface passはQEMUを要しない公開commandを実storeへ実行し、末尾のstress節は反復・中断・強制終了後のcleanupをbounded回だけ繰り返す。
 
 ### 出力上限
 
@@ -48,15 +49,14 @@ E2Eの出力上限経路では、連打guestによる125終了、診断の一致
 ガイド全12章の本文を用意している。
 第1章から第11章は現在の実装、第12章はOCI対応の形式資料である。
 第10章はhost error、guest failure、protocol破損の三分類と終了code、timeoutの二層強制、診断logの扱いを説明する。
-第11章は`setup`と16段階の`check`と15段階の`check-host`、公開条件の検査、CIとの同一性を説明する。
+第11章は`setup`と18段階の`check`と17段階の`check-host`、公開条件の検査、CIとの同一性を説明する。
 第1章から第4章は境界、環境、ELFとGuest ABI、MiniBundleを、第12章はMiniBundleとOCI Image Layoutの対応と拡張順の計画を扱う。
 
 ## 開発マイルストーン
 
-以降の開発は、ローカル操作、イメージ配布、実行制御、互換性の順に進める。
-各マイルストーンのIssueはGitHubで管理し、このページには機能の境界と依存順を残す。
-期日は品質を下げる根拠にならないため、検証可能な完了条件を優先し、現時点では設定しない。
-[GitHub Roadmap Issue](https://github.com/kunihiko-t/minicontainer/issues/31)では、全マイルストーンの進捗を一覧できる。
+v0.2.0からv1.0.0までの全マイルストーンは完了しており、掲げた22のIssueはすべてclose済みである。
+進捗の追跡には[GitHub Roadmap Issue](https://github.com/kunihiko-t/minicontainer/issues/31)を使った。
+この節は当時の機能の境界と依存順を記す計画の記録であり、各契約の現行の保証は[公開契約の監査表](public-contract.md)が正である。
 
 ### [v0.2.0 Local Workflow](https://github.com/kunihiko-t/minicontainer/milestone/1)
 
