@@ -44,6 +44,10 @@ checksumはファイルの完全性だけを示し、生成元の証明にはな
 
 ## クイックスタート
 
+複数imageの構築とPID別結果、共有I/O、task-local fault分離は
+[複数taskのサンプル](examples/multi-task/README.md)で確認できる。
+その手順はsourceからビルドしたCLIと明示した候補kernelを使い、標準のリリースkernel固定は変更しない。
+
 sourceからビルドし、同梱の最小ゲスト例を登録して実行する。
 以下は同じシェルで、MiniContainerのリポジトリ直下から順に実行する。
 作業用のminiOSとストアは一時ディレクトリーに作成するため、長期保存には別の保存先を指定する。

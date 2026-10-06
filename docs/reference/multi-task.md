@@ -1,5 +1,8 @@
 # 複数taskのforeground実行
 
+CLIと候補kernelのビルドから正常2task・fault分離まで実行する手順は
+[複数taskのサンプル](../../examples/multi-task/README.md)を参照する。
+
 manifest v2のbundleを`minictr image import`で登録し、通常の`minictr run`で実行できる。
 内部builder `minicontainer_bundle::build_multi`は1〜4 imageを入力順で連結し、
 ELF領域先頭からの相対offsetを生成する。import時にもELF範囲、重なり、manifestとbundle上限を検証する。
