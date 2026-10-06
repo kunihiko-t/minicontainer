@@ -1,6 +1,7 @@
 //! `minictr` binary: store resolveとhost runtime、host入出力を接続する。
 
 mod cli;
+mod multi_build;
 
 use std::{
     ffi::{OsStr, OsString},
@@ -25,9 +26,9 @@ use cli::{
     Command, Environ, ImageCommand, RealEnv, ResolvedBuild, ResolvedDoctor, ResolvedExport,
     ResolvedExportOci, ResolvedImport, ResolvedImportOci, ResolvedInspect, ResolvedList,
     ResolvedPrune, ResolvedPs, ResolvedPullOci, ResolvedRemove, ResolvedRun, ResolvedStop, VERSION,
-    help, parse_os, resolve, resolve_build, resolve_doctor, resolve_export, resolve_export_oci,
-    resolve_import, resolve_import_oci, resolve_inspect, resolve_list, resolve_prune, resolve_ps,
-    resolve_pull_oci, resolve_remove, resolve_stop,
+    help, parse_os, resolve, resolve_build, resolve_build_multi, resolve_doctor, resolve_export,
+    resolve_export_oci, resolve_import, resolve_import_oci, resolve_inspect, resolve_list,
+    resolve_prune, resolve_ps, resolve_pull_oci, resolve_remove, resolve_stop,
 };
 
 /// usage errorのprocess終了code。
@@ -126,6 +127,17 @@ pub fn real_main(
                     }
                 };
                 build_resolved(&resolved, &RealStore, stdout, stderr)
+            }
+            ImageCommand::BuildMulti(args) => {
+                let resolved = match resolve_build_multi(&args, env) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "minictr: {error}");
+                        let _ = writeln!(stderr, "{help}", help = help());
+                        return USAGE_EXIT;
+                    }
+                };
+                multi_build::build_resolved(&resolved, &RealStore, stdout, stderr)
             }
             ImageCommand::Import(args) => {
                 let resolved = match resolve_import(&args, env) {
@@ -1489,20 +1501,29 @@ fn read_bounded_with(
     path: &Path,
     open: &dyn Fn(&Path) -> std::io::Result<File>,
 ) -> Result<Vec<u8>, BoundedReadError> {
-    if std::fs::metadata(path).map_err(BoundedReadError::Io)?.len() > MAX_BUNDLE_LEN {
+    read_bounded_with_limit(path, open, MAX_BUNDLE_LEN)
+}
+
+/// 複数ELFの合計にも上限を適用し、伸長したfileをsentinelで検出する。
+fn read_bounded_with_limit(
+    path: &Path,
+    open: &dyn Fn(&Path) -> std::io::Result<File>,
+    limit: u64,
+) -> Result<Vec<u8>, BoundedReadError> {
+    if std::fs::metadata(path).map_err(BoundedReadError::Io)?.len() > limit {
         return Err(BoundedReadError::TooLarge);
     }
     let file = open(path).map_err(BoundedReadError::Io)?;
-    if file.metadata().map_err(BoundedReadError::Io)?.len() > MAX_BUNDLE_LEN {
+    if file.metadata().map_err(BoundedReadError::Io)?.len() > limit {
         return Err(BoundedReadError::TooLarge);
     }
-    let mut bounded = file.take(MAX_BUNDLE_LEN + 1);
+    let mut bounded = file.take(limit + 1);
     let mut bytes = Vec::new();
     bounded
         .read_to_end(&mut bytes)
         .map_err(BoundedReadError::Io)?;
     let len = u64::try_from(bytes.len()).map_err(|_| BoundedReadError::TooLarge)?;
-    if len > MAX_BUNDLE_LEN {
+    if len > limit {
         return Err(BoundedReadError::TooLarge);
     }
     Ok(bytes)
@@ -2954,6 +2975,309 @@ mod tests {
             .into_bytes()
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // 公開CLIがimage順・引数・ELF bytesを変えず、同じ入力を同じbundleにする。
+    #[test]
+    fn multi_build_public_cli_is_deterministic_and_matches_builder() {
+        let root = temp_store_root("multi-build");
+        let first = root.join("first elf");
+        let second = root.join("second elf");
+        std::fs::write(&first, b"FIRST").unwrap();
+        std::fs::write(&second, b"SECOND").unwrap();
+        let mut lines = Vec::new();
+        for _ in 0..2 {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = real_main(
+                [
+                    OsString::from("image"),
+                    OsString::from("build-multi"),
+                    OsString::from("tasks"),
+                    OsString::from("--store"),
+                    root.clone().into_os_string(),
+                    OsString::from("--image"),
+                    OsString::from("first"),
+                    first.clone().into_os_string(),
+                    OsString::from("--arg"),
+                    OsString::from("two words"),
+                    OsString::from("--image"),
+                    OsString::from("second"),
+                    second.clone().into_os_string(),
+                ],
+                &UnusedEnv,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+            assert!(stderr.is_empty());
+            lines.push(stdout);
+        }
+        assert_eq!(lines[0], lines[1]);
+        let stored = Store::new(&root).unwrap().resolve("tasks").unwrap();
+        let expected = minicontainer_bundle::build_multi(&[
+            ImageSpec {
+                name: "first",
+                args: &["two words"],
+                elf: b"FIRST",
+            },
+            ImageSpec {
+                name: "second",
+                args: &[],
+                elf: b"SECOND",
+            },
+        ])
+        .unwrap();
+        assert_eq!(stored, expected);
+        assert_eq!(parse(&stored).unwrap().manifest.version(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // 第二imageの読み取り失敗やmanifest不正でstoreを部分登録しない。
+    #[test]
+    fn multi_build_invalid_inputs_leave_store_untouched() {
+        let root = temp_store_root("multi-build-errors");
+        let good = root.join("good");
+        let empty = root.join("empty");
+        let missing = root.join("missing");
+        std::fs::write(&good, b"GOOD").unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        for (name, path, argument) in [
+            ("second", &missing, "ok"),
+            ("second", &empty, "ok"),
+            ("../invalid", &good, "ok"),
+            ("second", &good, "bad\narg"),
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = real_main(
+                [
+                    OsString::from("image"),
+                    OsString::from("build-multi"),
+                    OsString::from("tasks"),
+                    OsString::from("--store"),
+                    root.clone().into_os_string(),
+                    OsString::from("--image"),
+                    OsString::from("first"),
+                    good.clone().into_os_string(),
+                    OsString::from("--image"),
+                    OsString::from(name),
+                    path.clone().into_os_string(),
+                    OsString::from("--arg"),
+                    OsString::from(argument),
+                ],
+                &UnusedEnv,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, RUNTIME_EXIT);
+            assert!(stdout.is_empty());
+            assert!(!stderr.is_empty());
+            assert!(!root.join("blobs").exists());
+            assert!(!root.join("tags").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // 個別file、合計payload、manifestの上限を超えてもtag/blobを作らない。
+    #[test]
+    fn multi_build_size_limits_and_unsafe_tags_do_not_mutate_store() {
+        let root = temp_store_root("multi-build-limits");
+        let elf = root.join("elf");
+        let huge = root.join("huge");
+        std::fs::write(&elf, b"ELF").unwrap();
+        let file = File::create(&huge).unwrap();
+        file.set_len(MAX_BUNDLE_LEN + 1).unwrap();
+        for (tag, first, second, argument) in [
+            ("tasks", &elf, &huge, String::new()),
+            ("..", &elf, &elf, String::new()),
+            ("../escape", &elf, &elf, String::new()),
+            ("tasks", &elf, &elf, "a".repeat(257)),
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = real_main(
+                [
+                    "image".into(),
+                    "build-multi".into(),
+                    OsString::from(tag),
+                    "--store".into(),
+                    root.clone().into_os_string(),
+                    "--image".into(),
+                    "first".into(),
+                    first.clone().into_os_string(),
+                    "--image".into(),
+                    "second".into(),
+                    second.clone().into_os_string(),
+                    "--arg".into(),
+                    argument.into(),
+                ],
+                &UnusedEnv,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, RUNTIME_EXIT);
+            assert!(stdout.is_empty());
+            assert!(!root.join("tags").exists());
+            assert!(!root.join("blobs").exists());
+        }
+        file.set_len(MAX_BUNDLE_LEN / 2).unwrap();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            real_main(
+                [
+                    "image".into(),
+                    "build-multi".into(),
+                    "tasks".into(),
+                    "--store".into(),
+                    root.clone().into_os_string(),
+                    "--image".into(),
+                    "first".into(),
+                    huge.clone().into_os_string(),
+                    "--image".into(),
+                    "second".into(),
+                    huge.clone().into_os_string(),
+                ],
+                &UnusedEnv,
+                &mut Vec::new(),
+                &mut stderr
+            ),
+            RUNTIME_EXIT
+        );
+        assert!(!root.join("tags").exists());
+        assert!(!root.join("blobs").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // 通常fileへ解決するsymlinkと非UTF8 pathを許可し、directory/FIFOは待たずに拒否する。
+    #[test]
+    #[cfg(unix)]
+    fn multi_build_handles_os_paths_and_rejects_special_files() {
+        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+        let root = temp_store_root("multi-build-os-paths");
+        let elf = root.join(OsString::from_vec(b"elf-\xff".to_vec()));
+        let link = root.join("symlink");
+        let fifo = root.join("fifo");
+        std::fs::write(&elf, b"ELF").unwrap();
+        symlink(&elf, &link).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (path, expected) in [
+            (&root, RUNTIME_EXIT),
+            (&fifo, RUNTIME_EXIT),
+            (&link, 0),
+            (&elf, 0),
+        ] {
+            let mut stderr = Vec::new();
+            assert_eq!(
+                real_main(
+                    [
+                        "image".into(),
+                        "build-multi".into(),
+                        "tasks".into(),
+                        "--store".into(),
+                        root.clone().into_os_string(),
+                        "--image".into(),
+                        "first".into(),
+                        path.clone().into_os_string(),
+                    ],
+                    &UnusedEnv,
+                    &mut Vec::new(),
+                    &mut stderr
+                ),
+                expected,
+                "{}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        assert_eq!(
+            parse(&Store::new(&root).unwrap().resolve("tasks").unwrap())
+                .unwrap()
+                .manifest
+                .version(),
+            2
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // 各imageの引数上限内でも合計manifest長を検証し、入力fileへ進まない。
+    #[test]
+    fn multi_build_rejects_aggregate_manifest_length_before_opening_inputs() {
+        let root = temp_store_root("multi-build-manifest");
+        let mut arguments = vec![
+            OsString::from("image"),
+            "build-multi".into(),
+            "tasks".into(),
+            "--store".into(),
+            root.clone().into_os_string(),
+        ];
+        for name in ["first", "second"] {
+            arguments.extend([
+                "--image".into(),
+                name.into(),
+                root.join("missing").into_os_string(),
+            ]);
+            for _ in 0..8 {
+                arguments.extend(["--arg".into(), "a".repeat(256).into()]);
+            }
+        }
+        let mut stderr = Vec::new();
+        assert_eq!(
+            real_main(arguments, &UnusedEnv, &mut Vec::new(), &mut stderr),
+            RUNTIME_EXIT
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("manifest"));
+        assert!(!String::from_utf8_lossy(&stderr).contains("failed to read ELF"));
+        assert!(!root.join("tags").exists());
+        assert!(!root.join("blobs").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // 不正な再構築が既存tagの内容を壊さない。
+    #[test]
+    fn multi_build_failure_preserves_an_existing_tag() {
+        let root = temp_store_root("multi-build-preserve");
+        let existing = build(ImageSpec {
+            name: "original",
+            args: &[],
+            elf: b"ORIGINAL",
+        })
+        .unwrap();
+        let store = Store::new(&root).unwrap();
+        let digest = store.import(&existing).unwrap();
+        store.tag("tasks", digest).unwrap();
+        let elf = root.join("elf");
+        std::fs::write(&elf, b"NEW").unwrap();
+        assert_eq!(
+            real_main(
+                [
+                    "image".into(),
+                    "build-multi".into(),
+                    "tasks".into(),
+                    "--store".into(),
+                    root.clone().into_os_string(),
+                    "--image".into(),
+                    "first".into(),
+                    elf.into_os_string(),
+                    "--image".into(),
+                    "second".into(),
+                    root.join("missing").into_os_string(),
+                ],
+                &UnusedEnv,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            RUNTIME_EXIT
+        );
+        assert_eq!(store.resolve("tasks").unwrap(), existing);
+        assert_eq!(store.list_tags().unwrap().len(), 1);
+        assert!(store.orphans().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // Catches drifting list output from the stable header and byte-sorted `TAG\tDIGEST` rows.

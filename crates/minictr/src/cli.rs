@@ -39,6 +39,8 @@ pub enum Command {
 pub enum ImageCommand {
     /// 静的ELFからMiniBundleを構築してstoreへ登録する。
     Build(ImageBuildArgs),
+    /// 複数の静的ELFからv2 MiniBundleを構築する。
+    BuildMulti(ImageBuildMultiArgs),
     /// MiniBundle fileを検証してstoreへ登録する。
     Import(ImageImportArgs),
     /// storeのMiniBundleを検証してfileへ書き出す。
@@ -70,6 +72,39 @@ pub struct ImageBuildArgs {
     pub args: Vec<String>,
     /// `--store`の指定値。`None`なら環境とHOMEから解決する。
     pub store: Option<PathBuf>,
+}
+
+/// multi-image bundle内の一つのimage。入力順がguest PID順になる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInput {
+    /// manifest内のimage名。
+    pub name: String,
+    /// 読み取る静的ELFのpath。
+    pub elf: PathBuf,
+    /// このimageへ渡すguest引数。
+    pub args: Vec<String>,
+}
+
+/// `image build-multi`の型付き引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBuildMultiArgs {
+    /// store内で付けるimage tag。
+    pub image: String,
+    /// 入力順のimage群。
+    pub images: Vec<ImageInput>,
+    /// 明示的なstore path。
+    pub store: Option<PathBuf>,
+}
+
+/// `image build-multi`の解決済み入力。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBuildMulti {
+    /// store内で付けるimage tag。
+    pub image: String,
+    /// 入力順のimage群。
+    pub images: Vec<ImageInput>,
+    /// bundle storeのroot。
+    pub store: PathBuf,
 }
 
 /// `image import`の型付き引数。
@@ -373,6 +408,14 @@ pub enum CliError {
     InvalidInstanceId(String),
     /// `image build`にimageが与えられなかった。
     MissingBuildImage,
+    /// multi-image buildにtagがない。
+    MissingBuildMultiImage,
+    /// image群の数が1から4の範囲外である。
+    InvalidImageCount(usize),
+    /// image名が重複している。
+    DuplicateImageName(String),
+    /// image群より前に引数が指定された。
+    ArgBeforeImage,
     /// `image build`にELF pathが与えられなかった。
     MissingElf,
     /// `image import`にimageが与えられなかった。
@@ -444,6 +487,15 @@ impl fmt::Display for CliError {
             Self::MissingBuildImage => {
                 formatter.write_str("missing image for `minictr image build`")
             }
+            Self::MissingBuildMultiImage => {
+                formatter.write_str("missing tag for `minictr image build-multi`")
+            }
+            Self::InvalidImageCount(count) => write!(
+                formatter,
+                "image build-multi requires 1 to 4 images, got {count}"
+            ),
+            Self::DuplicateImageName(name) => write!(formatter, "duplicate image name: {name}"),
+            Self::ArgBeforeImage => formatter.write_str("--arg requires a preceding --image"),
             Self::MissingElf => formatter.write_str("missing ELF for `minictr image build`"),
             Self::MissingImportImage => {
                 formatter.write_str("missing image for `minictr image import`")
@@ -530,7 +582,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+    "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image build-multi TAG --image NAME ELF [--arg VALUE]... [--image NAME ELF [--arg VALUE]...]... [--store PATH]\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
 }
 
 /// OS引数からcommandをparseする。
@@ -552,6 +604,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
                 .map_err(CliError::NonUtf8Argument)?;
             match subcommand.as_str() {
                 "build" => return parse_image_build(arguments),
+                "build-multi" => return parse_image_build_multi(arguments),
                 "import" => return parse_image_import(arguments),
                 "export" => return parse_image_export(arguments),
                 "list" => return parse_image_list(arguments),
@@ -744,6 +797,80 @@ fn parse_image_build(arguments: impl IntoIterator<Item = OsString>) -> Result<Co
         args,
         store,
     })))
+}
+
+/// image群を入力順に蓄積し、`--arg`を直前のimageへ結び付ける。
+fn parse_image_build_multi(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<Command, CliError> {
+    let mut image = None;
+    let mut images: Vec<ImageInput> = Vec::new();
+    let mut store = None;
+    let mut rest = arguments.into_iter();
+    while let Some(argument) = rest.next() {
+        if is_option(&argument) {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            let (name, inline_value) = match text.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+                None => (text, None),
+            };
+            match name.as_str() {
+                "--store" => {
+                    if store.is_some() {
+                        return Err(CliError::DuplicateOption("--store"));
+                    }
+                    let value = inline_value
+                        .or_else(|| rest.next())
+                        .ok_or(CliError::MissingValue("--store"))?;
+                    store = Some(PathBuf::from(value));
+                }
+                "--image" => {
+                    let value = inline_value
+                        .or_else(|| rest.next())
+                        .ok_or(CliError::MissingValue("--image"))?;
+                    let name = value.into_string().map_err(CliError::NonUtf8Argument)?;
+                    let elf = rest.next().ok_or(CliError::MissingValue("--image ELF"))?;
+                    if images.iter().any(|input| input.name == name) {
+                        return Err(CliError::DuplicateImageName(name));
+                    }
+                    images.push(ImageInput {
+                        name,
+                        elf: PathBuf::from(elf),
+                        args: Vec::new(),
+                    });
+                    if images.len() > 4 {
+                        return Err(CliError::InvalidImageCount(images.len()));
+                    }
+                }
+                "--arg" => {
+                    let input = images.last_mut().ok_or(CliError::ArgBeforeImage)?;
+                    let value = inline_value
+                        .or_else(|| rest.next())
+                        .ok_or(CliError::MissingValue("--arg"))?;
+                    input
+                        .args
+                        .push(value.into_string().map_err(CliError::NonUtf8Argument)?);
+                }
+                unknown => return Err(CliError::UnknownOption(unknown.to_owned())),
+            }
+        } else {
+            let text = argument.into_string().map_err(CliError::NonUtf8Argument)?;
+            if image.replace(text.clone()).is_some() {
+                return Err(CliError::UnexpectedArgument(text));
+            }
+        }
+    }
+    let image = image.ok_or(CliError::MissingBuildMultiImage)?;
+    if images.is_empty() {
+        return Err(CliError::InvalidImageCount(0));
+    }
+    Ok(Command::Image(ImageCommand::BuildMulti(
+        ImageBuildMultiArgs {
+            image,
+            images,
+            store,
+        },
+    )))
 }
 
 /// `image import`の引数をparseする。optionはIMAGEとFILEの前後どこに
@@ -1555,6 +1682,25 @@ pub fn resolve_build(args: &ImageBuildArgs, env: &dyn Environ) -> Result<Resolve
     })
 }
 
+/// parse済みmulti-image buildのstore pathを環境から解決する。
+pub fn resolve_build_multi(
+    args: &ImageBuildMultiArgs,
+    env: &dyn Environ,
+) -> Result<ResolvedBuildMulti, CliError> {
+    let store = match &args.store {
+        Some(path) => path.clone(),
+        None => match env.store_override() {
+            Some(path) => PathBuf::from(path),
+            None => default_store_root(env)?,
+        },
+    };
+    Ok(ResolvedBuildMulti {
+        image: args.image.clone(),
+        images: args.images.clone(),
+        store,
+    })
+}
+
 /// parse済み`image import`引数と環境からstore pathを解決する。
 pub fn resolve_import(
     args: &ImageImportArgs,
@@ -1751,6 +1897,271 @@ mod tests {
                 .into_iter()
                 .map(|argument| OsString::from(argument.as_ref())),
         )
+    }
+
+    #[test]
+    fn recognizes_explicit_multi_image_build() {
+        assert_eq!(
+            parse([
+                "image",
+                "build-multi",
+                "pair",
+                "--image",
+                "first",
+                "./a.elf"
+            ]),
+            Ok(Command::Image(ImageCommand::BuildMulti(
+                ImageBuildMultiArgs {
+                    image: "pair".into(),
+                    images: vec![ImageInput {
+                        name: "first".into(),
+                        elf: "./a.elf".into(),
+                        args: vec![]
+                    }],
+                    store: None,
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn multi_build_preserves_order_grouping_and_literal_values() {
+        let Command::Image(ImageCommand::BuildMulti(args)) = parse([
+            "image",
+            "build-multi",
+            "--store=./store",
+            "pair",
+            "--image=first",
+            "same.elf",
+            "--arg",
+            "--image",
+            "--arg=one",
+            "--image",
+            "second",
+            "same.elf",
+            "--arg",
+            "--store",
+        ])
+        .unwrap() else {
+            panic!("expected multi-image build");
+        };
+        assert_eq!(args.image, "pair");
+        assert_eq!(args.store, Some(PathBuf::from("./store")));
+        assert_eq!(
+            args.images,
+            vec![
+                ImageInput {
+                    name: "first".into(),
+                    elf: "same.elf".into(),
+                    args: vec!["--image".into(), "one".into()]
+                },
+                ImageInput {
+                    name: "second".into(),
+                    elf: "same.elf".into(),
+                    args: vec!["--store".into()]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_build_accepts_four_images_and_store_between_groups() {
+        let Command::Image(ImageCommand::BuildMulti(args)) = parse([
+            "image",
+            "build-multi",
+            "tag",
+            "--image",
+            "one",
+            "--arg",
+            "--store",
+            "--image",
+            "--image",
+            "two",
+            "a",
+            "--image",
+            "three",
+            "a",
+            "--image",
+            "four",
+            "a",
+        ])
+        .unwrap() else {
+            panic!("expected multi-image build");
+        };
+        assert_eq!(args.images.len(), 4);
+        assert_eq!(args.images[0].elf, PathBuf::from("--arg"));
+        assert_eq!(args.store, Some(PathBuf::from("--image")));
+        assert_eq!(
+            args.images
+                .iter()
+                .map(|image| image.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three", "four"]
+        );
+    }
+
+    #[test]
+    fn multi_build_rejects_incomplete_or_ambiguous_groups() {
+        assert_eq!(
+            parse(["image", "build-multi"]),
+            Err(CliError::MissingBuildMultiImage)
+        );
+        assert_eq!(
+            parse(["image", "build-multi", "tag"]),
+            Err(CliError::InvalidImageCount(0))
+        );
+        assert_eq!(
+            parse(["image", "build-multi", "tag", "--image"]),
+            Err(CliError::MissingValue("--image"))
+        );
+        assert_eq!(
+            parse(["image", "build-multi", "tag", "--image", "one"]),
+            Err(CliError::MissingValue("--image ELF"))
+        );
+        assert_eq!(
+            parse(["image", "build-multi", "tag", "--arg", "x"]),
+            Err(CliError::ArgBeforeImage)
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "build-multi",
+                "tag",
+                "--image",
+                "one",
+                "a",
+                "--image=one",
+                "b"
+            ]),
+            Err(CliError::DuplicateImageName("one".into()))
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "build-multi",
+                "tag",
+                "--store=a",
+                "--image",
+                "one",
+                "a",
+                "--store",
+                "b"
+            ]),
+            Err(CliError::DuplicateOption("--store"))
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "build-multi",
+                "tag",
+                "--image",
+                "one",
+                "a",
+                "--arg"
+            ]),
+            Err(CliError::MissingValue("--arg"))
+        );
+        assert_eq!(
+            parse([
+                "image",
+                "build-multi",
+                "tag",
+                "--image",
+                "one",
+                "a",
+                "extra"
+            ]),
+            Err(CliError::UnexpectedArgument("extra".into()))
+        );
+        let mut tokens = vec!["image", "build-multi", "tag"];
+        for name in ["one", "two", "three", "four", "five"] {
+            tokens.extend(["--image", name, "same.elf"]);
+        }
+        assert_eq!(parse(tokens), Err(CliError::InvalidImageCount(5)));
+    }
+
+    #[test]
+    fn multi_build_resolves_store_precedence() {
+        let args = ImageBuildMultiArgs {
+            image: "tag".into(),
+            images: vec![ImageInput {
+                name: "one".into(),
+                elf: "a".into(),
+                args: vec![],
+            }],
+            store: None,
+        };
+        assert_eq!(
+            resolve_build_multi(&args, &home_env()).unwrap().store,
+            PathBuf::from("/home/test/.minicontainer")
+        );
+        let env = FakeEnv {
+            store: Some("override".into()),
+            kernel: None,
+            home: None,
+        };
+        assert_eq!(
+            resolve_build_multi(&args, &env).unwrap().store,
+            PathBuf::from("override")
+        );
+        let explicit = ImageBuildMultiArgs {
+            store: Some("explicit".into()),
+            ..args.clone()
+        };
+        assert_eq!(
+            resolve_build_multi(&explicit, &env).unwrap().store,
+            PathBuf::from("explicit")
+        );
+        assert_eq!(
+            resolve_build_multi(
+                &args,
+                &FakeEnv {
+                    store: None,
+                    kernel: None,
+                    home: None
+                }
+            ),
+            Err(CliError::MissingHome)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_build_preserves_non_utf8_paths_and_rejects_non_utf8_text() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![b'p', 0xff]);
+        let Command::Image(ImageCommand::BuildMulti(args)) = parse_os([
+            "image".into(),
+            "build-multi".into(),
+            "tag".into(),
+            "--image".into(),
+            "one".into(),
+            raw.clone(),
+            "--store".into(),
+            raw.clone(),
+        ])
+        .unwrap() else {
+            panic!("expected multi-image build");
+        };
+        assert_eq!(args.images[0].elf, PathBuf::from(raw.clone()));
+        assert_eq!(args.store, Some(PathBuf::from(raw.clone())));
+        for tail in [
+            vec!["--image".into(), raw.clone(), "a".into()],
+            vec![
+                "--image".into(),
+                "one".into(),
+                "a".into(),
+                "--arg".into(),
+                raw.clone(),
+            ],
+        ] {
+            let mut tokens = vec!["image".into(), "build-multi".into(), "tag".into()];
+            tokens.extend(tail);
+            assert_eq!(
+                parse_os(tokens),
+                Err(CliError::NonUtf8Argument(raw.clone()))
+            );
+        }
     }
 
     struct FakeEnv {
@@ -2259,7 +2670,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+            "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image build-multi TAG --image NAME ELF [--arg VALUE]... [--image NAME ELF [--arg VALUE]...]... [--store PATH]\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
         );
     }
 

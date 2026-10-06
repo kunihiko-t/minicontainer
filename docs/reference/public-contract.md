@@ -25,6 +25,7 @@ command名と引数構文は`minictr help`のusage行が正であり、tracked M
 | `image import` | bundle fileを検証してstoreへ登録する | CI互換性fixture step (ABI v1.0受理)、unit test |
 | `image export` | storeのbundleをbyte一致でfileへ出す | 実QEMU E2Eのcli surface pass、unit test |
 | `image list` | 登録済みimageを列挙する | 実QEMU E2Eのcli surface pass、unit test |
+| `image build-multi` | 入力順にmanifest v2のbundleを構築して登録する | CLI unit test、候補kernelの実QEMU E2E |
 | `image inspect` | imageのdigestとmanifest情報を出す | 実QEMU E2E、CI OCI step、unit test |
 | `image remove` | imageをstoreから消す | 実QEMU E2Eのcli surface pass、unit test |
 | `image prune` | 参照されないimageを消す。`--dry-run`と`--force`を持つ | 実QEMU E2Eのcli surface pass、unit test |

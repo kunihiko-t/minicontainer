@@ -5,7 +5,7 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`ps`、`stop`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`ps`、`stop`、`doctor`、`image build`、`image build-multi`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
@@ -13,6 +13,7 @@ usage: minictr ps [--store PATH]
 usage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
+usage: minictr image build-multi TAG --image NAME ELF [--arg VALUE]... [--image NAME ELF [--arg VALUE]...]... [--store PATH]
 usage: minictr image import [--store PATH] IMAGE FILE
 usage: minictr image export [--store PATH] IMAGE --output PATH
 usage: minictr image list [--store PATH]
@@ -71,7 +72,7 @@ DIRもOS pathとして非UTF-8 byteを透過的に扱う。
 省略時の解決順は、明示option、環境変数`MINICTR_STORE`と`MINICTR_KERNEL`、既定pathである。
 既定のstoreは`$HOME/.minicontainer`、既定のkernelはその下の`minios-kernel`である。
 `HOME`がなく既定pathを作れない場合は型付きerrorになる。
-`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`のstore解決も同じ順序を使う。
+`image build`、`image build-multi`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`のstore解決も同じ順序を使う。
 `ps`も同じ順序でstoreを解決する。
 `stop`も同じ順序でstoreを解決し、`--timeout-ms`は`run`と同じ検証を受ける。
 `doctor`も`run`と同じ順序でstoreとkernelを解決する。
@@ -325,3 +326,27 @@ subcommandとflag、stdout契約行、終了codeの変更規則は[互換性と�
 ゲスト自身も2や125を返せるため、終了コードだけでは使い方の誤りやホスト側の失敗と区別できない。
 `minictr:`という文字列もゲストが出力できるので、接頭辞は調査の手掛かりとして使う。
 プログラムから失敗を厳密に区別する場合は、Rust APIの`Result`とエラー型を使う。
+
+## 複数imageのbundleを構築する
+
+```sh
+minictr image build-multi tasks --image fault ./fault.elf --arg illegal --image survivor ./survivor.elf
+minictr image export tasks --output ./tasks.mcb
+minictr run --kernel ./candidate-kernel tasks
+```
+
+`--image NAME ELF`を1〜4回指定し、`--arg VALUE`は直前のimageへ格納する。
+入力順が初期PID順であり、同名imageと`--image`より前の`--arg`は終了code 2で拒否する。
+同じELFを異なるimage名で再利用できる。tagの置換と成功行`TAG sha256:DIGEST`は既存buildと同じである。
+`--store`は任意の位置に1回指定でき、明示値・環境・HOMEの既存優先順に従う。
+消費するNAME/ELF/arg値はoptionに似た文字列でも値として扱う。`--image=NAME ELF`、`--arg=VALUE`も使える。
+
+このcommandは1 imageでも明示的にmanifest v2を作る。既存`image build IMAGE ELF`はv1のbytesと操作を維持する。
+ELFはOS pathとして非UTF8や空白を含めて扱い、通常fileへ解決するsymlinkも許可する。
+directoryとFIFOなどの特殊file、欠落path、空ELF、不正な名前・引数、manifest上限、合計bundle 6 MiB超過は終了code 125になる。
+全入力を上限付きで読み、bundle検証に成功するまでstoreを変更しない。
+ELF中身のload可否は既存buildと同じくMiniOS loaderで検査する。
+同じ名前・引数・ELF bytes・順序ならpath表記に関係なく同じbundle bytes/digestになる。
+
+共有stdout/stderr、PID別結果と最終code、対応kernel、foregroundのみという制約は
+[複数task実行](../reference/multi-task.md)を参照する。
