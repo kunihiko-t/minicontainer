@@ -3149,13 +3149,13 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    // 通常fileへ解決するsymlinkと非UTF8 pathを許可し、directory/FIFOは待たずに拒否する。
+    // 通常fileへ解決するsymlinkと空白pathを許可し、directory/FIFOは待たずに拒否する。
     #[test]
     #[cfg(unix)]
     fn multi_build_handles_os_paths_and_rejects_special_files() {
-        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+        use std::os::unix::fs::symlink;
         let root = temp_store_root("multi-build-os-paths");
-        let elf = root.join(OsString::from_vec(b"elf-\xff".to_vec()));
+        let elf = root.join("elf with spaces");
         let link = root.join("symlink");
         let fifo = root.join("fifo");
         std::fs::write(&elf, b"ELF").unwrap();
@@ -3201,6 +3201,46 @@ mod tests {
                 .manifest
                 .version(),
             2
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Linuxのfilesystem上で非UTF8 filenameを実際に読めることを確認する。
+    // macOS CIではfilename作成自体がEILSEQになるため、pathのbyte保持は
+    // Unix共通のparser test、特殊file/symlinkは上の共通testで検証する。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn multi_build_reads_non_utf8_filenames_on_linux() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = temp_store_root("multi-build-non-utf8");
+        let elf = root.join(OsString::from_vec(b"elf-\xff".to_vec()));
+        std::fs::write(&elf, b"ELF").unwrap();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            real_main(
+                [
+                    "image".into(),
+                    "build-multi".into(),
+                    "tasks".into(),
+                    "--store".into(),
+                    root.clone().into_os_string(),
+                    "--image".into(),
+                    "first".into(),
+                    elf.into_os_string(),
+                ],
+                &UnusedEnv,
+                &mut Vec::new(),
+                &mut stderr
+            ),
+            0,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            parse(&Store::new(&root).unwrap().resolve("tasks").unwrap())
+                .unwrap()
+                .elf,
+            b"ELF"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

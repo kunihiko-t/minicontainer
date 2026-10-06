@@ -343,6 +343,7 @@ minictr run --kernel ./candidate-kernel tasks
 
 このcommandは1 imageでも明示的にmanifest v2を作る。既存`image build IMAGE ELF`はv1のbytesと操作を維持する。
 ELFはOS pathとして非UTF8や空白を含めて扱い、通常fileへ解決するsymlinkも許可する。
+filenameの作成・読み取り可否はfilesystemに従う。
 directoryとFIFOなどの特殊file、欠落path、空ELF、不正な名前・引数、manifest上限、合計bundle 6 MiB超過は終了code 125になる。
 全入力を上限付きで読み、bundle検証に成功するまでstoreを変更しない。
 ELF中身のload可否は既存buildと同じくMiniOS loaderで検査する。
