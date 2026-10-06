@@ -23,6 +23,82 @@ pub(crate) fn encode_manifest(spec: &ImageSpec<'_>) -> Result<Vec<u8>, BundleErr
     Ok(bytes)
 }
 
+pub(crate) fn encode_multi(specs: &[ImageSpec<'_>]) -> Result<(Vec<u8>, usize), BundleError> {
+    use minios_abi::manifest::IMAGE_MAX_COUNT;
+    if specs.is_empty() {
+        return Err(BundleError::Manifest(ManifestError::MissingImage));
+    }
+    if specs.len() > IMAGE_MAX_COUNT {
+        return Err(BundleError::Manifest(ManifestError::TooManyImages));
+    }
+    let mut encoded_len = VERSION_LINE.len();
+    let mut elf_len = 0usize;
+    for spec in specs {
+        let single_len = preflight_manifest_len(spec)?;
+        if spec.name.is_empty() {
+            return Err(BundleError::Manifest(ManifestError::EmptyName));
+        }
+        if !spec
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(BundleError::Manifest(ManifestError::InvalidName));
+        }
+        if spec.elf.is_empty() {
+            return Err(BundleError::Manifest(ManifestError::MalformedElf));
+        }
+        // v1のversion行を除き、name=をimage=へ置換し、elf行を加える。
+        encoded_len = encoded_len
+            .checked_add(single_len - VERSION_LINE.len() + 1)
+            .and_then(|len| len.checked_add(6 + decimal_len(elf_len) + decimal_len(spec.elf.len())))
+            .ok_or(BundleError::LengthOverflow)?;
+        if encoded_len > MANIFEST_MAX_LEN {
+            return Err(BundleError::Manifest(ManifestError::TooLong));
+        }
+        elf_len = elf_len
+            .checked_add(spec.elf.len())
+            .ok_or(BundleError::LengthOverflow)?;
+    }
+    // manifestもpayloadも上限を確認してから、可変長領域を確保する。
+    let prefix_len = crate::BOOT_HEADER_LEN
+        .checked_add(encoded_len)
+        .ok_or(BundleError::LengthOverflow)?;
+    let padding_len = (8 - prefix_len % 8) % 8;
+    let total_len = prefix_len
+        .checked_add(padding_len)
+        .and_then(|len| len.checked_add(elf_len))
+        .ok_or(BundleError::LengthOverflow)?;
+    if u64::try_from(total_len).map_err(|_| BundleError::LengthOverflow)? > crate::MAX_BUNDLE_LEN {
+        return Err(BundleError::TooLarge);
+    }
+    let mut bytes = Vec::with_capacity(encoded_len);
+    bytes.extend_from_slice(b"version=2\n");
+    let mut offset = 0usize;
+    for spec in specs {
+        bytes.extend_from_slice(b"image=");
+        bytes.extend_from_slice(spec.name.as_bytes());
+        bytes.push(b'\n');
+        for argument in spec.args {
+            bytes.extend_from_slice(ARG_PREFIX);
+            bytes.extend_from_slice(argument.as_bytes());
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(format!("elf={offset},{}\n", spec.elf.len()).as_bytes());
+        offset += spec.elf.len();
+    }
+    Manifest::parse(&bytes).map_err(BundleError::Manifest)?;
+    Ok((bytes, elf_len))
+}
+
+fn decimal_len(value: usize) -> usize {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
+}
+
 fn preflight_manifest_len(spec: &ImageSpec<'_>) -> Result<usize, BundleError> {
     if spec.name.len() > NAME_MAX_LEN {
         return Err(BundleError::Manifest(ManifestError::NameTooLong));
@@ -46,6 +122,9 @@ fn preflight_manifest_len(spec: &ImageSpec<'_>) -> Result<usize, BundleError> {
         }
         if argument.as_bytes().contains(&b'\n') {
             return Err(BundleError::ArgumentContainsLf { index });
+        }
+        if argument.as_bytes().contains(&0) {
+            return Err(BundleError::Manifest(ManifestError::ArgumentContainsNul));
         }
         if argument.as_bytes().contains(&b'\r') {
             return Err(BundleError::Manifest(

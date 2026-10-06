@@ -143,6 +143,8 @@ elf-bytes: 4096
 ```
 
 manifest引数の内容は表示せず、件数だけを表示する。
+manifest v2では`name`と`args`は先頭imageの情報、`elf-bytes`は全imageのELF領域合計である。
+複数taskのforeground実行は[実行契約](../reference/multi-task.md)を参照する。
 未参照のtagは一覧に出るが、同じtagのinspectは`resolve`経由で失敗する。
 
 ## instanceの確認

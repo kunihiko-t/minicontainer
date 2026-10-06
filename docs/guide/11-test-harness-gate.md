@@ -141,3 +141,11 @@ Linux containerのPID 1には孤児processを回収するinitを用意する。
 各iterationのあとでQEMU processと`minicontainer-run-*` payload directoryの残留を検査する。
 失敗は`stress <scenario> iteration <n> failed: <原因>`の形で、scenario名・iteration番号・残留対象つきで報告する。
 節の終わりに、共有storeの`run/`にinstance state fileが残っていないこと、`ps`がinstance行を出さないこと、QEMUとpayloadの差分が開始時snapshotからゼロであることを確認する。
+
+## 明示リビジョンでの複数task検査
+
+`cargo xtask compat --minios-rev 086f2e3fa54f751cd28c5fcd2bed205830bd2934 --multi`は、
+通常のhost検査とv1 E2Eに加え、illegal instructionとstore faultでPID 0がcode 70になった後も
+PID 1が出力を継続してcode 7で終了することを公開CLI経由で検査する。
+QEMUと一時fileの回収も検査する。Ubuntu CIはこの明示SHAを検証用に固定する。
+リリースkernelの固定SHAは変更しない。詳細は[複数task実行](../reference/multi-task.md)を参照する。

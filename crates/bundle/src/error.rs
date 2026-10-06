@@ -18,6 +18,8 @@ pub enum BundleError {
     DigestMismatch,
     /// Alignment padding contains a non-zero byte.
     NonZeroPadding,
+    /// imageの相対ELF範囲がbundleのELF領域に収まらない。
+    ElfRangeOutOfBounds { index: usize },
     /// A source argument contains LF and would encode as multiple manifest lines.
     ArgumentContainsLf { index: usize },
 }
@@ -35,6 +37,10 @@ impl fmt::Display for BundleError {
             ),
             Self::DigestMismatch => formatter.write_str("MiniBundle SHA-256 digest mismatch"),
             Self::NonZeroPadding => formatter.write_str("MiniBundle alignment padding is not zero"),
+            Self::ElfRangeOutOfBounds { index } => write!(
+                formatter,
+                "MiniBundle image {index} ELF range exceeds the ELF region"
+            ),
             Self::ArgumentContainsLf { index } => write!(
                 formatter,
                 "MiniBundle argument {index} contains LF and is not canonically encodable"

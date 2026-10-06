@@ -15,3 +15,6 @@ libc = "0.2"
 minicontainer-bundle = { path = "../bundle" }
 minicontainer-oci = { path = "../oci" }
 minicontainer-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+minios-abi.workspace = true

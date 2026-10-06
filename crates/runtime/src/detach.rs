@@ -109,7 +109,13 @@ impl<D: DetachBackend> DetachedRuntime<D> {
         let deadline = Instant::now()
             .checked_add(request.deadline)
             .ok_or(RuntimeError::InvalidDeadline)?;
-        minicontainer_bundle::parse(request.bundle).map_err(RuntimeError::Bundle)?;
+        let bundle = minicontainer_bundle::parse(request.bundle).map_err(RuntimeError::Bundle)?;
+        if bundle.manifest.version() == 2 {
+            return Err(RuntimeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "manifest v2 currently requires foreground execution",
+            )));
+        }
         let payload = PayloadTemp::create(request.bundle)?;
         let logs = DetachLogs {
             uart: payload.root().join("uart.log"),
@@ -985,6 +991,34 @@ mod tests {
             "expected an instance error, got {error:?}"
         );
         assert_eq!(trace.borrow().as_slice(), ["spawn", "reap"]);
+        assert!(dir.list().unwrap().is_empty());
+    }
+
+    // v2拒否ではprocess、payload、instanceを作らない。
+    #[test]
+    fn multi_bundle_is_rejected_before_detached_side_effects() {
+        let root = TempRoot::create();
+        let dir = InstanceDir::open(&root.0).unwrap();
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = captured_root();
+        let runtime = DetachedRuntime::new(FakeDetachBackend::new(
+            trace.clone(),
+            payload.clone(),
+            Rc::new(RefCell::new(None)),
+        ));
+        let bundle = minicontainer_bundle::build_multi(&[minicontainer_bundle::ImageSpec {
+            name: "task",
+            args: &[],
+            elf: b"ELF",
+        }])
+        .unwrap();
+        let program = helper_program();
+        assert!(matches!(
+            runtime.run(detached_request(&bundle, &dir, program.as_os_str(), None)),
+            Err(RuntimeError::Io(_))
+        ));
+        assert!(trace.borrow().is_empty());
+        assert!(payload.borrow().is_none());
         assert!(dir.list().unwrap().is_empty());
     }
 

@@ -67,7 +67,8 @@ importとimport-ociは検証済みのlayer bytesをそのまま格納し、store
 
 hostとguestは`abi_major`の一致を必須とし、hostは`guest minor ≤ host minor`を受理する。
 stdin転送はminor 1以上のguestでだけ有効であり、ABI v1.0のguestへstdin入力を要求したrunは起動前に型付きerrorで失敗する。
-manifest v2と`ProcExit` frameはframe集合に含まれるが現行runtimeでは受理しない。
+manifest v2はforeground実行で受理し、ABI minor 2以上の`Ready`とPID別`ProcExit`を必須とする。
+終了codeの集約と制約は[複数task実行](multi-task.md)を参照する。
 
 | 検証根拠 | 保証 |
 | --- | --- |

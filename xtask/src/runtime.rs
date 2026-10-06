@@ -253,6 +253,186 @@ pub(crate) fn run_compat(workspace: &Path, revision: &str) -> Result<String, E2E
     run_revision_e2e(workspace, revision, true)
 }
 
+/// multi-task fault分離を実装したMiniOS #88の統合commit。
+pub const MINIOS_MULTI_MIN_REV: &str = "805e6cc1c44da516d6a8b66028aa328893341a21";
+
+/// 既存E2Eの成功後、公開CLI経由でmulti-task fault分離を検証する。
+pub(crate) fn run_compat_multi(workspace: &Path, revision: &str) -> Result<String, E2EError> {
+    let mut preparation = String::new();
+    let checkout = match std::env::var_os("MINICTR_E2E_MINIOS_DIR") {
+        Some(path) => {
+            let directory = PathBuf::from(path);
+            if !directory.is_absolute() {
+                return Err(E2EError::Store(
+                    "MINICTR_E2E_MINIOS_DIRは絶対pathで指定してください".into(),
+                ));
+            }
+            directory
+        }
+        None => {
+            let directory = workspace
+                .join("target/compat")
+                .join(revision)
+                .join("minios");
+            prepare_checkout(
+                &directory,
+                &mut |line| {
+                    preparation.push_str(line);
+                    preparation.push('\n');
+                },
+                MINIOS_REPO_URL,
+                revision,
+            )?;
+            directory
+        }
+    };
+    verify_checkout_rev(&checkout, revision)?;
+    verify_clean_checkout(&checkout)?;
+    verify_multi_ancestor(&checkout, revision, MINIOS_MULTI_MIN_REV)?;
+    let mut transcript = preparation;
+    transcript.push_str(&run_compat(workspace, revision)?);
+    let kernel = ensure_kernel(workspace, revision, true, &mut |_| {})?;
+    verify_checkout_rev(&checkout, revision)?;
+    verify_clean_checkout(&checkout)?;
+    let target = workspace
+        .join("target/compat")
+        .join(revision)
+        .join("multi-guest-target");
+    run_checked(
+        "cargo",
+        &multi_guest_build_args(&target),
+        Some(&checkout),
+        &[],
+        KERNEL_BUILD_TIMEOUT,
+    )?;
+    verify_clean_checkout(&checkout)?;
+    let guest_root = target.join(RISCV_TARGET).join("debug");
+    let fault = read_guest_fixture(&guest_root.join("minios-guest-proc-fault"))?;
+    let survivor = read_guest_fixture(&guest_root.join("minios-guest-sched-b"))?;
+    let minictr = workspace.join("target/debug/minictr");
+    for mode in ["illegal", "store"] {
+        let report = run_multi_fault_path(&minictr, &kernel, &fault, &survivor, mode)?;
+        transcript.push_str(&format!("e2e: multi-task {mode}分離成功 (pid0=70, pid1=7, b3到達, minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)\n", report.minictr_pid, report.qemu_before, report.qemu_after, report.elapsed.as_secs_f64()));
+    }
+    Ok(transcript)
+}
+
+fn verify_multi_ancestor(checkout: &Path, revision: &str, required: &str) -> Result<(), E2EError> {
+    run_checked(
+        "git",
+        &[
+            OsString::from("-C"),
+            checkout.as_os_str().to_owned(),
+            OsString::from("merge-base"),
+            OsString::from("--is-ancestor"),
+            OsString::from(required),
+            OsString::from(revision),
+        ],
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|error| {
+        E2EError::Store(format!(
+            "multi-task E2EにはMiniOS #88 ({required})の子孫revisionが必要です: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn multi_guest_build_args(target: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
+        "build",
+        "-p",
+        "minios-guest",
+        "--bin",
+        "minios-guest-proc-fault",
+        "--bin",
+        "minios-guest-sched-b",
+        "--target",
+        RISCV_TARGET,
+        "--locked",
+        "--target-dir",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.push(target.as_os_str().to_owned());
+    args
+}
+
+fn read_guest_fixture(path: &Path) -> Result<Vec<u8>, E2EError> {
+    std::fs::read(path).map_err(|_| E2EError::MissingGuestElf(path.to_owned()))
+}
+
+fn run_multi_fault_path(
+    minictr: &Path,
+    kernel: &Path,
+    fault: &[u8],
+    survivor: &[u8],
+    mode: &str,
+) -> Result<CaseReport, E2EError> {
+    let bytes = minicontainer_bundle::build_multi(&[
+        minicontainer_bundle::ImageSpec {
+            name: "fault",
+            args: &[mode],
+            elf: fault,
+        },
+        minicontainer_bundle::ImageSpec {
+            name: "survivor",
+            args: &[],
+            elf: survivor,
+        },
+    ])
+    .map_err(|error| E2EError::Store(error.to_string()))?;
+    let scratch = TempDir::create("minictr-e2e-multi-")?;
+    let bundle = scratch.path().join("multi.mcb");
+    std::fs::write(&bundle, bytes).map_err(|error| E2EError::Store(error.to_string()))?;
+    let store = TempStore::empty();
+    run_checked(
+        minictr,
+        &minictr_image_args(
+            &store.path,
+            "import",
+            &[OsString::from(E2E_IMAGE), bundle.as_os_str().to_owned()],
+        ),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    let report = run_case_in_store(minictr, store, kernel, HAPPY_PATH_TIMEOUT_MS)?;
+    check_multi_fault_result(report.status, &report.stdout, &report.stderr)?;
+    let scratch_path = scratch.path().to_owned();
+    drop(scratch);
+    if scratch_path.exists() {
+        return Err(E2EError::Store(format!(
+            "multi-task fixture directoryが残留しました: {}",
+            scratch_path.display()
+        )));
+    }
+    Ok(report)
+}
+
+fn check_multi_fault_result(
+    status: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), E2EError> {
+    let expected_stderr = b"minictr: process pid=0 code=70\nminictr: process pid=1 code=7\n";
+    if status != Some(70) || stdout != b"b1\nb2\nb3\n" || stderr != expected_stderr {
+        return Err(E2EError::UnexpectedRun {
+            case: "multi-task fault分離",
+            expected: "exit 70、b1/b2/b3、pid0=70とpid1=7の結果行".into(),
+            actual: format!(
+                "status {status:?}, stdout {:?}, stderr {:?}",
+                String::from_utf8_lossy(stdout),
+                String::from_utf8_lossy(stderr)
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn run_revision_e2e(
     workspace: &Path,
     revision: &str,
@@ -3123,6 +3303,68 @@ mod tests {
         assert!(!workspace.path().join("target/e2e/minios").exists());
     }
 
+    /// 対象commitを含まないrevisionと欠けたcommitをQEMU起動前に拒否する。
+    #[test]
+    fn multi_revision_requires_the_fault_isolation_ancestor() {
+        let source = TempDir::create("minictr-multi-gate-").unwrap();
+        let old = commit_fixture(source.path(), "old");
+        let required = commit_fixture(source.path(), "fault isolation");
+        let selected = commit_fixture(source.path(), "candidate");
+        verify_multi_ancestor(source.path(), &selected, &required).unwrap();
+        verify_multi_ancestor(source.path(), &required, &required).unwrap();
+        let error = verify_multi_ancestor(source.path(), &old, &required).unwrap_err();
+        assert!(error.to_string().contains("子孫revisionが必要"));
+        assert!(verify_multi_ancestor(source.path(), &selected, &"0".repeat(40)).is_err());
+        assert_eq!(git_head(source.path()), selected);
+        verify_clean_checkout(source.path()).unwrap();
+    }
+
+    /// 候補guest buildは指定targetへ隔離し、lockfileと二つのfixtureを選ぶ。
+    #[test]
+    fn multi_guest_plan_selects_existing_fixtures_and_isolates_target() {
+        let target = Path::new("/workspace/target/compat/candidate/multi-guest-target");
+        assert_eq!(
+            multi_guest_build_args(target),
+            [
+                "build",
+                "-p",
+                "minios-guest",
+                "--bin",
+                "minios-guest-proc-fault",
+                "--bin",
+                "minios-guest-sched-b",
+                "--target",
+                RISCV_TARGET,
+                "--locked",
+                "--target-dir",
+                target.to_str().unwrap(),
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    /// 全taskの結果とsurvivor最終出力を要求し、集約codeだけで成功にしない。
+    #[test]
+    fn multi_fault_result_requires_survival_and_both_process_results() {
+        let stdout = b"b1\nb2\nb3\n";
+        let stderr = b"minictr: process pid=0 code=70\nminictr: process pid=1 code=7\n";
+        check_multi_fault_result(Some(70), stdout, stderr).unwrap();
+        assert!(check_multi_fault_result(Some(7), stdout, stderr).is_err());
+        assert!(check_multi_fault_result(Some(70), b"b1\nb2\n", stderr).is_err());
+        assert!(
+            check_multi_fault_result(Some(70), stdout, b"minictr: process pid=0 code=70\n")
+                .is_err()
+        );
+        assert!(
+            check_multi_fault_result(
+                Some(70),
+                stdout,
+                b"minictr: process pid=0 code=70\nminictr: process pid=1 code=0\n"
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn docs_name_the_pinned_kernel_revision() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -3145,9 +3387,23 @@ mod tests {
                 if !text.to_ascii_lowercase().contains("minios") {
                     continue;
                 }
+                // 明示compat commandの候補SHAはrelease pinとは独立である。
+                // 同じ行の他のSHAは引き続きrelease pinとして検査する。
+                let compatibility_revision = text
+                    .split_once("cargo xtask compat --minios-rev ")
+                    .and_then(|(_, arguments)| arguments.split_whitespace().next())
+                    .filter(|revision| {
+                        revision.len() == 40
+                            && revision
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    });
                 for token in text.split(|c: char| !c.is_ascii_hexdigit() || c.is_ascii_uppercase())
                 {
-                    if token.len() == 40 && token != MINIOS_KERNEL_REV {
+                    if token.len() == 40
+                        && token != MINIOS_KERNEL_REV
+                        && Some(token) != compatibility_revision
+                    {
                         stale.push(format!("{}:{}: {token}", relative.display(), line + 1));
                     }
                 }
