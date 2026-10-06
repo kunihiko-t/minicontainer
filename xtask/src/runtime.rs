@@ -81,11 +81,12 @@ const INTERRUPT_BOOT_TIMEOUT: Duration = Duration::from_secs(20);
 const INTERRUPT_SETTLE: Duration = Duration::from_secs(2);
 /// SIGINT後の`minictr`終了を待つ上限。
 const INTERRUPT_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
-/// stress節の反復回数。全scenario合計21回、E2E全体に数十秒を足す量に抑える。
+/// stress節の反復回数。全scenario合計26回、E2E全体に数十秒を足す量に抑える。
 const STRESS_RUN_ITERS: usize = 5;
 const STRESS_TIMEOUT_ITERS: usize = 5;
 const STRESS_SIGNAL_ITERS: usize = 3;
 const STRESS_DETACH_ITERS: usize = 3;
+const STRESS_DETACH_EXIT_ITERS: usize = 5;
 const STRESS_CRASH_ITERS: usize = 2;
 /// stress節で回転するguestのimage tag。`hello`は正常終了するguestへ使う。
 const E2E_SPIN_IMAGE: &str = "spin";
@@ -2468,10 +2469,11 @@ fn check_ps_rows_empty(minictr: &Path, store: &Path) -> Result<(), E2EError> {
     Ok(())
 }
 
-/// 反復起動・timeout・signal・detach・crashの各scenarioを一つの共有storeへ
-/// bounded回だけ実行する。累積漏れを見るため、instance stateとps行は節の
-/// 終わりにまとめて検査し、各iterationではQEMUとpayloadの残留だけを
-/// iteration番号つきで報告する。
+/// 反復起動・timeout・signal・detach・crashの各scenarioを共有storeへ
+/// bounded回だけ実行する。短いguestのdetached終了は独立storeで反復し、
+/// READY通知とQEMU終了の競合も検査する。共有storeの累積漏れを見るため、
+/// instance stateとps行は節の終わりにまとめて検査し、各iterationでは
+/// QEMUとpayloadの残留をiteration番号つきで報告する。
 fn run_stress(minictr: &Path, kernel: &Path, workspace: &Path) -> Result<String, E2EError> {
     let elf = workspace.join(GUEST_HELLO_ELF);
     let hello_elf = std::fs::read(&elf).map_err(|_| E2EError::MissingGuestElf(elf.clone()))?;
@@ -2519,6 +2521,11 @@ fn run_stress(minictr: &Path, kernel: &Path, workspace: &Path) -> Result<String,
             .and_then(|()| check_stress_leftovers(&baseline));
         stress_iter("detach", iteration, outcome)?;
     }
+    for iteration in 0..STRESS_DETACH_EXIT_ITERS {
+        let outcome = run_detached_exit_path(minictr, kernel, workspace)
+            .and_then(|_| check_stress_leftovers(&baseline));
+        stress_iter("detached exit", iteration, outcome)?;
+    }
     for iteration in 0..STRESS_CRASH_ITERS {
         let outcome = stress_crash_once(minictr, &store_path, kernel, &baseline.qemu)
             .and_then(|()| check_stress_leftovers(&baseline));
@@ -2539,6 +2546,7 @@ fn run_stress(minictr: &Path, kernel: &Path, workspace: &Path) -> Result<String,
         + STRESS_TIMEOUT_ITERS
         + 2 * STRESS_SIGNAL_ITERS
         + STRESS_DETACH_ITERS
+        + STRESS_DETACH_EXIT_ITERS
         + STRESS_CRASH_ITERS;
     Ok(format!(
         "{total} iterations in {:.1}s",

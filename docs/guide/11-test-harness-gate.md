@@ -130,12 +130,14 @@ Linux containerのPID 1には孤児processを回収するinitを用意する。
 
 単発経路のあと、一つの共有storeに対して反復と中断のscenarioをbounded回だけ実行する。
 `hello`と`spin`の二つのtagを同じstoreへ登録し、全scenarioが同じ`run/` state directoryを使う。
+短命guestのdetached exitだけはiterationごとに独立storeを使い、既存の終了・回収検査を再利用する。
 反復数は次のとおりであり、全体で数十秒に収まる。
 
 - foreground: 5回。`run hello`が終了code 42を返す。
 - timeout: 5回。`run spin`が800 msの期限で125を返す。
 - SIGINTとSIGTERM: 各3回。回転中のrunへsignalを送り、125とsignal名の診断を確認する。
 - detach: 3回。`run --detach`のidを`stop`で回収する。
+- detached exit: 5回。短命の`hello`を`run --detach`で起動し、READYによる起動成功、stale instanceと`stop`による回収を確認する。
 - crash: 2回。`minictr`をSIGKILLし、孤児QEMUを殺したあと`stop`がstale instanceを回収する。
 
 各iterationのあとでQEMU processと`minicontainer-run-*` payload directoryの残留を検査する。

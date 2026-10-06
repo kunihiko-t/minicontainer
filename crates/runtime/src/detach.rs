@@ -209,7 +209,8 @@ impl<D: DetachBackend> DetachedRuntime<D> {
                 let _ = child.send_signal(observation.first);
                 return Err(RuntimeError::Interrupted(observation.first));
             }
-            if let Some(status) = child.try_wait().map_err(RuntimeError::Process)? {
+            let exit_status = child.try_wait().map_err(RuntimeError::Process)?;
+            if let Some(status) = exit_status.filter(|status| !status.success) {
                 return Err(RuntimeError::DetachedBoot {
                     status,
                     diagnostics: read_diagnostics(&logs.diagnostics),
@@ -227,6 +228,14 @@ impl<D: DetachBackend> DetachedRuntime<D> {
                     }
                 }
                 Err(error) => return Err(RuntimeError::Io(error)),
+            }
+            // 正常終了の観測後にも最後のUARTを読む。短命guestのREADYを失わず、
+            // READYのない終了とQEMUの異常終了は従来どおり起動失敗にする。
+            if let Some(status) = exit_status {
+                return Err(RuntimeError::DetachedBoot {
+                    status,
+                    diagnostics: read_diagnostics(&logs.diagnostics),
+                });
             }
             thread::sleep(HANDSHAKE_POLL);
         }
@@ -405,7 +414,10 @@ impl Drop for SystemDetachedChild {
 
 #[cfg(test)]
 mod tests {
-    use super::{DetachBackend, DetachLogs, DetachRequest, DetachedChild, DetachedRuntime};
+    use super::{
+        DetachBackend, DetachLogs, DetachRequest, DetachedChild, DetachedRuntime,
+        SystemDetachedChild,
+    };
     use crate::{
         HostSignal, InstanceDir, InstanceRegistration, InstanceRow, InstanceStatus,
         InterruptSource, ProcessError, ProcessStatus, QemuCommand, QemuResources, RuntimeError,
@@ -420,7 +432,7 @@ mod tests {
         process::{Child, Command, Stdio},
         rc::Rc,
         sync::atomic::{AtomicU64, Ordering},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     const HELPER_ENV: &str = "MINICONTAINER_INSTANCE_HELPER";
@@ -432,6 +444,12 @@ mod tests {
     fn instance_helper() {
         match env::var(HELPER_ENV).as_deref() {
             Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
+            Ok("ready-exit") => {
+                let path = env::var_os("MINICONTAINER_HELPER_UART").unwrap();
+                let mut bytes = ready_frame();
+                bytes.extend(frame(FrameKind::Exit, &42u32.to_le_bytes()));
+                fs::write(path, bytes).unwrap();
+            }
             mode => panic!("unknown instance helper mode: {mode:?}"),
         }
     }
@@ -761,6 +779,152 @@ mod tests {
             !payload.exists(),
             "stop must remove the persisted payload dir"
         );
+    }
+
+    /// await_readyの境界だけを検査し、spawnや登録は既存run testへ委ねる。
+    struct HandshakeOnly<C>(std::marker::PhantomData<C>);
+    impl<C: DetachedChild> DetachBackend for HandshakeOnly<C> {
+        type Child = C;
+        fn spawn(&self, _: &QemuCommand, _: &DetachLogs) -> Result<C, ProcessError> {
+            panic!("handshake test must not spawn through this backend")
+        }
+    }
+
+    // 実processがREADYとExitを書いて終了済みでも、未読UARTのREADYで起動を確認する。
+    #[test]
+    #[cfg(unix)]
+    fn ready_from_an_already_exited_process_is_not_lost() {
+        let root = TempRoot::create();
+        let logs = DetachLogs {
+            uart: root.0.join("uart.log"),
+            diagnostics: root.0.join("qemu.log"),
+        };
+        let child = Command::new(env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "detach::tests::instance_helper"])
+            .env(HELPER_ENV, "ready-exit")
+            .env("MINICONTAINER_HELPER_UART", &logs.uart)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = SystemDetachedChild {
+            child,
+            reaped_status: None,
+        };
+        assert!(child.child.wait().unwrap().success());
+        let runtime = DetachedRuntime::new(HandshakeOnly::<SystemDetachedChild>(
+            std::marker::PhantomData,
+        ));
+        runtime
+            .await_ready(
+                &mut child,
+                &logs,
+                Instant::now() + Duration::from_secs(1),
+                None,
+            )
+            .unwrap();
+    }
+
+    // 最後のUART bytesが終了観測と同時に可視化される境界をsleepなしで再現する。
+    struct FinalUartOnExit {
+        uart: PathBuf,
+        bytes: Vec<u8>,
+        polls: usize,
+        status: ProcessStatus,
+    }
+    impl DetachedChild for FinalUartOnExit {
+        fn id(&self) -> u32 {
+            1
+        }
+        fn try_wait(&mut self) -> Result<Option<ProcessStatus>, ProcessError> {
+            self.polls += 1;
+            fs::write(&self.uart, &self.bytes).unwrap();
+            Ok(Some(self.status))
+        }
+        fn send_signal(&mut self, _: HostSignal) -> Result<(), ProcessError> {
+            panic!("not expected")
+        }
+        fn terminate_and_reap(&mut self) -> Result<ProcessStatus, ProcessError> {
+            panic!("not expected")
+        }
+        fn release(self) {
+            panic!("not expected")
+        }
+    }
+
+    #[test]
+    fn final_ready_written_during_exit_observation_is_read() {
+        let root = TempRoot::create();
+        let logs = DetachLogs {
+            uart: root.0.join("uart.log"),
+            diagnostics: root.0.join("qemu.log"),
+        };
+        let runtime =
+            DetachedRuntime::new(HandshakeOnly::<FinalUartOnExit>(std::marker::PhantomData));
+        // 元の「終了なら即error」と、単なる「先にreadしてから終了確認」の両方を検出する。
+        for _ in 0..32 {
+            let _ = fs::remove_file(&logs.uart);
+            let mut child = FinalUartOnExit {
+                uart: logs.uart.clone(),
+                bytes: ready_frame(),
+                polls: 0,
+                status: ProcessStatus {
+                    code: Some(0),
+                    success: true,
+                },
+            };
+            runtime
+                .await_ready(
+                    &mut child,
+                    &logs,
+                    Instant::now() + Duration::from_secs(1),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(child.polls, 1);
+        }
+    }
+
+    #[test]
+    fn exited_without_ready_or_with_qemu_failure_is_still_a_boot_failure() {
+        let root = TempRoot::create();
+        let logs = DetachLogs {
+            uart: root.0.join("uart.log"),
+            diagnostics: root.0.join("qemu.log"),
+        };
+        fs::write(&logs.diagnostics, b"qemu diagnostic").unwrap();
+        let runtime =
+            DetachedRuntime::new(HandshakeOnly::<FinalUartOnExit>(std::marker::PhantomData));
+        let ready = ready_frame();
+        for (bytes, code) in [
+            (Vec::new(), 0),
+            (ready[..ready.len() - 1].to_vec(), 0),
+            (ready, 1),
+        ] {
+            let mut child = FinalUartOnExit {
+                uart: logs.uart.clone(),
+                bytes,
+                polls: 0,
+                status: ProcessStatus {
+                    code: Some(code),
+                    success: code == 0,
+                },
+            };
+            let error = runtime
+                .await_ready(
+                    &mut child,
+                    &logs,
+                    Instant::now() + Duration::from_secs(1),
+                    None,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, RuntimeError::DetachedBoot { status, ref diagnostics }
+                if status.code == Some(code) && diagnostics == "qemu diagnostic"),
+                "{error:?}"
+            );
+            assert_eq!(child.polls, 1);
+        }
     }
 
     // Catches a startup failure leaving state behind: a handshake timeout
