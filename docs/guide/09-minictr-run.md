@@ -285,6 +285,7 @@ grace中の2回目以降のsignalは即座に強制回収へ進み、guestのExi
 runはQEMU起動直後にinstance stateをstoreへ記録し、終了時のcleanupで消す。state directoryを開けないstoreではrunを始めない。
 crashで残ったinstanceは`ps`で確認でき、`stop`で回収できる。
 `--detach`を付けたrunはguestの`Ready`を確認してからinstance idだけを出して終わり、QEMU・state file・payload directoryを残す。guestの出力はpayload directory内の`uart.log`と`qemu.log`へ落ち、標準出力・標準エラー出力には何も流れない。
+短命guestがREADYを書いてQEMUが正常終了した場合も、終了確認後に最後のUARTを読んで起動を確認する。この場合のinstanceはstaleになり、`stop`でstateとpayloadを回収できる。READYのない終了とQEMUの異常終了は起動失敗になる。
 E2Eのhappy pathは同梱ゲストを`image build`、`image inspect`、`run`へ一続きで通し、このflow全体を公開CLIで検証する。
 割り込み経路はgroup宛のSIGINTと`minictr`のPIDだけへのSIGTERMを別々に検査し、どちらも125終了とQEMU・一時領域の非残留を確認する。
 
