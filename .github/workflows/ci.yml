@@ -27,6 +27,8 @@ jobs:
           cache-bin: false
       - run: cargo xtask setup
       - run: cargo xtask check
+      - name: Verify multi-task compatibility with explicit MiniOS revision
+        run: cargo xtask compat --minios-rev 086f2e3fa54f751cd28c5fcd2bed205830bd2934 --multi
       - name: Smoke-test minictr doctor
         run: |
           set -eu

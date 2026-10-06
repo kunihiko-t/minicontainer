@@ -1,4 +1,4 @@
-//! MiniBundle construction and validation boundary.
+//! MiniBundleの構築と検証の境界。
 
 #![forbid(unsafe_code)]
 
@@ -29,23 +29,31 @@ pub fn format_digest(digest: [u8; 32]) -> String {
     encoded
 }
 
-/// Source fields used to construct a canonical MiniBundle.
+/// 正規形MiniBundleを構築するimageの入力。
 pub struct ImageSpec<'a> {
     pub name: &'a str,
     pub args: &'a [&'a str],
     pub elf: &'a [u8],
 }
 
-/// A validated MiniBundle borrowing its manifest and ELF from the input bytes.
+/// 入力bytesからmanifestとELFを借用する検証済みMiniBundle。
 pub struct Bundle<'a> {
     pub header: BootHeader,
     pub manifest: Manifest<'a>,
     pub elf: &'a [u8],
 }
 
-/// Builds a canonical MiniBundle from a manifest specification and ELF bytes.
+/// 単一imageからmanifest v1の正規形MiniBundleを構築する。
 pub fn build(spec: ImageSpec<'_>) -> Result<Vec<u8>, BundleError> {
     let manifest = manifest::encode_manifest(&spec)?;
+    assemble(&manifest, spec.elf.len(), std::iter::once(spec.elf))
+}
+
+fn assemble<'a>(
+    manifest: &[u8],
+    elf_len: usize,
+    elfs: impl Iterator<Item = &'a [u8]>,
+) -> Result<Vec<u8>, BundleError> {
     let manifest_end = BOOT_HEADER_LEN
         .checked_add(manifest.len())
         .ok_or(BundleError::LengthOverflow)?;
@@ -54,7 +62,7 @@ pub fn build(spec: ImageSpec<'_>) -> Result<Vec<u8>, BundleError> {
         .checked_add(padding_len)
         .ok_or(BundleError::LengthOverflow)?;
     let total_len = elf_offset
-        .checked_add(spec.elf.len())
+        .checked_add(elf_len)
         .ok_or(BundleError::LengthOverflow)?;
     let total_len_u64 = u64::try_from(total_len).map_err(|_| BundleError::LengthOverflow)?;
     if total_len_u64 > BUNDLE_MAX_LEN {
@@ -69,22 +77,33 @@ pub fn build(spec: ImageSpec<'_>) -> Result<Vec<u8>, BundleError> {
         },
         elf: ByteRange {
             offset: u64::try_from(elf_offset).map_err(|_| BundleError::LengthOverflow)?,
-            len: u64::try_from(spec.elf.len()).map_err(|_| BundleError::LengthOverflow)?,
+            len: u64::try_from(elf_len).map_err(|_| BundleError::LengthOverflow)?,
         },
         digest: [0; 32],
     };
 
-    let mut bytes = vec![0; elf_offset];
+    let mut bytes = Vec::with_capacity(total_len);
+    bytes.resize(elf_offset, 0);
     bytes[..BOOT_HEADER_LEN].copy_from_slice(&header.encode_with_zero_digest());
-    bytes[BOOT_HEADER_LEN..manifest_end].copy_from_slice(&manifest);
-    bytes.extend_from_slice(spec.elf);
+    bytes[BOOT_HEADER_LEN..manifest_end].copy_from_slice(manifest);
+    for elf in elfs {
+        bytes.extend_from_slice(elf);
+    }
 
     header.digest = digest_for(&header.encode(), &bytes[BOOT_HEADER_LEN..]);
     bytes[..BOOT_HEADER_LEN].copy_from_slice(&header.encode());
     Ok(bytes)
 }
 
-/// Parses and validates a MiniBundle while borrowing its variable regions.
+/// 入力順にELFを連結し、manifest v2の正規形MiniBundleを構築する。
+/// image数は1〜4、各ELFは非空で、範囲はELF領域先頭からの相対値である。
+/// 同名imageは許可し、manifestとbundleの上限を確保前に検査する。
+pub fn build_multi(specs: &[ImageSpec<'_>]) -> Result<Vec<u8>, BundleError> {
+    let (manifest, elf_len) = manifest::encode_multi(specs)?;
+    assemble(&manifest, elf_len, specs.iter().map(|spec| spec.elf))
+}
+
+/// 可変長領域を借用し、manifest v1/v2、digest、ELF相対範囲を検証する。
 pub fn parse(bytes: &[u8]) -> Result<Bundle<'_>, BundleError> {
     let header_bytes = bytes.get(..BOOT_HEADER_LEN).ok_or(BundleError::Header(
         minios_abi::boot::BootHeaderError::WrongLength,
@@ -128,6 +147,14 @@ pub fn parse(bytes: &[u8]) -> Result<Bundle<'_>, BundleError> {
     let elf = bytes.get(elf_start..).ok_or(BundleError::LengthOverflow)?;
     let manifest = Manifest::parse(manifest_bytes).map_err(BundleError::Manifest)?;
 
+    for (index, image) in manifest.images().enumerate() {
+        if let Some(range) = image.elf()
+            && range.end > header.elf.len
+        {
+            return Err(BundleError::ElfRangeOutOfBounds { index });
+        }
+    }
+
     Ok(Bundle {
         header,
         manifest,
@@ -155,6 +182,208 @@ pub fn parse_digest(encoded: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use minios_abi::{boot::BootHeaderError, manifest::ManifestError};
+
+    // v2範囲検査を省く退行を、encoderに依存せず検出する。
+    fn raw_v2(manifest: &[u8], elf: &[u8]) -> Vec<u8> {
+        let elf_offset = (BOOT_HEADER_LEN + manifest.len() + 7) & !7;
+        let header = BootHeader {
+            total_len: (elf_offset + elf.len()) as u64,
+            manifest: ByteRange {
+                offset: BOOT_HEADER_LEN as u64,
+                len: manifest.len() as u64,
+            },
+            elf: ByteRange {
+                offset: elf_offset as u64,
+                len: elf.len() as u64,
+            },
+            digest: [0; 32],
+        };
+        let mut bytes = vec![0; elf_offset];
+        bytes[..BOOT_HEADER_LEN].copy_from_slice(&header.encode());
+        bytes[BOOT_HEADER_LEN..BOOT_HEADER_LEN + manifest.len()].copy_from_slice(manifest);
+        bytes.extend_from_slice(elf);
+        let digest = digest_for(&bytes[..BOOT_HEADER_LEN], &bytes[BOOT_HEADER_LEN..]);
+        bytes[56..88].copy_from_slice(&digest);
+        bytes
+    }
+
+    // v2でimage順序、個別args、相対ELF範囲、決定性を保持する。
+    #[test]
+    fn builds_multi_images_deterministically() {
+        let specs = [
+            ImageSpec {
+                name: "same",
+                args: &["first", ""],
+                elf: b"abc",
+            },
+            ImageSpec {
+                name: "same",
+                args: &["second"],
+                elf: b"defg",
+            },
+        ];
+        let bytes = build_multi(&specs).unwrap();
+        assert_eq!(bytes, build_multi(&specs).unwrap());
+        let bundle = parse(&bytes).unwrap();
+        assert_eq!(bundle.manifest.version(), 2);
+        assert_eq!(bundle.elf, b"abcdefg");
+        let images: Vec<_> = bundle.manifest.images().collect();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].name(), "same");
+        assert_eq!(images[0].args().collect::<Vec<_>>(), ["first", ""]);
+        assert_eq!(images[0].elf(), Some(0..3));
+        assert_eq!(images[1].args().collect::<Vec<_>>(), ["second"]);
+        assert_eq!(images[1].elf(), Some(3..7));
+    }
+
+    #[test]
+    fn multi_builder_enforces_image_and_argument_limits() {
+        assert_eq!(
+            build_multi(&[]),
+            Err(BundleError::Manifest(ManifestError::MissingImage))
+        );
+        let make_specs = |count| {
+            (0..count)
+                .map(|_| ImageSpec {
+                    name: "a",
+                    args: &[],
+                    elf: b"x",
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            parse(&build_multi(&make_specs(4)).unwrap())
+                .unwrap()
+                .manifest
+                .images()
+                .count(),
+            4
+        );
+        assert_eq!(
+            build_multi(&make_specs(5)),
+            Err(BundleError::Manifest(ManifestError::TooManyImages))
+        );
+        for (args, expected) in [
+            (
+                vec![""; 17],
+                BundleError::Manifest(ManifestError::TooManyArgs),
+            ),
+            (vec!["a\nb"], BundleError::ArgumentContainsLf { index: 0 }),
+            (
+                vec!["a\rb"],
+                BundleError::Manifest(ManifestError::ArgumentContainsCarriageReturn),
+            ),
+            (
+                vec!["a\0b"],
+                BundleError::Manifest(ManifestError::ArgumentContainsNul),
+            ),
+        ] {
+            assert_eq!(
+                build_multi(&[ImageSpec {
+                    name: "a",
+                    args: &args,
+                    elf: b"x"
+                }]),
+                Err(expected)
+            );
+        }
+        assert!(
+            build_multi(&[ImageSpec {
+                name: "a",
+                args: &[""; 16],
+                elf: b"x"
+            }])
+            .is_ok()
+        );
+        assert_eq!(
+            build_multi(&[ImageSpec {
+                name: "a",
+                args: &[],
+                elf: b""
+            }]),
+            Err(BundleError::Manifest(ManifestError::MalformedElf))
+        );
+    }
+
+    // parserがABIの重複keyと重複範囲の拒否を迂回する退行を検出する。
+    #[test]
+    fn v2_parser_preserves_abi_range_and_section_validation() {
+        for (source, expected) in [
+            (
+                b"version=2\nimage=a\nelf=0,2\nimage=b\nelf=1,2\n".as_slice(),
+                ManifestError::OverlappingElfRange,
+            ),
+            (
+                b"version=2\nimage=a\nelf=0,2\nelf=2,1\n".as_slice(),
+                ManifestError::InvalidOrder,
+            ),
+            (
+                b"version=2\nimage=a\nelf=0,0\n".as_slice(),
+                ManifestError::MalformedElf,
+            ),
+        ] {
+            assert!(
+                matches!(parse(&raw_v2(source, b"abc")), Err(BundleError::Manifest(error)) if error == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn multi_builder_enforces_aggregate_manifest_and_payload_caps() {
+        let full = "x".repeat(256);
+        let boundary = "x".repeat(150);
+        let over = "x".repeat(151);
+        let mut args = vec![full.as_str(); 15];
+        args.push(&boundary);
+        let bytes = build_multi(&[ImageSpec {
+            name: "a",
+            args: &args,
+            elf: b"x",
+        }])
+        .unwrap();
+        assert_eq!(parse(&bytes).unwrap().header.manifest.len, 4096);
+        args[15] = &over;
+        assert_eq!(
+            build_multi(&[ImageSpec {
+                name: "a",
+                args: &args,
+                elf: b"x"
+            }]),
+            Err(BundleError::Manifest(ManifestError::TooLong))
+        );
+        let elf = vec![0; BUNDLE_MAX_LEN as usize - 128];
+        let bytes = build_multi(&[ImageSpec {
+            name: "a",
+            args: &[],
+            elf: &elf,
+        }])
+        .unwrap();
+        assert_eq!(bytes.len() as u64, BUNDLE_MAX_LEN);
+        let elf = vec![0; elf.len() + 1];
+        assert_eq!(
+            build_multi(&[ImageSpec {
+                name: "a",
+                args: &[],
+                elf: &elf
+            }]),
+            Err(BundleError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn rejects_v2_ranges_outside_the_elf_region() {
+        for manifest in [
+            b"version=2\nimage=a\nelf=0,4\n".as_slice(),
+            b"version=2\nimage=a\nelf=4,1\n".as_slice(),
+            b"version=2\nimage=a\nelf=18446744073709551614,1\n".as_slice(),
+        ] {
+            assert!(matches!(
+                parse(&raw_v2(manifest, b"abc")),
+                Err(BundleError::ElfRangeOutOfBounds { index: 0 })
+            ));
+        }
+        assert!(parse(&raw_v2(b"version=2\nimage=a\nelf=1,2\n", b"abc")).is_ok());
+    }
 
     // Production break caught: build or parse stops preserving canonical manifest fields and ELF bytes.
     #[test]

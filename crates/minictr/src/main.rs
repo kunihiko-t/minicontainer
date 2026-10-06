@@ -484,8 +484,8 @@ impl<'a> CliSink<'a> {
 
 impl OutputSink for CliSink<'_> {
     fn push(&mut self, event: &SessionEvent) -> io::Result<()> {
-        // pipe越しでも進行が見えるよう、chunkごとにflushする。診断と
-        // handshake・終了通知は表示せず、終了codeの写像は`execute`が行う。
+        // pipe越しでも進行が見えるよう、chunkごとにflushする。
+        // v2のタスク終了だけをPID付きで表示し、全体codeはexecuteが写像する。
         match event {
             SessionEvent::Stdout(bytes) => {
                 self.stdout.write_all(bytes)?;
@@ -493,6 +493,14 @@ impl OutputSink for CliSink<'_> {
             }
             SessionEvent::Stderr(bytes) => {
                 self.stderr.write_all(bytes)?;
+                self.stderr.flush()
+            }
+            SessionEvent::ProcExit(result) => {
+                writeln!(
+                    self.stderr,
+                    "minictr: process pid={} code={}",
+                    result.pid, result.code
+                )?;
                 self.stderr.flush()
             }
             SessionEvent::Ready | SessionEvent::Diagnostic(_) | SessionEvent::Exit(_) => Ok(()),
@@ -1938,6 +1946,7 @@ mod tests {
 
     fn outcome(stdout: &[u8], stderr: &[u8], exit_code: u32) -> RunOutcome {
         RunOutcome {
+            process_exits: Vec::new(),
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
             exit_code,
@@ -2553,6 +2562,20 @@ mod tests {
 
         assert_eq!(stdout, b"out\n");
         assert_eq!(stderr, b"err\n");
+    }
+
+    // PID別結果をstderrへ即時公開し、stdoutと混ぜない。
+    #[test]
+    fn cli_sink_flushes_process_exit_results() {
+        let mut stdout = Vec::new();
+        let mut stderr = FlushGatedWriter::new();
+        let mut sink = CliSink::new(&mut stdout, &mut stderr);
+        sink.push(&SessionEvent::ProcExit(
+            minios_abi::control::ProcExitPayload { pid: 1, code: 70 },
+        ))
+        .unwrap();
+        assert!(stdout.is_empty());
+        assert_eq!(stderr.visible(), b"minictr: process pid=1 code=70\n");
     }
 
     // Catches holding a chunk past the guest's next frame when piped: each

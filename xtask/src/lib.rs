@@ -434,6 +434,17 @@ pub fn run(command: Command) -> Result<(), XtaskError> {
             print!("{transcript}");
             Ok(())
         }
+        Command::CompatMulti(revision) => {
+            println!(
+                "compat: MiniOS revision {revision}; release pin {}; multi-task E2Eを追加",
+                runtime::MINIOS_KERNEL_REV
+            );
+            let workspace = workspace_root();
+            run_check_host(&workspace)?;
+            let transcript = runtime::run_compat_multi(&workspace, &revision)?;
+            print!("{transcript}");
+            Ok(())
+        }
         Command::Dist(args) => dist::run(&workspace_root(), &args).map_err(XtaskError::Dist),
         Command::Fuzz(args) => {
             let report = fuzz::run(&args.config(&workspace_root()))?;

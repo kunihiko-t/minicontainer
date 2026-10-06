@@ -215,7 +215,12 @@ impl<B: ProcessBackend> Runtime<B> {
         let deadline = Instant::now()
             .checked_add(request.deadline)
             .ok_or(RuntimeError::InvalidDeadline)?;
-        minicontainer_bundle::parse(request.bundle).map_err(RuntimeError::Bundle)?;
+        let bundle = minicontainer_bundle::parse(request.bundle).map_err(RuntimeError::Bundle)?;
+        let mut session = if bundle.manifest.version() == 2 {
+            Session::multi(bundle.manifest.images().count()).map_err(RuntimeError::Session)?
+        } else {
+            Session::new()
+        };
         let payload = PayloadTemp::create(request.bundle)?;
         let command = match QemuCommand::new(request.kernel, payload.path(), request.resources) {
             Ok(command) => command,
@@ -247,7 +252,6 @@ impl<B: ProcessBackend> Runtime<B> {
             None => None,
         };
 
-        let mut session = Session::new();
         let mut signals = SignalWatch::new(request.interrupts, self.signal_grace);
         let mut input = request.input;
         let mut forwarder: Option<StdinForwarder> = None;
@@ -517,6 +521,72 @@ mod tests {
         ProcessStatus, QemuCommand, QemuResources, RunRequest, Runtime, RuntimeError, SessionError,
         SessionEvent, SignalObservation,
     };
+
+    // 異常終了後の生存task出力と末尾の回収失敗を、QEMU終了まで読む。
+    #[test]
+    fn multi_run_drains_survivor_and_terminal_errors_and_cleans_payload() {
+        let bundle = minicontainer_bundle::build_multi(&[
+            ImageSpec {
+                name: "fault",
+                args: &[],
+                elf: b"ELF0",
+            },
+            ImageSpec {
+                name: "survivor",
+                args: &[],
+                elf: b"ELF1",
+            },
+        ])
+        .unwrap();
+        for tail in [None, Some(FrameKind::GuestError)] {
+            let trace = Rc::new(RefCell::new(Vec::new()));
+            let payload = Rc::new(RefCell::new(None));
+            let mut stream = ready_frame();
+            for (pid, code) in [(0, 70), (1, 7)] {
+                stream.extend(frame(
+                    FrameKind::ProcExit,
+                    &minios_abi::control::ProcExitPayload { pid, code }.encode(),
+                ));
+                if pid == 0 {
+                    stream.extend(frame(FrameKind::Stdout, b"survivor alive\n"));
+                }
+            }
+            if let Some(kind) = tail {
+                stream.extend(frame(kind, b"reclaim failed"));
+            }
+            let runtime = Runtime::new(FakeBackend::events(
+                trace.clone(),
+                payload.clone(),
+                vec![
+                    ProcessEvent::Uart(stream),
+                    ProcessEvent::Exited(successful_process()),
+                ],
+            ));
+            let result = runtime.run(RunRequest {
+                bundle: &bundle,
+                kernel: "/kernel".as_ref(),
+                deadline: Duration::from_secs(1),
+                resources: QemuResources::DEFAULT,
+                input: None,
+                interrupts: None,
+                instances: None,
+            });
+            if tail.is_some() {
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::Session(SessionError::GuestError(_)))
+                ));
+            } else {
+                let outcome = result.unwrap();
+                assert_eq!(outcome.exit_code, 70);
+                assert_eq!(outcome.stdout, b"survivor alive\n");
+                assert_eq!(outcome.process_exits.len(), 2);
+                assert!(trace.borrow().contains(&"exit"));
+            }
+            assert!(trace.borrow().contains(&"reap"));
+            assert!(!payload.borrow().as_ref().unwrap().exists());
+        }
+    }
 
     // Catches skipping any part of the happy-path lifecycle: only a validated
     // bundle can be materialized, decoded, reaped, and then removed.
@@ -1061,7 +1131,7 @@ mod tests {
                 SessionEvent::Stdout(bytes)
                 | SessionEvent::Stderr(bytes)
                 | SessionEvent::Diagnostic(bytes) => bytes.len(),
-                SessionEvent::Ready | SessionEvent::Exit(_) => 0,
+                SessionEvent::Ready | SessionEvent::Exit(_) | SessionEvent::ProcExit(_) => 0,
             })
             .sum();
         assert_eq!(streamed, 1024 * 1024);

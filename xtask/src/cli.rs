@@ -21,6 +21,8 @@ pub enum Command {
     Check,
     /// 明示したMiniOS revisionを既存E2Eで検証する。
     Compat(String),
+    /// 選択したMiniOSで既存E2Eとmulti-task E2Eを検証する。
+    CompatMulti(String),
     /// Builds and verifies a distribution archive from prebuilt inputs.
     Dist(DistArgs),
     /// Fuzzes one parser with deterministic inputs.
@@ -171,7 +173,7 @@ impl fmt::Display for CliError {
 
 /// Returns the complete public command syntax.
 pub fn help() -> &'static str {
-    "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask compat --minios-rev SHA40\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
+    "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask compat --minios-rev SHA40 [--multi]\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
 }
 
 /// Parses one supported command from UTF-8 arguments.
@@ -214,7 +216,15 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
             {
                 return Err(CliError::InvalidValue("--minios-rev"));
             }
-            parse_bare(arguments, Command::Compat(revision))
+            match arguments.next() {
+                None => Ok(Command::Compat(revision)),
+                Some(option) if option == "--multi" => {
+                    parse_bare(arguments, Command::CompatMulti(revision))
+                }
+                Some(option) => Err(CliError::UnexpectedArgument(
+                    option.into_string().map_err(CliError::NonUtf8Argument)?,
+                )),
+            }
         }
         "dist" => parse_dist(arguments),
         "fuzz" => parse_fuzz(arguments),
@@ -476,6 +486,18 @@ mod tests {
     }
 
     #[test]
+    fn multi_compat_is_explicit_and_does_not_change_default() {
+        let revision = "ab".repeat(20);
+        assert_eq!(
+            parse(["compat", "--minios-rev", &revision, "--multi"]),
+            Ok(Command::CompatMulti(revision.clone()))
+        );
+        assert!(parse(["compat", "--multi"]).is_err());
+        assert!(parse(["compat", "--minios-rev", &revision, "--multi", "--multi"]).is_err());
+        assert!(parse(["check", "--multi"]).is_err());
+    }
+
+    #[test]
     fn parses_the_public_bare_commands() {
         assert_eq!(parse(["setup"]), Ok(Command::Setup));
         assert_eq!(parse(["check"]), Ok(Command::Check));
@@ -725,7 +747,7 @@ mod tests {
     fn help_and_diagnostics_name_the_public_contract() {
         assert_eq!(
             help(),
-            "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask compat --minios-rev SHA40\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
+            "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask compat --minios-rev SHA40 [--multi]\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
         );
         assert_eq!(
             CliError::MissingCommand.to_string(),

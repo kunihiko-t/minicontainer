@@ -224,6 +224,7 @@ dependencies = [
  "minicontainer-bundle",
  "minicontainer-oci",
  "minicontainer-runtime",
+ "minios-abi",
 ]
 
 [[package]]

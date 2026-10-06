@@ -1,11 +1,11 @@
 //! QEMU UART control frameをrun結果へ復元するstate machine。
 
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 use minicontainer_protocol::{Decoder, Frame, ProtocolError};
 use minios_abi::{
     boot::{BOOT_ABI_MAJOR, BOOT_ABI_MINOR},
-    control::{FRAME_MAGIC, FrameKind, ReadyPayload},
+    control::{FRAME_MAGIC, FrameKind, ProcExitPayload, ReadyPayload},
 };
 
 use crate::ProcessStatus;
@@ -33,6 +33,8 @@ pub enum SessionEvent {
     Diagnostic(Vec<u8>),
     /// guestが終了codeを報告した。
     Exit(u32),
+    /// manifest v2のタスク別終了。run全体の完了とは異なる。
+    ProcExit(ProcExitPayload),
 }
 
 /// QEMU UART sessionの復元に失敗した理由。
@@ -51,6 +53,14 @@ pub enum SessionError {
     FrameAfterExit(FrameKind),
     /// QEMU終了時までにguest Exitを受信しなかった。
     MissingExit,
+    /// manifest v2の初期タスクの終了通知が欠落した。
+    MissingProcessExit(u32),
+    /// 同じPIDの終了通知を二度受信した。
+    DuplicateProcessExit(u32),
+    /// ProcExit payloadがABI固定長と異なる。
+    InvalidProcExitPayload,
+    /// manifest v2の初期image数がABI上限の範囲外。
+    InvalidProcessCount(usize),
     /// ReadyがMiniContainerと異なるABI versionを示した。
     UnsupportedReadyAbi(ReadyPayload),
     /// ABI固定長と異なるExit payloadを受信した。
@@ -76,6 +86,21 @@ impl fmt::Display for SessionError {
             }
             Self::DuplicateReady => write!(formatter, "received a second Ready frame"),
             Self::FrameAfterExit(kind) => write!(formatter, "{kind:?} frame arrived after Exit"),
+            Self::MissingProcessExit(pid) => write!(
+                formatter,
+                "QEMU exited without ProcExit for initial pid {pid}"
+            ),
+            Self::DuplicateProcessExit(pid) => {
+                write!(formatter, "received a second ProcExit for pid {pid}")
+            }
+            Self::InvalidProcExitPayload => write!(
+                formatter,
+                "ProcExit payload must contain pid and code u32 values"
+            ),
+            Self::InvalidProcessCount(count) => write!(
+                formatter,
+                "manifest v2 requires 1-4 initial processes, got {count}"
+            ),
             Self::MissingExit => write!(formatter, "QEMU exited without a guest Exit frame"),
             Self::UnsupportedReadyAbi(ready) => write!(
                 formatter,
@@ -111,6 +136,10 @@ impl Error for SessionError {
             | Self::FrameBeforeReady(_)
             | Self::DuplicateReady
             | Self::FrameAfterExit(_)
+            | Self::MissingProcessExit(_)
+            | Self::DuplicateProcessExit(_)
+            | Self::InvalidProcExitPayload
+            | Self::InvalidProcessCount(_)
             | Self::MissingExit
             | Self::UnsupportedReadyAbi(_)
             | Self::InvalidExitPayload
@@ -125,11 +154,13 @@ impl Error for SessionError {
 /// 正常終了したguest runの出力。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
+    /// manifest v2のPID昇順の終了結果。v1では空。
+    pub process_exits: Vec<ProcExitPayload>,
     /// guest stdoutを連結したbytes。
     pub stdout: Vec<u8>,
     /// guest stderrを連結したbytes。
     pub stderr: Vec<u8>,
-    /// guestがExit frameで報告した終了code。
+    /// v1のExit code、またはv2でPID順に選んだ最初の非zero code。
     pub exit_code: u32,
     /// firmware preambleとguest Diagnostic frameを連結したbytes。
     pub diagnostics: Vec<u8>,
@@ -138,6 +169,8 @@ pub struct RunOutcome {
 /// QEMU UARTをguest runへ復元するstate machine。
 pub struct Session {
     state: State,
+    initial_processes: Option<usize>,
+    process_exits: BTreeMap<u32, u32>,
     decoder: Decoder,
     boot_diagnostic: Vec<u8>,
     magic_prefix: Vec<u8>,
@@ -160,6 +193,8 @@ impl Session {
     pub fn new() -> Self {
         Self {
             state: State::AwaitReady,
+            initial_processes: None,
+            process_exits: BTreeMap::new(),
             decoder: Decoder::new(),
             boot_diagnostic: Vec::new(),
             magic_prefix: Vec::new(),
@@ -169,6 +204,17 @@ impl Session {
             guest_abi_minor: None,
             diagnostics: Vec::new(),
         }
+    }
+
+    /// manifest v2の初期image数を指定する。実行中にspawnされたPIDも保持する。
+    pub fn multi(initial_processes: usize) -> Result<Self, SessionError> {
+        if !(1..=minios_abi::manifest::IMAGE_MAX_COUNT).contains(&initial_processes) {
+            return Err(SessionError::InvalidProcessCount(initial_processes));
+        }
+        Ok(Self {
+            initial_processes: Some(initial_processes),
+            ..Self::new()
+        })
     }
 
     /// guestがReadyで名乗ったABI minor。Ready到達前は`None`。
@@ -202,8 +248,25 @@ impl Session {
         self.finish_boot_preamble()?;
         self.decoder.finish().map_err(SessionError::Protocol)?;
 
-        let State::Exited(exit_code) = self.state else {
-            return Err(SessionError::MissingExit);
+        let exit_code = if let Some(initial) = self.initial_processes {
+            if self.state != State::Running {
+                return Err(SessionError::MissingExit);
+            }
+            for pid in 0..initial as u32 {
+                if !self.process_exits.contains_key(&pid) {
+                    return Err(SessionError::MissingProcessExit(pid));
+                }
+            }
+            self.process_exits
+                .values()
+                .copied()
+                .find(|code| *code != 0)
+                .unwrap_or(0)
+        } else {
+            let State::Exited(code) = self.state else {
+                return Err(SessionError::MissingExit);
+            };
+            code
         };
         if !status.success {
             return Err(SessionError::ProcessFailed(status));
@@ -212,6 +275,11 @@ impl Session {
         let mut diagnostics = self.boot_diagnostic.clone();
         diagnostics.extend_from_slice(&self.diagnostics);
         Ok(RunOutcome {
+            process_exits: self
+                .process_exits
+                .iter()
+                .map(|(&pid, &code)| ProcExitPayload { pid, code })
+                .collect(),
             stdout: self.stdout.clone(),
             stderr: self.stderr.clone(),
             exit_code,
@@ -261,6 +329,7 @@ impl Session {
             .len()
             .saturating_add(self.stderr.len())
             .saturating_add(self.diagnostics.len())
+            .saturating_add(self.process_exits.len().saturating_mul(8))
             .saturating_add(extra);
         if total > GUEST_OUTPUT_MAX_LEN {
             return Err(SessionError::GuestOutputTooLarge);
@@ -333,7 +402,10 @@ impl Session {
         // host側の受理規約は`abi_major`一致と`abi_minor`以下である。古い
         // minorを名乗るguestには`STDIN`のような新frameを送らない判断が
         // 呼び出し側へ委ねられるよう、成立したminorを記録する。
-        if ready.abi_major != BOOT_ABI_MAJOR || ready.abi_minor > BOOT_ABI_MINOR {
+        if ready.abi_major != BOOT_ABI_MAJOR
+            || ready.abi_minor > BOOT_ABI_MINOR
+            || (self.initial_processes.is_some() && ready.abi_minor < 2)
+        {
             return Err(SessionError::UnsupportedReadyAbi(ready));
         }
         self.guest_abi_minor = Some(ready.abi_minor);
@@ -368,6 +440,9 @@ impl Session {
                 Ok(())
             }
             FrameKind::Exit => {
+                if self.initial_processes.is_some() {
+                    return Err(SessionError::UnexpectedKind(frame.kind));
+                }
                 let exit_code = u32::from_le_bytes(
                     frame
                         .payload
@@ -380,6 +455,17 @@ impl Session {
                 Ok(())
             }
             FrameKind::GuestError => Err(SessionError::GuestError(frame.payload)),
+            FrameKind::ProcExit if self.initial_processes.is_some() => {
+                let result = ProcExitPayload::decode(&frame.payload)
+                    .map_err(|_| SessionError::InvalidProcExitPayload)?;
+                if self.process_exits.contains_key(&result.pid) {
+                    return Err(SessionError::DuplicateProcessExit(result.pid));
+                }
+                self.check_output_room(8)?;
+                self.process_exits.insert(result.pid, result.code);
+                events.push(SessionEvent::ProcExit(result));
+                Ok(())
+            }
             FrameKind::Stdin | FrameKind::ProcExit => Err(SessionError::UnexpectedKind(frame.kind)),
         }
     }
@@ -400,7 +486,7 @@ fn trailing_magic_prefix_len(bytes: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunOutcome, Session, SessionError, SessionEvent};
+    use super::{GUEST_OUTPUT_MAX_LEN, RunOutcome, Session, SessionError, SessionEvent};
     use crate::ProcessStatus;
     use minicontainer_protocol::ProtocolError;
     use minios_abi::control::ControlError;
@@ -408,6 +494,132 @@ mod tests {
 
     // Catches treating a partial MCF1 magic prefix as boot text, which would
     // make a normal transport chunk split lose the initial Ready frame.
+    fn multi_ready(count: usize) -> Session {
+        let mut session = Session::multi(count).unwrap();
+        session.push_uart(&ready_frame()).unwrap();
+        session
+    }
+
+    fn proc_exit(pid: u32, code: u32) -> Vec<u8> {
+        frame(
+            FrameKind::ProcExit,
+            &minios_abi::control::ProcExitPayload { pid, code }.encode(),
+        )
+    }
+
+    #[test]
+    fn multi_process_results_share_output_budget_and_need_valid_payloads() {
+        let mut session = multi_ready(2);
+        session.diagnostics.resize(GUEST_OUTPUT_MAX_LEN - 8, b'x');
+        session.push_uart(&proc_exit(0, 0)).unwrap();
+        assert_eq!(
+            session.push_uart(&proc_exit(1, 0)),
+            Err(SessionError::GuestOutputTooLarge)
+        );
+        let mut session = multi_ready(1);
+        assert_eq!(
+            session.push_uart(&frame(FrameKind::ProcExit, b"bad")),
+            Err(SessionError::Protocol(ProtocolError::Header(
+                minios_abi::control::ControlError::WrongFixedPayloadLength,
+            )))
+        );
+        let mut session = multi_ready(1);
+        session.push_uart(&proc_exit(0, 0)).unwrap();
+        assert!(matches!(
+            session.finish(ProcessStatus {
+                code: Some(1),
+                success: false
+            }),
+            Err(SessionError::ProcessFailed(_))
+        ));
+    }
+
+    #[test]
+    fn multi_continues_after_fault_and_aggregates_by_pid() {
+        let mut session = multi_ready(2);
+        session.push_uart(&proc_exit(1, 7)).unwrap();
+        session.push_uart(&proc_exit(0, 70)).unwrap();
+        session
+            .push_uart(&frame(FrameKind::Stdout, b"survivor\n"))
+            .unwrap();
+        session
+            .push_uart(&frame(FrameKind::Diagnostic, b"recovered"))
+            .unwrap();
+        let outcome = session.finish(successful_process()).unwrap();
+        assert_eq!(outcome.exit_code, 70);
+        assert_eq!(outcome.stdout, b"survivor\n");
+        assert_eq!(
+            outcome.process_exits,
+            vec![
+                minios_abi::control::ProcExitPayload { pid: 0, code: 70 },
+                minios_abi::control::ProcExitPayload { pid: 1, code: 7 },
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_requires_all_initial_results_and_rejects_duplicate_and_mixed_exit() {
+        let mut session = multi_ready(2);
+        session.push_uart(&proc_exit(0, 0)).unwrap();
+        assert_eq!(
+            session.finish(successful_process()),
+            Err(SessionError::MissingProcessExit(1))
+        );
+        assert_eq!(
+            session.push_uart(&proc_exit(0, 0)),
+            Err(SessionError::DuplicateProcessExit(0))
+        );
+        assert_eq!(
+            session.push_uart(&frame(FrameKind::Exit, &0_u32.to_le_bytes())),
+            Err(SessionError::UnexpectedKind(FrameKind::Exit))
+        );
+        let mut single = ready_session();
+        assert_eq!(
+            single.push_uart(&proc_exit(0, 0)),
+            Err(SessionError::UnexpectedKind(FrameKind::ProcExit))
+        );
+    }
+
+    #[test]
+    fn multi_drains_recovery_failures_and_reports_dynamic_task_results() {
+        let mut session = multi_ready(1);
+        session.push_uart(&proc_exit(5, 3)).unwrap();
+        session.push_uart(&proc_exit(0, 0)).unwrap();
+        let outcome = session.finish(successful_process()).unwrap();
+        assert_eq!(outcome.exit_code, 3);
+        assert_eq!(outcome.process_exits.len(), 2);
+        let mut session = multi_ready(1);
+        session.push_uart(&proc_exit(0, 0)).unwrap();
+        assert!(matches!(
+            session.push_uart(&frame(FrameKind::GuestError, b"recovery")),
+            Err(SessionError::GuestError(_))
+        ));
+    }
+
+    #[test]
+    fn multi_all_zero_and_fragmented_results_require_supported_ready() {
+        let mut session = multi_ready(2);
+        for byte in proc_exit(1, 0).into_iter().chain(proc_exit(0, 0)) {
+            session.push_uart(&[byte]).unwrap();
+        }
+        assert_eq!(session.finish(successful_process()).unwrap().exit_code, 0);
+        for count in [0, 5] {
+            assert!(Session::multi(count).is_err());
+        }
+        let mut session = Session::multi(1).unwrap();
+        assert!(matches!(
+            session.push_uart(&frame(
+                FrameKind::Ready,
+                &ReadyPayload {
+                    abi_major: 1,
+                    abi_minor: 1
+                }
+                .encode()
+            )),
+            Err(SessionError::UnsupportedReadyAbi(_))
+        ));
+    }
+
     #[test]
     fn bounded_boot_text_precedes_a_split_ready_frame() {
         let mut session = Session::new();
@@ -559,6 +771,7 @@ mod tests {
         assert_eq!(
             session.finish(successful_process()),
             Ok(RunOutcome {
+                process_exits: Vec::new(),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 exit_code: 42,
@@ -718,6 +931,7 @@ mod tests {
         assert_eq!(
             session.finish(successful_process()),
             Ok(RunOutcome {
+                process_exits: Vec::new(),
                 stdout: b"hello".to_vec(),
                 stderr: b"warning".to_vec(),
                 exit_code: 7,
@@ -886,6 +1100,7 @@ mod tests {
 
     fn complete_outcome() -> RunOutcome {
         RunOutcome {
+            process_exits: Vec::new(),
             stdout: b"hello".to_vec(),
             stderr: b"warning".to_vec(),
             exit_code: 7,

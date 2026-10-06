@@ -110,7 +110,7 @@ version不一致の`i-*.state`は`ps`がcorruptとして表示する。
 - temp dirの命名（`minicontainer-run-*`）、store内部のfile配置、instance file名の形式。
 - detached実行が残す`uart.log`と`qemu.log`の内容と形式。検査用の副産物であり、出力契約ではない。
 - 標準エラー出力の診断文言。
-- manifest v2と`ProcExit` frameによる複数image実行。frame集合には含まれるが、現行runtimeでは受理しない。
+- manifest v2のdetached実行、task別stdout/stderr、複数imageを組み立てるCLI。foreground実行は[複数task実行](multi-task.md)の範囲で対応する。
 - guest ABI minorが足りないときの個別機能。利用可否はhandshakeでnegotiateされ、不足は型付きerrorになる。
 - Docker API互換、Linux application ABI、本番向けマルチテナント境界。
 
