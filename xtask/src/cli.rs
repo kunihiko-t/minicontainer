@@ -19,6 +19,8 @@ pub enum Command {
     CheckHost,
     /// Runs the ordered release gate.
     Check,
+    /// 明示したMiniOS revisionを既存E2Eで検証する。
+    Compat(String),
     /// Builds and verifies a distribution archive from prebuilt inputs.
     Dist(DistArgs),
     /// Fuzzes one parser with deterministic inputs.
@@ -169,7 +171,7 @@ impl fmt::Display for CliError {
 
 /// Returns the complete public command syntax.
 pub fn help() -> &'static str {
-    "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
+    "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask compat --minios-rev SHA40\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
 }
 
 /// Parses one supported command from UTF-8 arguments.
@@ -191,6 +193,29 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         "setup" => parse_bare(arguments, Command::Setup),
         "check-host" => parse_bare(arguments, Command::CheckHost),
         "check" => parse_bare(arguments, Command::Check),
+        "compat" => {
+            let option = arguments
+                .next()
+                .ok_or(CliError::MissingOption("--minios-rev"))?;
+            if option != "--minios-rev" {
+                return Err(CliError::UnknownOption(
+                    option.into_string().map_err(CliError::NonUtf8Argument)?,
+                ));
+            }
+            let revision = arguments
+                .next()
+                .ok_or(CliError::MissingValue("--minios-rev"))?
+                .into_string()
+                .map_err(CliError::NonUtf8Argument)?;
+            if revision.len() != 40
+                || !revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(CliError::InvalidValue("--minios-rev"));
+            }
+            parse_bare(arguments, Command::Compat(revision))
+        }
         "dist" => parse_dist(arguments),
         "fuzz" => parse_fuzz(arguments),
         unknown => Err(CliError::UnknownCommand(unknown.to_owned())),
@@ -412,6 +437,43 @@ fn parse_usize(value: OsString, option: &'static str) -> Result<usize, CliError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 選択したrevisionだけを検証し、浮動refや省略SHAを受け入れない。
+    #[test]
+    fn compat_requires_an_explicit_full_revision() {
+        let revision = "ab".repeat(20);
+        assert_eq!(
+            parse(["compat", "--minios-rev", &revision]),
+            Ok(Command::Compat(revision.clone()))
+        );
+        for invalid in ["main", "abcd", "", &"g".repeat(40), &"AB".repeat(20)] {
+            assert!(matches!(
+                parse(["compat", "--minios-rev", invalid]),
+                Err(CliError::InvalidValue("--minios-rev"))
+            ));
+        }
+        assert!(matches!(
+            parse(["compat"]),
+            Err(CliError::MissingOption("--minios-rev"))
+        ));
+        assert!(parse(["compat", "--minios-rev", &revision, "extra"]).is_err());
+        assert!(parse(["check", "--minios-rev", &revision]).is_err());
+        assert!(matches!(
+            parse(["compat", "--minios-rev"]),
+            Err(CliError::MissingValue("--minios-rev"))
+        ));
+        assert!(
+            parse([
+                "compat",
+                "--minios-rev",
+                &revision,
+                "--minios-rev",
+                &revision
+            ])
+            .is_err()
+        );
+        assert!(parse(["compat", "--unknown", &revision]).is_err());
+    }
 
     #[test]
     fn parses_the_public_bare_commands() {
@@ -663,7 +725,7 @@ mod tests {
     fn help_and_diagnostics_name_the_public_contract() {
         assert_eq!(
             help(),
-            "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
+            "usage: cargo xtask <setup|check-host|check>\nusage: cargo xtask compat --minios-rev SHA40\nusage: cargo xtask dist --target TARGET --minictr PATH --kernel PATH [--version VERSION] [--output DIR]\nusage: cargo xtask fuzz --target <bundle|uart> [--seed N] [--iters N] [--max-bytes N] [--input-timeout SECS] [--time-limit SECS] [--corpus DIR] [--output DIR] [--input FILE]"
         );
         assert_eq!(
             CliError::MissingCommand.to_string(),

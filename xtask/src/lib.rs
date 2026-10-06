@@ -423,6 +423,17 @@ pub fn run(command: Command) -> Result<(), XtaskError> {
         Command::Setup => tools::check_setup(),
         Command::CheckHost => run_check_host(&workspace_root()),
         Command::Check => run_check(&workspace_root()),
+        Command::Compat(revision) => {
+            println!(
+                "compat: MiniOS revision {revision}; release pin {}",
+                runtime::MINIOS_KERNEL_REV
+            );
+            let workspace = workspace_root();
+            run_check_host(&workspace)?;
+            let transcript = runtime::run_compat(&workspace, &revision)?;
+            print!("{transcript}");
+            Ok(())
+        }
         Command::Dist(args) => dist::run(&workspace_root(), &args).map_err(XtaskError::Dist),
         Command::Fuzz(args) => {
             let report = fuzz::run(&args.config(&workspace_root()))?;
