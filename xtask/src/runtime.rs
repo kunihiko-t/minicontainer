@@ -104,7 +104,7 @@ pub enum E2EError {
         stdout: String,
         stderr: String,
     },
-    /// miniOS checkoutのHEADがpin留めrevisionと異なる。
+    /// miniOS checkoutのHEADが選択したrevisionと異なる。
     UnexpectedKernelRev { expected: String, actual: String },
     /// miniOS checkoutに未commitの変更がある。
     DirtyCheckout { directory: PathBuf, status: String },
@@ -169,7 +169,7 @@ impl fmt::Display for E2EError {
             }
             Self::UnexpectedKernelRev { expected, actual } => write!(
                 formatter,
-                "miniOS checkout revision {actual} does not match the pinned E2E revision {expected}"
+                "miniOS checkout revision {actual} does not match the selected E2E revision {expected}"
             ),
             Self::DirtyCheckout { directory, status } => write!(
                 formatter,
@@ -245,6 +245,19 @@ impl std::error::Error for E2EError {
 
 /// release gateの最終phaseとして実QEMU E2Eを実行し、transcriptを返す。
 pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
+    run_revision_e2e(workspace, MINIOS_KERNEL_REV, false)
+}
+
+/// リリースpinを変更せず、選択したrevisionで同じE2E契約を検証する。
+pub(crate) fn run_compat(workspace: &Path, revision: &str) -> Result<String, E2EError> {
+    run_revision_e2e(workspace, revision, true)
+}
+
+fn run_revision_e2e(
+    workspace: &Path,
+    revision: &str,
+    compatibility: bool,
+) -> Result<String, E2EError> {
     let mut transcript = String::new();
     let mut log = |line: &str| {
         transcript.push_str(line);
@@ -262,10 +275,10 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
         git_version.lines().next().unwrap_or("git version unknown")
     ));
 
-    log("e2e: ensuring the pinned miniOS kernel");
-    let kernel = ensure_kernel(workspace, &mut log)?;
+    log(&format!("e2e: ensuring miniOS revision {revision}"));
+    let kernel = ensure_kernel(workspace, revision, compatibility, &mut log)?;
     log(&format!(
-        "e2e: kernel ready at {} (rev {MINIOS_KERNEL_REV}, abi {MINIOS_ABI_TAG})",
+        "e2e: kernel ready at {} (rev {revision}, abi {MINIOS_ABI_TAG})",
         kernel.display()
     ));
 
@@ -399,34 +412,73 @@ pub fn run_e2e(workspace: &Path) -> Result<String, E2EError> {
     Ok(transcript)
 }
 
-/// pin留めrevisionのminiOS kernelをbuildし、そのbinary pathを返す。
+/// 選択したrevisionのminiOS kernelをbuildし、そのbinary pathを返す。
 ///
-/// cache checkoutはworkspaceの`target/e2e/minios`に置き、存在すればpin留め
+/// 通常のcacheは`target/e2e/minios`、互換性検査は`target/compat/<revision>/minios`
+/// に置く。存在すれば選択した
 /// revisionへ更新して再利用する。fetchはrevisionが欠けているときだけ行い、
 /// checkout後はrevisionとcleanさを毎回検証する。`MINICTR_E2E_MINIOS_DIR`が
 /// 絶対pathで与えられた場合はそのcheckoutを読み取り専用として扱い、fetchや
 /// checkoutやin-place buildで書き換えず、target directoryだけworkspace側へ
 /// 隔離してbuildする。
-fn ensure_kernel(workspace: &Path, log: &mut dyn FnMut(&str)) -> Result<PathBuf, E2EError> {
-    match std::env::var_os("MINICTR_E2E_MINIOS_DIR") {
+fn ensure_kernel(
+    workspace: &Path,
+    revision: &str,
+    compatibility: bool,
+    log: &mut dyn FnMut(&str),
+) -> Result<PathBuf, E2EError> {
+    ensure_kernel_from(
+        workspace,
+        revision,
+        compatibility,
+        std::env::var_os("MINICTR_E2E_MINIOS_DIR").map(PathBuf::from),
+        log,
+        build_kernel,
+    )
+}
+
+fn ensure_kernel_from(
+    workspace: &Path,
+    revision: &str,
+    compatibility: bool,
+    external: Option<PathBuf>,
+    log: &mut dyn FnMut(&str),
+    build: impl FnOnce(&Path, Option<&Path>) -> Result<PathBuf, E2EError>,
+) -> Result<PathBuf, E2EError> {
+    match external {
         Some(directory) => {
-            let directory = PathBuf::from(directory);
-            verify_checkout_rev(&directory, MINIOS_KERNEL_REV)?;
+            verify_checkout_rev(&directory, revision)?;
             verify_clean_checkout(&directory)?;
-            let target_dir = workspace.join("target/e2e/minios-override-target");
+            let target_dir = if compatibility {
+                workspace
+                    .join("target/compat")
+                    .join(revision)
+                    .join("override-target")
+            } else {
+                workspace.join("target/e2e/minios-override-target")
+            };
             std::fs::create_dir_all(&target_dir)
                 .map_err(|error| E2EError::Store(error.to_string()))?;
-            build_kernel(&directory, Some(&target_dir))
+            build(&directory, Some(&target_dir))
         }
         None => {
-            let directory = workspace.join("target/e2e/minios");
-            prepare_checkout(&directory, log, MINIOS_REPO_URL, MINIOS_KERNEL_REV)?;
-            build_kernel(&directory, None)
+            let directory = if compatibility {
+                workspace
+                    .join("target/compat")
+                    .join(revision)
+                    .join("minios")
+            } else {
+                workspace.join("target/e2e/minios")
+            };
+            prepare_checkout(&directory, log, MINIOS_REPO_URL, revision)?;
+            // 環境のCARGO_TARGET_DIRより選択したcheckoutのbuild先を優先する。
+            let target_dir = directory.join("target");
+            build(&directory, Some(&target_dir))
         }
     }
 }
 
-/// pin留めkernelのcheckoutを用意し、初回失敗時はdirectoryごと破棄して
+/// 選択したkernelのcheckoutを用意し、初回失敗時はdirectoryごと破棄して
 /// fresh cloneから一度だけ再試行する。CI cacheから復元した壊れたcheckout
 /// が残ると、再試行なしでは同じ失敗を繰り返してgateが赤信号のまま固まる。
 /// 再試行も失敗したときは再試行のerrorを返す。初回errorの要約はtranscript
@@ -2960,6 +3012,117 @@ mod tests {
     // Catches documentation that still names a stale miniOS kernel
     // revision. `MINIOS_KERNEL_REV` is the only source of truth; a
     // revision bump must update every doc that spells the revision out.
+    // 外部checkoutは変更せず、対象SHAの隔離targetだけへbuildする。
+    #[test]
+    fn compat_external_checkout_is_verified_before_build_and_preserved() {
+        let source = TempDir::create("minictr-compat-source-").unwrap();
+        let revision = commit_fixture(source.path(), "source");
+        let workspace = TempDir::create("minictr-compat-work-").unwrap();
+        let selected_target = workspace
+            .path()
+            .join("target/compat")
+            .join(&revision)
+            .join("override-target");
+        let result = ensure_kernel_from(
+            workspace.path(),
+            &revision,
+            true,
+            Some(source.path().to_owned()),
+            &mut |_| {},
+            |checkout, target| {
+                assert_eq!(checkout, source.path());
+                assert_eq!(target, Some(selected_target.as_path()));
+                Ok(selected_target.join("kernel"))
+            },
+        )
+        .unwrap();
+        assert_eq!(result, selected_target.join("kernel"));
+        assert_eq!(git_head(source.path()), revision);
+        verify_clean_checkout(source.path()).unwrap();
+        assert!(!source.path().join("target").exists());
+        assert!(
+            git_output(source.path(), &["remote"])
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
+
+        let mismatch = ensure_kernel_from(
+            workspace.path(),
+            MINIOS_KERNEL_REV,
+            true,
+            Some(source.path().to_owned()),
+            &mut |_| {},
+            |_, _| panic!("不一致のcheckoutをbuildしてはいけない"),
+        );
+        assert!(matches!(
+            mismatch,
+            Err(E2EError::UnexpectedKernelRev { .. })
+        ));
+        std::fs::write(source.path().join("untracked"), b"keep").unwrap();
+        let dirty = ensure_kernel_from(
+            workspace.path(),
+            &revision,
+            true,
+            Some(source.path().to_owned()),
+            &mut |_| {},
+            |_, _| panic!("変更のあるcheckoutをbuildしてはいけない"),
+        );
+        assert!(matches!(dirty, Err(E2EError::DirtyCheckout { .. })));
+        assert_eq!(
+            std::fs::read(source.path().join("untracked")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(git_head(source.path()), revision);
+    }
+
+    // 二つの候補とrelease pinがcacheを共有せず、外部のCARGO_TARGET_DIRを使わない。
+    #[test]
+    fn compat_cached_revisions_have_explicit_separate_build_targets() {
+        let workspace = TempDir::create("minictr-compat-cache-").unwrap();
+        let origin = TempDir::create("minictr-compat-origin-").unwrap();
+        let mut locations = Vec::new();
+        for label in ["first", "second"] {
+            let revision = commit_fixture(origin.path(), label);
+            let checkout = workspace
+                .path()
+                .join("target/compat")
+                .join(&revision)
+                .join("minios");
+            std::fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+            git(
+                workspace.path(),
+                &[
+                    "clone",
+                    "--quiet",
+                    origin.path().to_str().unwrap(),
+                    checkout.to_str().unwrap(),
+                ],
+            );
+            let expected_target = checkout.join("target");
+            ensure_kernel_from(
+                workspace.path(),
+                &revision,
+                true,
+                None,
+                &mut |_| {},
+                |source, target| {
+                    assert_eq!(source, checkout);
+                    assert_eq!(
+                        target,
+                        Some(expected_target.as_path()),
+                        "build先は必ず明示する"
+                    );
+                    Ok(expected_target.join("kernel"))
+                },
+            )
+            .unwrap();
+            locations.push(checkout);
+        }
+        assert_ne!(locations[0], locations[1]);
+        assert!(!workspace.path().join("target/e2e/minios").exists());
+    }
+
     #[test]
     fn docs_name_the_pinned_kernel_revision() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");

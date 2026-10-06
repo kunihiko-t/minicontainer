@@ -17,6 +17,9 @@ cargo xtask check
 `check`は依存関係を解決するすべてのCargo phaseを`--locked`で実行し、18段階の検査を最初の失敗で停止する。
 `check-host`は実QEMUの最終段階を除く17段階を実行する。
 
+新しいMiniOS commitとの連動検証は`cargo xtask compat --minios-rev <40桁SHA>`で行う。
+リリース用kernelのpinを変更せず、[互換性検査](docs/guide/11-test-harness-gate.md#新しいminios-revisionとの互換性検査)の手順で既存E2Eを再利用する。
+
 ## テストの保守
 
 マイルストーンの完了時と、既存テストと同じ退行をより広い範囲で検出するテストを追加したときに、重複したテストを棚卸しする。

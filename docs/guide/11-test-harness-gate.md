@@ -102,6 +102,30 @@ cli surface passでは、QEMUを要しない公開commandを一時storeへ一回
 既存の取得済みソースを使う場合は、`MINICTR_E2E_MINIOS_DIR`に固定リビジョンと一致する、未変更のチェックアウトを指定する。
 失敗の分類は[第10章](10-failure-diagnostics.md)を参照する。
 
+## 新しいMiniOS revisionとの互換性検査
+
+リリース用kernelのpinは維持したまま、開発者が選んだcommitを同じ実QEMU E2Eで検証できる。
+
+```sh
+revision=$(git -C ../minios rev-parse HEAD)
+cargo xtask compat --minios-rev "$revision"
+```
+
+`--minios-rev`は小文字の16進数40桁の完全なcommit SHAを必須とし、branch名や短縮SHAは受け付けない。
+まず`check-host`の17段階を実行し、成功後に選択したrevisionのkernelをbuildする。
+ソースcacheは`target/compat/<revision>/minios`で、通常の`target/e2e/minios`と共有しない。
+transcriptには対象revision、期待するABI tag、QEMU versionと各経路の結果が残る。
+helloとechoのバンドル登録、READYを経由する起動、stdinとEOF、stdoutとstderr、exit 42、timeout、processと一時領域の回収を含め、通常のE2E全体を再利用する。
+raw supervisor kernelによるmalformed-frame検査は選択したMiniOSを経由しない。
+
+`MINICTR_E2E_MINIOS_DIR`を併用する場合も、checkoutのHEADが選択したSHAに一致し、変更がないことを検証する。
+このcheckoutへfetch、checkout、in-place buildは行わず、build成果物を`target/compat/<revision>/override-target`へ隔離する。
+通常の`check`では引き続き固定revisionとの一致を求める。
+成功はそのcommitと現行MiniContainerの互換性を示すもので、リリースpinやABI依存を更新する操作ではない。
+
+Linux containerのPID 1には孤児processを回収するinitを用意する。
+回収されないゾンビが残る環境ではprocess生存検査が失敗し、互換性成功とは判定できない。
+
 ## E2E末尾のstress節
 
 単発経路のあと、一つの共有storeに対して反復と中断のscenarioをbounded回だけ実行する。
