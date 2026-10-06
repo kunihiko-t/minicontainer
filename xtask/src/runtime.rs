@@ -307,9 +307,19 @@ pub(crate) fn run_compat_multi(workspace: &Path, revision: &str) -> Result<Strin
     )?;
     verify_clean_checkout(&checkout)?;
     let guest_root = target.join(RISCV_TARGET).join("debug");
-    let fault = read_guest_fixture(&guest_root.join("minios-guest-proc-fault"))?;
-    let survivor = read_guest_fixture(&guest_root.join("minios-guest-sched-b"))?;
+    let fault = guest_root.join("minios-guest-proc-fault");
+    let survivor = guest_root.join("minios-guest-sched-b");
     let minictr = workspace.join("target/debug/minictr");
+    let normal = run_multi_build_path(
+        &minictr,
+        &kernel,
+        &[
+            ("first", survivor.as_path(), vec![]),
+            ("second", survivor.as_path(), vec![]),
+        ],
+    )?;
+    check_multi_normal_result(normal.status, &normal.stdout, &normal.stderr)?;
+    transcript.push_str(&format!("e2e: multi-task normal成功 (pid0=7, pid1=7, b1/b2/b3各2回, minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)\n", normal.minictr_pid, normal.qemu_before, normal.qemu_after, normal.elapsed.as_secs_f64()));
     for mode in ["illegal", "store"] {
         let report = run_multi_fault_path(&minictr, &kernel, &fault, &survivor, mode)?;
         transcript.push_str(&format!("e2e: multi-task {mode}分離成功 (pid0=70, pid1=7, b3到達, minictr pid={}, qemu before={:?} after={:?}, elapsed={:.1}s)\n", report.minictr_pid, report.qemu_before, report.qemu_after, report.elapsed.as_secs_f64()));
@@ -365,43 +375,58 @@ fn read_guest_fixture(path: &Path) -> Result<Vec<u8>, E2EError> {
     std::fs::read(path).map_err(|_| E2EError::MissingGuestElf(path.to_owned()))
 }
 
-fn run_multi_fault_path(
+/// 公開build-multi/exportで登録と決定的なbundle bytesを確認して起動する。
+fn run_multi_build_path(
     minictr: &Path,
     kernel: &Path,
-    fault: &[u8],
-    survivor: &[u8],
-    mode: &str,
+    images: &[(&str, &Path, Vec<&str>)],
 ) -> Result<CaseReport, E2EError> {
-    let bytes = minicontainer_bundle::build_multi(&[
-        minicontainer_bundle::ImageSpec {
-            name: "fault",
-            args: &[mode],
-            elf: fault,
-        },
-        minicontainer_bundle::ImageSpec {
-            name: "survivor",
-            args: &[],
-            elf: survivor,
-        },
-    ])
-    .map_err(|error| E2EError::Store(error.to_string()))?;
+    let elfs = images
+        .iter()
+        .map(|(_, path, _)| read_guest_fixture(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let specs = images
+        .iter()
+        .zip(&elfs)
+        .map(|((name, _, args), elf)| minicontainer_bundle::ImageSpec { name, args, elf })
+        .collect::<Vec<_>>();
+    let expected = minicontainer_bundle::build_multi(&specs)
+        .map_err(|error| E2EError::Store(error.to_string()))?;
     let scratch = TempDir::create("minictr-e2e-multi-")?;
     let bundle = scratch.path().join("multi.mcb");
-    std::fs::write(&bundle, bytes).map_err(|error| E2EError::Store(error.to_string()))?;
     let store = TempStore::empty();
+    let stdout = run_checked(
+        minictr,
+        &minictr_multi_build_args(&store.path, images),
+        None,
+        &[],
+        COMMAND_TIMEOUT,
+    )?;
+    parse_build_output(&stdout, E2E_IMAGE)?;
     run_checked(
         minictr,
         &minictr_image_args(
             &store.path,
-            "import",
-            &[OsString::from(E2E_IMAGE), bundle.as_os_str().to_owned()],
+            "export",
+            &[
+                OsString::from(E2E_IMAGE),
+                OsString::from("--output"),
+                bundle.as_os_str().to_owned(),
+            ],
         ),
         None,
         &[],
         COMMAND_TIMEOUT,
     )?;
+    let actual = std::fs::read(&bundle).map_err(|error| E2EError::Store(error.to_string()))?;
+    if actual != expected {
+        return Err(E2EError::UnexpectedRun {
+            case: "multi-task build/export bytes",
+            expected: format!("build_multiの{} bytesと完全一致", expected.len()),
+            actual: format!("exportの{} bytesが不一致", actual.len()),
+        });
+    }
     let report = run_case_in_store(minictr, store, kernel, HAPPY_PATH_TIMEOUT_MS)?;
-    check_multi_fault_result(report.status, &report.stdout, &report.stderr)?;
     let scratch_path = scratch.path().to_owned();
     drop(scratch);
     if scratch_path.exists() {
@@ -413,13 +438,102 @@ fn run_multi_fault_path(
     Ok(report)
 }
 
+fn minictr_multi_build_args(store: &Path, images: &[(&str, &Path, Vec<&str>)]) -> Vec<OsString> {
+    let mut extra = vec![OsString::from(E2E_IMAGE)];
+    for (name, elf, args) in images {
+        extra.extend([
+            OsString::from("--image"),
+            OsString::from(name),
+            elf.as_os_str().to_owned(),
+        ]);
+        for arg in args {
+            extra.extend([OsString::from("--arg"), OsString::from(arg)]);
+        }
+    }
+    minictr_image_args(store, "build-multi", &extra)
+}
+
+fn run_multi_fault_path(
+    minictr: &Path,
+    kernel: &Path,
+    fault: &Path,
+    survivor: &Path,
+    mode: &str,
+) -> Result<CaseReport, E2EError> {
+    let report = run_multi_build_path(
+        minictr,
+        kernel,
+        &[("fault", fault, vec![mode]), ("survivor", survivor, vec![])],
+    )?;
+    check_multi_fault_result(report.status, &report.stdout, &report.stderr)?;
+    Ok(report)
+}
+
+/// 到着順は任意だが、期待したPID結果を過不足なく要求する。
+fn process_result_lines_match(stderr: &[u8], expected: &[u8]) -> bool {
+    let mut actual = stderr
+        .split_inclusive(|byte| *byte == b'\n')
+        .collect::<Vec<_>>();
+    let mut expected = expected
+        .split_inclusive(|byte| *byte == b'\n')
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    actual == expected
+}
+
+/// PIDなしのUART streamが二つのb1→b2→b3の合流であることを確認する。
+fn check_multi_normal_result(
+    status: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), E2EError> {
+    let mut counts = [0; 3];
+    let mut valid = stdout.ends_with(b"\n");
+    for line in stdout.split_inclusive(|byte| *byte == b'\n') {
+        let index = match line {
+            b"b1\n" => 0,
+            b"b2\n" => 1,
+            b"b3\n" => 2,
+            _ => {
+                valid = false;
+                break;
+            }
+        };
+        counts[index] += 1;
+        if counts[index] > 2 || (index > 0 && counts[index] > counts[index - 1]) {
+            valid = false;
+        }
+    }
+    let expected_stderr = b"minictr: process pid=0 code=7\nminictr: process pid=1 code=7\n";
+    if status != Some(7)
+        || !valid
+        || counts != [2, 2, 2]
+        || !process_result_lines_match(stderr, expected_stderr)
+    {
+        return Err(E2EError::UnexpectedRun {
+            case: "multi-task normal",
+            expected: "exit 7、順序を保つb1/b2/b3各2回、pid0=7とpid1=7の結果行".into(),
+            actual: format!(
+                "status {status:?}, stdout {:?}, stderr {:?}",
+                String::from_utf8_lossy(stdout),
+                String::from_utf8_lossy(stderr)
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn check_multi_fault_result(
     status: Option<i32>,
     stdout: &[u8],
     stderr: &[u8],
 ) -> Result<(), E2EError> {
     let expected_stderr = b"minictr: process pid=0 code=70\nminictr: process pid=1 code=7\n";
-    if status != Some(70) || stdout != b"b1\nb2\nb3\n" || stderr != expected_stderr {
+    if status != Some(70)
+        || stdout != b"b1\nb2\nb3\n"
+        || !process_result_lines_match(stderr, expected_stderr)
+    {
         return Err(E2EError::UnexpectedRun {
             case: "multi-task fault分離",
             expected: "exit 70、b1/b2/b3、pid0=70とpid1=7の結果行".into(),
@@ -3360,6 +3474,90 @@ mod tests {
                 Some(70),
                 stdout,
                 b"minictr: process pid=0 code=70\nminictr: process pid=1 code=0\n"
+            )
+            .is_err()
+        );
+    }
+
+    /// 公開commandはimage順序を保ち、argを対応imageに結び付ける。
+    #[test]
+    fn multi_build_uses_public_command_and_preserves_image_order() {
+        let images = [
+            ("fault", Path::new("/tmp/fault"), vec!["store"]),
+            ("survivor", Path::new("/tmp/survivor"), vec![]),
+        ];
+        assert_eq!(
+            minictr_multi_build_args(Path::new("/tmp/store"), &images),
+            [
+                "image",
+                "build-multi",
+                "--store",
+                "/tmp/store",
+                "hello",
+                "--image",
+                "fault",
+                "/tmp/fault",
+                "--arg",
+                "store",
+                "--image",
+                "survivor",
+                "/tmp/survivor"
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    /// UARTの集約streamはPIDを付けず、二つの順序付き出力分を要求する。
+    #[test]
+    fn multi_normal_result_checks_stream_counts_and_process_results() {
+        let stderr = b"minictr: process pid=0 code=7\nminictr: process pid=1 code=7\n";
+        for stdout in [
+            b"b1\nb1\nb2\nb2\nb3\nb3\n".as_slice(),
+            b"b1\nb2\nb3\nb1\nb2\nb3\n".as_slice(),
+        ] {
+            check_multi_normal_result(Some(7), stdout, stderr).unwrap();
+            check_multi_normal_result(
+                Some(7),
+                stdout,
+                b"minictr: process pid=1 code=7\nminictr: process pid=0 code=7\n",
+            )
+            .unwrap();
+        }
+        for stdout in [
+            b"b1\nb2\nb3\n".as_slice(),
+            b"b2\nb1\nb1\nb2\nb3\nb3\n".as_slice(),
+            b"b1\nb1\nb2\nb2\nb3\nb3\nextra\n".as_slice(),
+            b"b1\nb1\nb2\nb2\nb3\nb3".as_slice(),
+            b"b1\nb1\nb1\nb2\nb2\nb3\nb3\n".as_slice(),
+        ] {
+            assert!(check_multi_normal_result(Some(7), stdout, stderr).is_err());
+        }
+        assert!(check_multi_normal_result(Some(0), b"b1\nb1\nb2\nb2\nb3\nb3\n", stderr).is_err());
+        assert!(check_multi_normal_result(Some(7), b"b1\nb1\nb2\nb2\nb3\nb3\n", b"").is_err());
+    }
+
+    // 終了順序はPID順と一致する保証がない。結果の欠落・重複は拒否する。
+    #[test]
+    fn multi_fault_results_accept_either_exit_order_without_duplicates() {
+        check_multi_fault_result(
+            Some(70),
+            b"b1\nb2\nb3\n",
+            b"minictr: process pid=1 code=7\nminictr: process pid=0 code=70\n",
+        )
+        .unwrap();
+        assert!(
+            check_multi_fault_result(
+                Some(70),
+                b"b1\nb2\nb3\n",
+                b"minictr: process pid=0 code=70\nminictr: process pid=0 code=70\n"
+            )
+            .is_err()
+        );
+        assert!(
+            check_multi_normal_result(
+                Some(7),
+                b"b1\nb1\nb2\nb2\nb3\nb3\n",
+                b"minictr: process pid=0 code=7\nminictr: process pid=0 code=7\n"
             )
             .is_err()
         );

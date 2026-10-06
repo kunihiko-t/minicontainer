@@ -17,8 +17,8 @@ ELF領域先頭からの相対offsetを生成する。import時にもELF範囲�
 出力上限1 MiBにはPID結果のwire payload 8 bytesずつも含め、結果数による無制限な蓄積を防ぐ。
 stdin/EOFとdeadline、signal、process・一時fileの回収は既存foreground経路を使う。
 
-detached実行は起動前に拒否する。複数imageを組み立てるCLIは未実装であり、
-この段階は構築済みbundleのimport/runと内部builderを対象とする。
+detached実行は起動前に拒否する。`image build-multi TAG --image NAME ELF ...`で複数imageを構築できる。
+引数の所属と入力規則は[CLI手順](../guide/09-minictr-run.md#複数imageのbundleを構築する)を参照する。
 `image inspect`のname/argsとOCI configは先頭imageの情報を使い、bundle layer自体は全imageのbytesを保持する。
 OCI configから複数taskの構造を復元する契約は設けない。
 
@@ -32,6 +32,7 @@ SHAは小文字40桁で明示する。`--multi`はtask-local fault処理を含�
 `805e6cc1c44da516d6a8b66028aa328893341a21`以降を要求する。
 検証対象checkoutはcleanかつ指定HEADでなければならず、候補用cacheとCargo target dirはリリース経路から分離する。
 通常のv1 E2E（READY、stdin/EOF、stdout/stderr、exit 42、timeout、cleanup）を先に実行し、
+公開build-multi/exportのbytes一致と正常2 taskのPID別code 7を確認し、
 その後illegal instructionとstore faultのcode 70、survivorの出力とcode 7、最終code 70、cleanupを確認する。
 Ubuntu CIは上記の検証SHAを明示して継続検査する。候補の更新はリリースkernel更新とは独立である。
 物理FPGA、macOS実機でのQEMU動作、task別I/Oはこの検査の対象外である。

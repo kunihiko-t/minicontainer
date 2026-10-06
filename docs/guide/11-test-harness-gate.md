@@ -145,7 +145,8 @@ Linux containerのPID 1には孤児processを回収するinitを用意する。
 ## 明示リビジョンでの複数task検査
 
 `cargo xtask compat --minios-rev 086f2e3fa54f751cd28c5fcd2bed205830bd2934 --multi`は、
-通常のhost検査とv1 E2Eに加え、illegal instructionとstore faultでPID 0がcode 70になった後も
+通常のhost検査とv1 E2Eに加え、公開CLIの`image build-multi`で作った正常2 taskの実行、
+`image export`とbuilderのbytes一致、illegal instructionとstore faultでPID 0がcode 70になった後も
 PID 1が出力を継続してcode 7で終了することを公開CLI経由で検査する。
 QEMUと一時fileの回収も検査する。Ubuntu CIはこの明示SHAを検証用に固定する。
 リリースkernelの固定SHAは変更しない。詳細は[複数task実行](../reference/multi-task.md)を参照する。
