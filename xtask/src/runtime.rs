@@ -696,6 +696,9 @@ fn run_revision_e2e(
         echoed.elapsed.as_secs_f64()
     ));
 
+    run_recorded_foundation(&minictr, &kernel)?;
+    log("e2e: 監視記録の正常終了・timeout・stop競合、再読取とcleanup成功");
+
     log("e2e: cli surface pass (QEMUを要しない公開commandを実storeへ実行)");
     run_cli_surface(&minictr, workspace)?;
     log("e2e: cli surface passed");
@@ -705,6 +708,130 @@ fn run_revision_e2e(
     log(&format!("e2e: stress passed ({stress})"));
 
     Ok(transcript)
+}
+
+/// 内部監視APIを実QEMUで試す。公開CLI/detached/state v1は変更しない。
+fn run_recorded_foundation(minictr: &Path, kernel: &Path) -> Result<(), E2EError> {
+    use minicontainer_runtime::{
+        InstanceDir, InstanceRegistration, InstanceRow, RecordStream, RecordedExit,
+        RecordedObservation, RunRecords, RunRequest, Runtime,
+    };
+    let problem = |error: String| E2EError::Store(format!("recorded runtime: {error}"));
+    for case in ["normal", "timeout", "stop"] {
+        let store = TempStore::empty();
+        let root = store.path.clone();
+        let before = qemu_pids()?;
+        let payloads = payload_temp_leftovers();
+        let records = RunRecords::open(&root).map_err(|e| problem(e.to_string()))?;
+        let run = records.begin().map_err(|e| problem(e.to_string()))?;
+        let id = run.id().to_owned();
+        if records.observe(&id).map_err(|e| problem(e.to_string()))? != RecordedObservation::Running
+        {
+            return Err(problem("未確定記録がRunningではない".into()));
+        }
+        let instances = InstanceDir::open(&root).map_err(|e| problem(e.to_string()))?;
+        let stopper = if case == "stop" {
+            let store = root.clone();
+            let minictr = minictr.to_owned();
+            Some(thread::spawn(move || -> Result<(), String> {
+                let dir = InstanceDir::open(&store).map_err(|e| e.to_string())?;
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    let rows = dir.list().map_err(|e| e.to_string())?;
+                    if let Some(InstanceRow::Known { id, .. }) = rows.first() {
+                        let output = Command::new(minictr)
+                            .args([
+                                OsStr::new("stop"),
+                                OsStr::new("--store"),
+                                store.as_os_str(),
+                                OsStr::new("--timeout-ms"),
+                                OsStr::new("100"),
+                                OsStr::new(id),
+                            ])
+                            .output()
+                            .map_err(|e| e.to_string())?;
+                        return if output.status.success() {
+                            Ok(())
+                        } else {
+                            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+                        };
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("stop対象のstateが現れない".into());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }))
+        } else {
+            None
+        };
+        let bundle = hello_bundle_bytes(&if case == "normal" {
+            hello_elf_bytes()
+        } else {
+            spin_elf_bytes()
+        })?;
+        let result = run
+            .supervise(
+                &Runtime::default(),
+                RunRequest {
+                    bundle: &bundle,
+                    kernel,
+                    deadline: Duration::from_millis(if case == "timeout" { 300 } else { 5000 }),
+                    resources: minicontainer_runtime::QemuResources::DEFAULT,
+                    input: None,
+                    interrupts: None,
+                    instances: Some(InstanceRegistration {
+                        dir: &instances,
+                        image: "recorded",
+                        program: OsStr::new("qemu-system-riscv64"),
+                    }),
+                },
+            )
+            .map_err(|e| problem(e.to_string()))?;
+        if let Some(stopper) = stopper {
+            stopper
+                .join()
+                .map_err(|_| problem("stop threadがpanic".into()))?
+                .map_err(problem)?;
+        }
+        let observed = RunRecords::open(&root)
+            .and_then(|r| r.observe(&id))
+            .map_err(|e| problem(e.to_string()))?;
+        match (case, &result, observed) {
+            (
+                "normal",
+                Ok(outcome),
+                RecordedObservation::Finished(RecordedExit::Guest { code: 42, .. }),
+            ) if outcome.exit_code == 42 => {
+                if records
+                    .read_log(&id, RecordStream::Stdout)
+                    .map_err(|e| problem(e.to_string()))?
+                    != E2E_STDOUT
+                    || records
+                        .read_log(&id, RecordStream::Stderr)
+                        .map_err(|e| problem(e.to_string()))?
+                        != E2E_STDERR
+                {
+                    return Err(problem("共有logがguest出力と一致しない".into()));
+                }
+            }
+            (
+                "timeout" | "stop",
+                Err(_),
+                RecordedObservation::Finished(RecordedExit::HostFailure { .. }),
+            ) => {}
+            (_, _, observed) => return Err(problem(format!("{case}: {result:?}, {observed:?}"))),
+        }
+        if !instances
+            .list()
+            .map_err(|e| problem(e.to_string()))?
+            .is_empty()
+        {
+            return Err(problem("実行stateが残留".into()));
+        }
+        check_case_leftovers(&before, &payloads, store, &root)?;
+    }
+    Ok(())
 }
 
 /// 選択したrevisionのminiOS kernelをbuildし、そのbinary pathを返す。
