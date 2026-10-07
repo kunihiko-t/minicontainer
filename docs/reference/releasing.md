@@ -14,6 +14,9 @@ tagを打つ前に、`main`の先端で次のchecklistが全て成功してい�
 4. [公開契約の監査表](public-contract.md)の記述が現行実装と一致し、契約を変える変更が検証根拠と表の更新を同じPRへ含んでいることを確認する。
 5. release notesが、含まれる契約変更をbreakingと互換に分類して記載する。分類の基準は[互換性と移行の方針](compatibility.md)に従う。
 
+公開workflowはtagと同名の`docs/reference/<tag>-release-notes.md`をRelease本文へ取り込み、build commitとchecksum/provenanceの確認手順を追記する。
+tagをpushする前に、この文書が存在することを確認する。公開済みtagやassetは上書きしない。
+
 ## 配布内容
 
 matrixは`macos-15`と`ubuntu-24.04`であり、成果物名のtargetは`aarch64-apple-darwin`と`x86_64-unknown-linux-gnu`である。
@@ -36,7 +39,7 @@ minicontainer-<version>-<target>/
 ```
 
 `minictr`はrelease buildであり、実行bitを付けて格納する。
-`kernel/minios.bin`は固定revision `4865f9be97a6cdcd77c71e36b1ba426b49bd73d7` のminiOSを`--release --locked --target riscv64gc-unknown-none-elf`でbuildしたものである。
+`kernel/minios.bin`は固定revision `086f2e3fa54f751cd28c5fcd2bed205830bd2934` のminiOSを`--release --locked --target riscv64gc-unknown-none-elf`でbuildしたものである。
 配布kernelは[脅威モデル](threat-model.md)の信頼する計算基盤と同じ前提で扱う。
 `MANIFEST.txt`はarchive version、target、各fileのmodeとSHA-256を記録する。
 `SHA256SUMS`は`sha256sum -c`形式でpayloadと`MANIFEST.txt`を検査できる。

@@ -1,12 +1,13 @@
 # MiniContainer
 
-MiniContainerは、miniOSをゲストカーネルとして使い、一つのRISC-V 64アプリケーションを一つのQEMU仮想マシンで実行する学習用マイクロVMランタイムである。
+MiniContainerは、miniOSをゲストカーネルとして使い、静的RISC-V 64ゲストをQEMU仮想マシンで実行する学習用マイクロVMランタイムである。
 仕組みを追える実装を軸に、信頼できる静的RISC-V 64ゲストをローカルで動かす個人開発、デモ、OS教材、ランタイム実験に使う。
 
 `minictr` binary一つで、静的ELFをMiniBundleとして登録し、QEMU上のminiOSで実行し、終了コードと標準入出力をホストへ透過する。
 imageはcontent-addressed storeに置き、ファイルとOCI Image Layoutの両方で持ち出しと取り込みができる。
 v1.0.0で公開契約（MiniBundle format、Guest ABI、CLI構文と終了コード、instance state、OCI対応）を固定した。
-変更は[v1.0.0 release notes](docs/reference/v1.0.0-release-notes.md)に、保証と検証根拠の対応は[公開契約の監査表](docs/reference/public-contract.md)に記載している。
+v1.1.0では標準kernelを更新し、複数imageの構築とforeground実行、task-local fault分離を提供する。
+変更は[v1.1.0 release notes](docs/reference/v1.1.0-release-notes.md)に、保証と検証根拠の対応は[公開契約の監査表](docs/reference/public-contract.md)に記載している。
 
 DockerやOCI runtime、Linuxコンテナとの互換性はない。
 OCI対応はMiniBundle用artifactの配布形式に限る。
@@ -84,7 +85,7 @@ Guest ABIは`minios-abi-v0.2.0`に固定している。
 
 ```sh
 git clone https://github.com/kunihiko-t/minios.git "$MINIOS"
-git -C "$MINIOS" checkout 4865f9be97a6cdcd77c71e36b1ba426b49bd73d7
+git -C "$MINIOS" checkout 086f2e3fa54f751cd28c5fcd2bed205830bd2934
 cargo build --manifest-path "$MINIOS/Cargo.toml" --target-dir "$MINIOS/target" -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --locked
 ```
 
@@ -223,7 +224,7 @@ usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
-`--version`は`minictr 1.0.0`を標準出力へ出して0で終わる。
+`--version`は`minictr 1.1.0`を標準出力へ出して0で終わる。
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。
 
@@ -307,7 +308,7 @@ parserのfuzzは`cargo xtask fuzz --target <bundle|uart>`で実行し、finding�
 | 変更時の解釈基準 | [互換性と移行の方針](docs/reference/compatibility.md) |
 | 安全境界 | [脅威モデル](docs/reference/threat-model.md)、[Security Policy](SECURITY.md) |
 | 配布と導入 | [配布手順](docs/reference/releasing.md) |
-| 版ごとの変更 | [v1.0.0 release notes](docs/reference/v1.0.0-release-notes.md)、[v0.1.0 release notes](docs/reference/v0.1.0-release-notes.md) |
+| 版ごとの変更 | [v1.1.0 release notes](docs/reference/v1.1.0-release-notes.md)、[v1.0.0 release notes](docs/reference/v1.0.0-release-notes.md)、[v0.1.0 release notes](docs/reference/v0.1.0-release-notes.md) |
 | 到達した節目 | [ロードマップ](docs/reference/roadmap.md) |
 | 開発への参加 | [CONTRIBUTING](CONTRIBUTING.md) |
 
