@@ -1,6 +1,6 @@
 //! opt-in監視の永続結果。CLIとinstance state v1を変更しない内部基盤。
 
-use crate::instance::{Probe, probe_identity};
+use crate::instance::{InstanceState, Probe, probe_identity};
 use crate::{
     OutputSink, ProcessBackend, RunOutcome, RunRequest, Runtime, RuntimeError, SessionEvent,
 };
@@ -235,6 +235,55 @@ impl RunRecords {
         )
     }
 
+    /// QEMU stateへの関連を読む。基盤のみで保存した旧記録には存在しない。
+    pub fn instance(&self, id: &str) -> io::Result<Option<String>> {
+        self.observe(id)?;
+        let path = self.directory(id)?.join("instance");
+        let bytes = match bounded_file(&path, 2048) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let state = linked_state(&bytes)?;
+        Ok(Some(format!("i-{}", state.pid)))
+    }
+
+    /// 現boot・登録state・process identityが一致する停止用リンクだけを返す。
+    /// 過去のPIDが他のrunへ再利用された場合は表示しない。
+    pub fn active_instance(&self, id: &str) -> io::Result<Option<String>> {
+        let Some(instance) = self.instance(id)? else {
+            return Ok(None);
+        };
+        let root = self.directory(id)?;
+        let snapshot = Snapshot::decode(&bounded_file(&root.join("snapshot"), MAX_RECORD)?)?;
+        if boot_identity().ok().as_ref() != Some(&snapshot.boot) {
+            return Ok(None);
+        }
+        let saved = linked_state(&bounded_file(&root.join("instance"), 2048)?)?;
+        let state_path = self
+            .root
+            .parent()
+            .ok_or_else(invalid)?
+            .join("run")
+            .join(format!("{instance}.state"));
+        checked_directory(state_path.parent().ok_or_else(invalid)?)?;
+        let bytes = match bounded_file(&state_path, 1024) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let current = InstanceState::parse(&bytes).ok_or_else(invalid)?;
+        Ok(
+            if current == saved
+                && matches!(probe_identity(saved.pid), Probe::Found(identity) if identity.running && identity.token == saved.token && identity.comm == saved.comm)
+            {
+                Some(instance)
+            } else {
+                None
+            },
+        )
+    }
+
     /// 共有出力を上限付きで読む。firmware診断やtask別streamは提供しない。
     pub fn read_log(&self, id: &str, stream: RecordStream) -> io::Result<Vec<u8>> {
         bounded_file(&self.directory(id)?.join(stream.name()), MAX_LOG)
@@ -257,9 +306,19 @@ impl RecordedRun {
     /// 既存runtimeがQEMUを所有しwait/reapとcleanupを終えるまで監視する。
     /// この関数自体はforkやdaemon登録をせず、呼び出しprocessが監視役になる。
     pub fn supervise<B: ProcessBackend>(
+        self,
+        runtime: &Runtime<B>,
+        request: RunRequest<'_>,
+    ) -> Result<Result<RunOutcome, RuntimeError>, RecordingFailure> {
+        self.supervise_with_sink(runtime, request, &mut crate::Discard)
+    }
+
+    /// 保存を先に行い、その後observerへREADYやstate登録を通知する。
+    pub fn supervise_with_sink<B: ProcessBackend, S: OutputSink>(
         mut self,
         runtime: &Runtime<B>,
         request: RunRequest<'_>,
+        observer: &mut S,
     ) -> Result<Result<RunOutcome, RuntimeError>, RecordingFailure> {
         if !self.owns_record() {
             return Err(RecordingFailure {
@@ -267,7 +326,13 @@ impl RecordedRun {
                 run_result: None,
             });
         }
-        let result = runtime.run_with_sink(request, &mut self);
+        let result = runtime.run_with_sink(
+            request,
+            &mut RecordedObserver {
+                record: &mut self,
+                observer,
+            },
+        );
         self.snapshot.result = Some(match &result {
             Ok(outcome) => RecordedExit::Guest {
                 code: outcome.exit_code,
@@ -310,6 +375,20 @@ impl RecordedRun {
 }
 
 impl OutputSink for RecordedRun {
+    fn registered(&mut self, id: &str, state: &InstanceState) -> io::Result<()> {
+        if !self.owns_record() || !canonical_instance(id) {
+            return Err(invalid());
+        }
+        if id != format!("i-{}", state.pid) || state.token == 0 {
+            return Err(invalid());
+        }
+        let mut bytes = b"minicontainer-instance-link-v1\n".to_vec();
+        bytes.extend(state.encode());
+        if bytes.len() > 2048 {
+            return Err(invalid());
+        }
+        atomic_record_file(&self.root, "instance", &bytes)
+    }
     fn push(&mut self, event: &SessionEvent) -> io::Result<()> {
         if !self.owns_record() {
             return Err(invalid());
@@ -328,6 +407,36 @@ impl OutputSink for RecordedRun {
         *length += bytes.len() as u64;
         Ok(())
     }
+}
+
+struct RecordedObserver<'a, S> {
+    record: &'a mut RecordedRun,
+    observer: &'a mut S,
+}
+impl<S: OutputSink> OutputSink for RecordedObserver<'_, S> {
+    fn registered(&mut self, id: &str, state: &InstanceState) -> io::Result<()> {
+        self.record.registered(id, state)?;
+        self.observer.registered(id, state)
+    }
+    fn push(&mut self, event: &SessionEvent) -> io::Result<()> {
+        self.record.push(event)?;
+        self.observer.push(event)
+    }
+}
+fn linked_state(bytes: &[u8]) -> io::Result<InstanceState> {
+    let bytes = bytes
+        .strip_prefix(b"minicontainer-instance-link-v1\n")
+        .ok_or_else(invalid)?;
+    let state = InstanceState::parse(bytes).ok_or_else(invalid)?;
+    if state.pid == 0 || state.token == 0 {
+        return Err(invalid());
+    }
+    Ok(state)
+}
+fn canonical_instance(id: &str) -> bool {
+    id.strip_prefix("i-")
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some_and(|pid| pid > 0 && id == format!("i-{pid}"))
 }
 
 impl Drop for RecordedRun {
@@ -452,6 +561,10 @@ fn bounded_file(path: &Path, maximum: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 fn atomic_snapshot(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+    atomic_record_file(root, "snapshot", &snapshot.encode())
+}
+
+fn atomic_record_file(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     checked_directory(root)?;
     let temporary = root.join(format!(
         ".snapshot-{}-{}",
@@ -460,9 +573,9 @@ fn atomic_snapshot(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     ));
     let result = (|| {
         let mut file = private_file(&temporary)?;
-        file.write_all(&snapshot.encode())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, root.join("snapshot"))?;
+        fs::rename(&temporary, root.join(name))?;
         File::open(root)?.sync_all()
     })();
     if result.is_err() {
@@ -622,6 +735,72 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn reused_pid_or_replaced_state_has_no_active_link() {
+        let temp = Temp::new();
+        let records = RunRecords::open(&temp.0).unwrap();
+        let mut run = records.begin().unwrap();
+        let pid = std::process::id();
+        let Probe::Found(identity) = probe_identity(pid) else {
+            panic!("identity");
+        };
+        let mut state = InstanceState {
+            pid,
+            token: identity.token,
+            comm: identity.comm,
+            image: "hello".into(),
+            started: 1,
+            payload: PathBuf::from("/tmp/minicontainer-run-test"),
+        };
+        let id = format!("i-{pid}");
+        run.registered(&id, &state).unwrap();
+        let dir = temp.0.join("run");
+        private_directory(&dir).unwrap();
+        let file = format!("{id}.state");
+        atomic_record_file(&dir, &file, &state.encode()).unwrap();
+        assert_eq!(records.active_instance(run.id()).unwrap(), Some(id.clone()));
+        state.token += 1;
+        atomic_record_file(&dir, &file, &state.encode()).unwrap();
+        assert_eq!(records.active_instance(run.id()).unwrap(), None);
+        state.token -= 1;
+        state.image = "other-run".into();
+        atomic_record_file(&dir, &file, &state.encode()).unwrap();
+        assert_eq!(records.active_instance(run.id()).unwrap(), None);
+    }
+
+    #[test]
+    fn instance_link_is_private_bounded_and_optional() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = Temp::new();
+        let records = RunRecords::open(&temp.0).unwrap();
+        let mut run = records.begin().unwrap();
+        assert_eq!(records.instance(run.id()).unwrap(), None);
+        let identity = InstanceState {
+            pid: 123,
+            token: 99,
+            comm: "qemu".into(),
+            image: "hello".into(),
+            started: 1,
+            payload: PathBuf::from("/tmp/minicontainer-run-test"),
+        };
+        assert!(run.registered("i-01", &identity).is_err());
+        run.registered("i-123", &identity).unwrap();
+        assert_eq!(
+            records.instance(run.id()).unwrap().as_deref(),
+            Some("i-123")
+        );
+        let link = run.root.join("instance");
+        assert_eq!(
+            fs::metadata(&link).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::write(&link, vec![b'x'; 2049]).unwrap();
+        assert!(records.instance(run.id()).is_err());
+        fs::remove_file(&link).unwrap();
+        symlink("snapshot", &link).unwrap();
+        assert!(records.instance(run.id()).is_err());
     }
 
     #[test]

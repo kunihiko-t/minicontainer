@@ -24,6 +24,10 @@ pub enum Command {
     Version,
     /// MiniBundleを一つのQEMU仮想machineで実行する。
     Run(RunArgs),
+    /// READYを確認して監視記録IDを返す。
+    Start(RunArgs),
+    /// 保存された実行結果を読む。
+    Status(StatusArgs),
     /// host環境を実行前に診断する。
     Doctor(DoctorArgs),
     /// 記録済みinstanceのlive/stale/corrupt状態を一覧する。
@@ -32,6 +36,13 @@ pub enum Command {
     Stop(StopArgs),
     /// imageのbuildなどstore内容を操作する。
     Image(ImageCommand),
+}
+
+/// 監視記録の再接続用引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusArgs {
+    pub query: StopArgs,
+    pub wait: bool,
 }
 
 /// `image` commandの型付きsubcommand。
@@ -404,6 +415,8 @@ pub enum CliError {
     MissingImage,
     /// `stop`にinstance idが与えられなかった。
     MissingStopId,
+    /// statusの観測IDがない。
+    MissingStatusId,
     /// `stop`のinstance idが`i-<pid>`の形ではない。
     InvalidInstanceId(String),
     /// `image build`にimageが与えられなかった。
@@ -480,6 +493,9 @@ impl fmt::Display for CliError {
                 write!(formatter, "unknown minictr command: {command}")
             }
             Self::MissingImage => formatter.write_str("missing image for `minictr run`"),
+            Self::MissingStatusId => {
+                formatter.write_str("missing observation id for `minictr status`")
+            }
             Self::MissingStopId => formatter.write_str("missing instance id for `minictr stop`"),
             Self::InvalidInstanceId(id) => {
                 write!(formatter, "invalid instance id: {id}")
@@ -582,7 +598,7 @@ impl std::error::Error for CliError {}
 
 /// 公開command syntax。
 pub fn help() -> &'static str {
-    "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image build-multi TAG --image NAME ELF [--arg VALUE]... [--image NAME ELF [--arg VALUE]...]... [--store PATH]\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+    "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr start [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr status [--store PATH] [--wait] [--timeout-ms N] ID\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image build-multi TAG --image NAME ELF [--arg VALUE]... [--image NAME ELF [--arg VALUE]...]... [--store PATH]\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
 }
 
 /// OS引数からcommandをparseする。
@@ -593,7 +609,8 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
     match command.as_str() {
         "help" | "--help" => return parse_bare_command(arguments, Command::Help),
         "--version" => return parse_bare_command(arguments, Command::Version),
-        "run" => {}
+        "run" | "start" => {}
+        "status" => return parse_status(arguments),
         "doctor" => return parse_doctor(arguments),
         "ps" => return parse_ps(arguments),
         "stop" => return parse_stop(arguments),
@@ -695,6 +712,9 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
                     cpus = Some(parse_cpus(&value)?);
                 }
                 "--detach" => {
+                    if command == "start" {
+                        return Err(CliError::UnknownOption(name));
+                    }
                     if inline_value.is_some() {
                         return Err(CliError::UnexpectedValue("--detach"));
                     }
@@ -718,7 +738,7 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
     let Some(image) = image else {
         return Err(CliError::MissingImage);
     };
-    Ok(Command::Run(RunArgs {
+    let args = RunArgs {
         image,
         store,
         kernel,
@@ -726,7 +746,12 @@ pub fn parse_os(arguments: impl IntoIterator<Item = OsString>) -> Result<Command
         memory_mib: memory_mib.unwrap_or(QemuResources::DEFAULT_MEMORY_MIB),
         cpus: cpus.unwrap_or(QemuResources::DEFAULT_CPUS),
         detach,
-    }))
+    };
+    Ok(if command == "start" {
+        Command::Start(args)
+    } else {
+        Command::Run(args)
+    })
 }
 
 /// `image build`の引数をparseする。optionはIMAGEとELFの前後どこに
@@ -1065,9 +1090,57 @@ fn parse_ps(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, Cl
     Ok(Command::Ps(PsArgs { store }))
 }
 
+/// `status`は停止用path/期限解決を共有する。記録IDはruntimeでも再検証する。
+fn parse_status(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    let mut wait = false;
+    let mut pending = Vec::new();
+    let mut value = false;
+    for arg in arguments {
+        if value {
+            value = false;
+            pending.push(arg);
+            continue;
+        }
+        if arg == "--store" || arg == "--timeout-ms" {
+            value = true;
+        }
+        if arg == "--wait" {
+            if wait {
+                return Err(CliError::DuplicateOption("--wait"));
+            }
+            wait = true;
+        } else {
+            pending.push(arg);
+        }
+    }
+    let Command::Stop(query) = parse_observation(pending).map_err(|e| {
+        if matches!(e, CliError::MissingStopId) {
+            CliError::MissingStatusId
+        } else {
+            e
+        }
+    })?
+    else {
+        unreachable!()
+    };
+    Ok(Command::Status(StatusArgs { query, wait }))
+}
+
+/// 停止構文を再利用し、記録IDだけは構造を保ったまま受理する。
+fn parse_observation(arguments: Vec<OsString>) -> Result<Command, CliError> {
+    parse_stop_inner(arguments, true)
+}
+
 /// `stop`の引数をparseする。`--store`と`--timeout-ms`はINSTANCEの前後
 /// どこに置いてもよい。idは`i-<pid>`のcanonicalな形だけを受理する。
 fn parse_stop(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
+    parse_stop_inner(arguments, false)
+}
+
+fn parse_stop_inner(
+    arguments: impl IntoIterator<Item = OsString>,
+    observation: bool,
+) -> Result<Command, CliError> {
     let mut id: Option<String> = None;
     let mut store: Option<PathBuf> = None;
     let mut timeout: Option<Duration> = None;
@@ -1118,7 +1191,7 @@ fn parse_stop(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
     let Some(id) = id else {
         return Err(CliError::MissingStopId);
     };
-    if !is_instance_id(&id) {
+    if !is_instance_id(&id) && !(observation && is_record_id(&id)) {
         return Err(CliError::InvalidInstanceId(id));
     }
     Ok(Command::Stop(StopArgs {
@@ -1126,6 +1199,20 @@ fn parse_stop(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, 
         store,
         timeout: timeout.unwrap_or(DEFAULT_STOP_TIMEOUT),
     }))
+}
+
+/// 保存名のcanonical表記だけを受理し、path traversalを排除する。
+pub fn is_record_id(id: &str) -> bool {
+    let parts: Vec<_> = id.split('-').collect();
+    parts.len() == 4
+        && parts[0] == "r"
+        && parts[1..].iter().enumerate().all(|(index, digits)| {
+            digits.parse::<u64>().is_ok_and(|n| {
+                n.to_string() == *digits
+                    && (index > 1 || n > 0)
+                    && (index != 0 || n <= u32::MAX as u64)
+            })
+        })
 }
 
 /// `i-<pid>`のcanonicalな形かを検査する。`i-042`やu32に収まらない値は
@@ -2260,8 +2347,8 @@ mod tests {
         assert_eq!(parse(["run"]), Err(CliError::MissingImage));
         assert_eq!(parse([] as [&str; 0]), Err(CliError::MissingCommand));
         assert_eq!(
-            parse(["status"]),
-            Err(CliError::UnknownCommand("status".to_owned()))
+            parse(["unavailable"]),
+            Err(CliError::UnknownCommand("unavailable".to_owned()))
         );
         assert_eq!(
             parse(["run", "--volume", "data", "hello"]),
@@ -2670,7 +2757,7 @@ mod tests {
     fn help_names_the_public_run_syntax() {
         assert_eq!(
             help(),
-            "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image build-multi TAG --image NAME ELF [--arg VALUE]... [--image NAME ELF [--arg VALUE]...]... [--store PATH]\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
+            "usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr start [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE\nusage: minictr status [--store PATH] [--wait] [--timeout-ms N] ID\nusage: minictr ps [--store PATH]\nusage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>\nusage: minictr doctor [--store PATH] [--kernel PATH]\nusage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF\nusage: minictr image build-multi TAG --image NAME ELF [--arg VALUE]... [--image NAME ELF [--arg VALUE]...]... [--store PATH]\nusage: minictr image import [--store PATH] IMAGE FILE\nusage: minictr image export [--store PATH] IMAGE --output PATH\nusage: minictr image list [--store PATH]\nusage: minictr image inspect [--store PATH] IMAGE\nusage: minictr image remove [--store PATH] IMAGE\nusage: minictr image prune [--store PATH] [--dry-run] [--force]\nusage: minictr image export-oci [--store PATH] IMAGE --output DIR\nusage: minictr image import-oci [--store PATH] IMAGE DIR\nusage: minictr image pull-oci [--store PATH] IMAGE REFERENCE"
         );
     }
 
@@ -2718,7 +2805,9 @@ mod tests {
     /// 記述とみなす。`minictr not found`のような診断文はtop verbが一致
     /// しないのでproseとして捨てる。
     fn documented_command_paths(root: &std::path::Path) -> std::collections::BTreeSet<String> {
-        const TOP_VERBS: [&str; 6] = ["run", "doctor", "ps", "stop", "image", "help"];
+        const TOP_VERBS: [&str; 8] = [
+            "run", "start", "status", "doctor", "ps", "stop", "image", "help",
+        ];
         let mut paths = std::collections::BTreeSet::new();
         for file in markdown_files(root) {
             let Ok(contents) = std::fs::read_to_string(&file) else {
@@ -4368,5 +4457,42 @@ mod tests {
                 store: PathBuf::from("/env/store"),
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<Command, CliError> {
+        parse_os(args.iter().map(OsString::from))
+    }
+    #[test]
+    fn start_is_additive_and_refuses_detach() {
+        assert!(matches!(parse(&["start", "hello"]), Ok(Command::Start(_))));
+        assert!(parse(&["start", "--detach", "hello"]).is_err());
+        assert!(matches!(
+            parse(&["run", "--detach", "hello"]),
+            Ok(Command::Run(_))
+        ));
+    }
+    #[test]
+    fn status_accepts_record_and_legacy_ids_only() {
+        assert!(matches!(
+            parse(&["status", "--wait", "r-12-34-0"]),
+            Ok(Command::Status(StatusArgs { wait: true, .. }))
+        ));
+        assert!(parse(&["status", "i-12"]).is_ok());
+        for id in [
+            "r-01-2-3",
+            "r-0-2-3",
+            "r-1-0-3",
+            "r-1-2-03",
+            "../snapshot",
+            "r-4294967296-2-3",
+        ] {
+            assert!(parse(&["status", id]).is_err(), "{id}");
+        }
+        assert!(parse(&["status", "--wait", "--wait", "r-1-2-3"]).is_err());
+        assert!(parse(&["stop", "r-1-2-3"]).is_err());
     }
 }

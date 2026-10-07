@@ -2,6 +2,7 @@
 
 mod cli;
 mod multi_build;
+mod supervision;
 
 use std::{
     ffi::{OsStr, OsString},
@@ -39,6 +40,9 @@ pub const RUNTIME_EXIT: i32 = 125;
 pub const DOCTOR_EXIT: i32 = 1;
 
 fn main() {
+    if let Some(code) = supervision::monitor_dispatch() {
+        std::process::exit(code);
+    }
     let code = real_main(
         std::env::args_os().skip(1),
         &RealEnv,
@@ -83,6 +87,20 @@ pub fn real_main(
             };
             run_resolved(&resolved, &RealRunner, &RealStore, stdout, stderr)
         }
+        Command::Start(args) => match resolve(&args, env) {
+            Ok(resolved) => supervision::start(&resolved, stdout, stderr),
+            Err(error) => {
+                let _ = writeln!(stderr, "minictr: {error}");
+                USAGE_EXIT
+            }
+        },
+        Command::Status(args) => match resolve_stop(&args.query, env) {
+            Ok(resolved) => supervision::status(&resolved, args.wait, stdout, stderr),
+            Err(error) => {
+                let _ = writeln!(stderr, "minictr: {error}");
+                USAGE_EXIT
+            }
+        },
         Command::Doctor(args) => {
             let resolved = match resolve_doctor(&args, env) {
                 Ok(resolved) => resolved,

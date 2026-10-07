@@ -696,6 +696,9 @@ fn run_revision_e2e(
         echoed.elapsed.as_secs_f64()
     ));
 
+    run_supervised_startup_failures(&minictr)?;
+    run_supervised_cli(&minictr, &kernel, workspace)?;
+    log("e2e: 監視CLIの再接続・短命guest・timeout・stop競合・signal・監視役喪失と手動回収成功");
     run_recorded_foundation(&minictr, &kernel)?;
     log("e2e: 監視記録の正常終了・timeout・stop競合、再読取とcleanup成功");
 
@@ -711,6 +714,303 @@ fn run_revision_e2e(
 }
 
 /// 内部監視APIを実QEMUで試す。公開CLI/detached/state v1は変更しない。
+/// READYを送らない実QEMU kernelで、親の起動中断が監視役へ伝わることを検査する。
+fn run_supervised_startup_failures(minictr: &Path) -> Result<(), E2EError> {
+    use minicontainer_runtime::{InstanceDir, RecordedExit, RecordedObservation, RunRecords};
+    let problem = |message: String| E2EError::Store(format!("supervised startup: {message}"));
+    for interrupted in [false, true] {
+        let before = qemu_pids()?;
+        let payloads = payload_temp_leftovers();
+        let store = prepare_store(&hello_elf_bytes())?;
+        let root = store.path.clone();
+        let kernel = root.join("no-ready-kernel");
+        std::fs::write(&kernel, build_elf_at(KERNEL_ENTRY, &[LOOP]))
+            .map_err(|e| problem(e.to_string()))?;
+        let args = vec![
+            OsString::from("start"),
+            OsString::from("--store"),
+            root.as_os_str().to_owned(),
+            OsString::from("--kernel"),
+            kernel.as_os_str().to_owned(),
+            OsString::from("--timeout-ms"),
+            OsString::from(if interrupted { "5000" } else { "500" }),
+            OsString::from(E2E_IMAGE),
+        ];
+        let completed = if interrupted {
+            let spawned = spawn_in_own_group(minictr, &args, None, &[], None)?;
+            let spawned = wait_for_qemu_boot(spawned, &before)?;
+            signal_process(spawned.pid, libc::SIGINT).map_err(|e| problem(e.to_string()))?;
+            wait_for_exit(spawned, INTERRUPT_EXIT_TIMEOUT)?
+        } else {
+            run_with_timeout(minictr, &args, None, &[], COMMAND_TIMEOUT)?
+        };
+        if completed.status.code() != Some(125) || !completed.stdout.is_empty() {
+            return Err(problem(format!("READYなしの起動が成功扱い: {completed:?}")));
+        }
+        let directory = root.join("results");
+        let records = RunRecords::open(&root).map_err(|e| problem(e.to_string()))?;
+        let entries = std::fs::read_dir(directory).map_err(|e| problem(e.to_string()))?;
+        let mut count = 0;
+        for entry in entries {
+            let id = entry
+                .map_err(|e| problem(e.to_string()))?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if !matches!(
+                records.observe(&id).map_err(|e| problem(e.to_string()))?,
+                RecordedObservation::Finished(RecordedExit::HostFailure { .. })
+            ) {
+                return Err(problem("中断した監視結果が確定host失敗でない".into()));
+            }
+            count += 1;
+        }
+        if count != 1 {
+            return Err(problem(format!("監視記録数が不正: {count}")));
+        }
+        if !InstanceDir::open(&root)
+            .and_then(|d| d.list())
+            .map_err(|e| problem(e.to_string()))?
+            .is_empty()
+        {
+            return Err(problem("起動中断後にstateが残留".into()));
+        }
+        check_case_leftovers(&before, &payloads, store, &root)?;
+    }
+    // v2は監視役をspawnする前に拒否する。
+    let before = qemu_pids()?;
+    let payloads = payload_temp_leftovers();
+    let elf = hello_elf_bytes();
+    let bundle = minicontainer_bundle::build_multi(&[
+        minicontainer_bundle::ImageSpec {
+            name: "one",
+            args: &[],
+            elf: &elf,
+        },
+        minicontainer_bundle::ImageSpec {
+            name: "two",
+            args: &[],
+            elf: &elf,
+        },
+    ])
+    .map_err(|e| problem(e.to_string()))?;
+    let store = TempStore::with_bundle(&bundle)?;
+    let root = store.path.clone();
+    let args = [
+        OsString::from("start"),
+        OsString::from("--store"),
+        root.as_os_str().to_owned(),
+        OsString::from(E2E_IMAGE),
+    ];
+    let result = run_with_timeout(minictr, &args, None, &[], COMMAND_TIMEOUT)?;
+    if result.status.code() != Some(125)
+        || !result.stdout.is_empty()
+        || root.join("results").exists()
+        || root.join("run").exists()
+    {
+        return Err(problem("v2拒否前に監視副作用がある".into()));
+    }
+    check_case_leftovers(&before, &payloads, store, &root)?;
+    Ok(())
+}
+
+/// 実CLIを別processから再接続し、保存結果と旧state回収を確認する。
+fn run_supervised_cli(minictr: &Path, kernel: &Path, workspace: &Path) -> Result<(), E2EError> {
+    use minicontainer_runtime::{InstanceDir, InstanceRow, RecordStream, RunRecords};
+    let problem = |message: String| E2EError::Store(format!("supervised CLI: {message}"));
+    let echo = std::fs::read(workspace.join(GUEST_ECHO_ELF)).map_err(|e| problem(e.to_string()))?;
+    for case in [
+        "normal",
+        "normal",
+        "normal",
+        "normal",
+        "echo",
+        "timeout",
+        "stop",
+        "interrupt",
+        "lost",
+    ] {
+        let before = qemu_pids()?;
+        let payloads = payload_temp_leftovers();
+        let guest_success = case == "normal" || case == "echo";
+        let store = prepare_store(&if case == "echo" {
+            echo.clone()
+        } else if case == "normal" {
+            hello_elf_bytes()
+        } else {
+            spin_elf_bytes()
+        })?;
+        let root = store.path.clone();
+        let args = |verb: &str, extra: &[&str]| -> Vec<OsString> {
+            let mut values = vec![
+                OsString::from(verb),
+                OsString::from("--store"),
+                root.as_os_str().to_owned(),
+            ];
+            values.extend(extra.iter().map(OsString::from));
+            values
+        };
+        let mut start = args(
+            "start",
+            &[
+                "--timeout-ms",
+                if case == "timeout" { "1200" } else { "10000" },
+            ],
+        );
+        start.extend([
+            OsString::from("--kernel"),
+            kernel.as_os_str().to_owned(),
+            OsString::from(E2E_IMAGE),
+        ]);
+        let bytes = run_checked(minictr, &start, None, &[], COMMAND_TIMEOUT)?;
+        let id = std::str::from_utf8(&bytes)
+            .map_err(|e| problem(e.to_string()))?
+            .trim()
+            .to_owned();
+        let monitor = id
+            .split('-')
+            .nth(1)
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or_else(|| problem(format!("起動IDが不正: {id}")))?;
+        let records = RunRecords::open(&root).map_err(|e| problem(e.to_string()))?;
+        let instance = records
+            .instance(&id)
+            .map_err(|e| problem(e.to_string()))?
+            .ok_or_else(|| problem("QEMU関連IDがない".into()))?;
+        let inspect = |wait: bool, timeout: &str| {
+            let mut query = args("status", &["--timeout-ms", timeout]);
+            if wait {
+                query.push(OsString::from("--wait"));
+            }
+            query.push(OsString::from(&id));
+            run_with_timeout(minictr, &query, None, &[], COMMAND_TIMEOUT)
+        };
+        let verification = (|| -> Result<(), E2EError> {
+            if !guest_success {
+                let running = inspect(false, "1000")?;
+                if !running.status.success() || !running.stdout.starts_with(b"running\t-\ti-") {
+                    return Err(problem(format!("実行中の再接続失敗: {running:?}")));
+                }
+                let expired = inspect(true, "20")?;
+                if expired.status.code() != Some(125) || !expired.stdout.starts_with(b"running\t-")
+                {
+                    return Err(problem("待機timeoutが実行を停止した".into()));
+                }
+                let legacy = run_with_timeout(
+                    minictr,
+                    &args("status", &[&instance]),
+                    None,
+                    &[],
+                    COMMAND_TIMEOUT,
+                )?;
+                if legacy.status.code() != Some(125) || !legacy.stdout.starts_with(b"unknown\t-") {
+                    return Err(problem("旧stateを確定結果として扱った".into()));
+                }
+            }
+            match case {
+                "stop" => {
+                    run_checked(
+                        minictr,
+                        &args("stop", &["--timeout-ms", "100", &instance]),
+                        None,
+                        &[],
+                        COMMAND_TIMEOUT,
+                    )?;
+                }
+                "interrupt" => {
+                    signal_process(monitor, libc::SIGTERM).map_err(|e| problem(e.to_string()))?
+                }
+                "lost" => {
+                    signal_process(monitor, libc::SIGKILL).map_err(|e| problem(e.to_string()))?;
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        let observation = inspect(false, "1000")?;
+                        if observation.stdout.starts_with(b"unknown\t-") {
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(problem("監視役喪失をunknownにできない".into()));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    run_checked(
+                        minictr,
+                        &args("stop", &["--timeout-ms", "100", &instance]),
+                        None,
+                        &[],
+                        COMMAND_TIMEOUT,
+                    )?;
+                }
+                _ => {}
+            }
+            let result = inspect(true, "5000")?;
+            let expected = if guest_success {
+                b"exited\t42\t".as_slice()
+            } else if case == "lost" {
+                b"unknown\t-\t".as_slice()
+            } else {
+                b"failed\t125\t".as_slice()
+            };
+            if result.status.code() != Some(if guest_success { 42 } else { 125 })
+                || !result.stdout.starts_with(expected)
+            {
+                return Err(problem(format!("{case}: 保存結果が不正: {result:?}")));
+            }
+            if case == "normal"
+                && (records
+                    .read_log(&id, RecordStream::Stdout)
+                    .map_err(|e| problem(e.to_string()))?
+                    != E2E_STDOUT
+                    || records
+                        .read_log(&id, RecordStream::Stderr)
+                        .map_err(|e| problem(e.to_string()))?
+                        != E2E_STDERR)
+            {
+                return Err(problem("保存共有出力が不一致".into()));
+            }
+            if case == "echo"
+                && (!records
+                    .read_log(&id, RecordStream::Stdout)
+                    .map_err(|e| problem(e.to_string()))?
+                    .is_empty()
+                    || !records
+                        .read_log(&id, RecordStream::Stderr)
+                        .map_err(|e| problem(e.to_string()))?
+                        .is_empty())
+            {
+                return Err(problem("監視起動のecho EOF出力が空でない".into()));
+            }
+            let repeated = inspect(false, "1000")?;
+            if !repeated.stdout.starts_with(expected) {
+                return Err(problem("最終結果の再読取が不一致".into()));
+            }
+            if !InstanceDir::open(&root)
+                .and_then(|d| d.list())
+                .map_err(|e| problem(e.to_string()))?
+                .is_empty()
+            {
+                return Err(problem("stateが残留".into()));
+            }
+            Ok(())
+        })();
+        if verification.is_err() {
+            let _ = signal_process(monitor, libc::SIGTERM);
+            if let Ok(dir) = InstanceDir::open(&root)
+                && let Ok(rows) = dir.list()
+            {
+                for row in rows {
+                    if let InstanceRow::Known { id, .. } = row {
+                        let _ = dir.stop(&id, Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+        verification?;
+        check_case_leftovers(&before, &payloads, store, &root)?;
+    }
+    Ok(())
+}
+
 fn run_recorded_foundation(minictr: &Path, kernel: &Path) -> Result<(), E2EError> {
     use minicontainer_runtime::{
         InstanceDir, InstanceRegistration, InstanceRow, RecordStream, RecordedExit,

@@ -149,6 +149,10 @@ impl InterruptSource for NeverInterrupt {
 /// consumerを待ってrunが期限を延ばすことはない。`Err`を返すとrunは
 /// [`RuntimeError::Consumer`]で中断するが、QEMUの回収とpayload削除は行う。
 pub trait OutputSink {
+    /// state登録後にQEMU instance IDを通知する。失敗も通常cleanupを通る。
+    fn registered(&mut self, _id: &str, _state: &InstanceState) -> io::Result<()> {
+        Ok(())
+    }
     /// 一つのdecode済みeventを順序どおりに受け取る。
     fn push(&mut self, event: &SessionEvent) -> io::Result<()>;
 }
@@ -256,10 +260,16 @@ impl<B: ProcessBackend> Runtime<B> {
             None => None,
         };
 
+        let mut registration_error = instance
+            .as_ref()
+            .and_then(|(_, handle)| sink.registered(handle.id(), handle.state()).err());
         let mut signals = SignalWatch::new(request.interrupts, self.signal_grace);
         let mut input = request.input;
         let mut forwarder: Option<StdinForwarder> = None;
         let primary = 'events: loop {
+            if let Some(error) = registration_error.take() {
+                break Err(RuntimeError::Consumer(error));
+            }
             let bound = signals.bound(deadline);
             // queueにeventが残っていても全体の期限を強制する。backendが期限
             // 過ぎの出力を返し続けても、この検査がrunをtimeoutで終わらせる。

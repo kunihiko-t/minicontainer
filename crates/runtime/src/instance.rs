@@ -153,9 +153,14 @@ pub struct InstanceHandle {
     /// file名のstem。`ps`のINSTANCE列に出る公開名。
     id: String,
     path: PathBuf,
+    state: InstanceState,
 }
 
 impl InstanceHandle {
+    /// 登録時のidentity。現在のPIDが別runへ再利用されても変わらない。
+    pub fn state(&self) -> &InstanceState {
+        &self.state
+    }
     /// instanceの公開名。
     pub fn id(&self) -> &str {
         &self.id
@@ -265,7 +270,7 @@ impl InstanceDir {
         let id = format!("{INSTANCE_PREFIX}{pid}");
         let path = self.root.join(format!("{id}{STATE_SUFFIX}"));
         atomic_write(&path, &state.encode())?;
-        Ok(InstanceHandle { id, path })
+        Ok(InstanceHandle { id, path, state })
     }
 
     /// 登録済みfileを消す。既に無いfileの削除は成功として扱う。
@@ -453,7 +458,7 @@ impl InstanceState {
 
     /// canonical text形式をparseする。version行とfieldの順序・必須性に
     /// 一致しない入力はすべて`None`であり、corruptとして扱われる。
-    fn parse(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
         let rest = bytes.strip_prefix(STATE_VERSION)?;
         let mut lines = rest.split(|byte| *byte == b'\n');
         let pid = parse_field(lines.next(), b"pid=", |text| text.parse::<u32>().ok())?;

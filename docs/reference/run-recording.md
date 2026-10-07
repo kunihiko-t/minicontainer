@@ -46,4 +46,4 @@ cargo run -p minicontainer-runtime --example record-run --locked -- "$STORE" "$B
 stdoutの`record=`行が保存名であり、共有logは上記の明示保存先に残る。
 通常の`cargo xtask check`は実QEMUで正常42、timeout、既存stopとの競合、確定結果の再読取、共有log一致とcleanupを検査する。
 host検査には監視役終了、別boot、identity不一致、異なるownerのhandle、部分snapshot、保存失敗、権限とsymlinkを含む。
-次段はこの基盤を使ったdetached監視の起動・再接続と観測CLI、それからv2 detachedである。
+この基盤を使ったv1監視起動・再接続は [start/status](supervised-v1.md) を参照。次段の候補はv2 detachedである。
