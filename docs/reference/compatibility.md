@@ -50,7 +50,7 @@ stdin転送はminor 1以上でだけ有効であり、ABI v1.0のguestへstdin�
 ### CLI構文と終了code
 
 breaking:subcommandやflagの削除と改名、終了codeの意味変更、stdout契約行の形式変更である。
-stdout契約行は、`sha256:<hex>`のdigest行、detached runの`i-<pid>`行、`ps`の列構成を指す。
+stdout契約行は、`sha256:<hex>`のdigest行、detached runの`i-<pid>`行、`ps`の列構成を指す。v1.2.0追加のstart記録ID行とstatusのtab区切りSTATE/CODE/INSTANCE行も契約とする。
 
 互換:subcommand・flagの追加、標準エラー出力への診断追加、`ps`への列追加である。
 `ps`の列は末尾への追加だけを互換とし、既存列の削除や並べ替えはbreakingに分類する。

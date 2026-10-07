@@ -92,7 +92,7 @@ corrupt fileは`ps`が表示し、`stop`は触れずに125で失敗する。
 
 QEMUは固定引数のprocess groupで起動し、SIGINTとSIGTERMを転送する。
 中断されたrunは2秒のgraceののちSIGKILLで回収し、終了code 125で終わる。
-成功、失敗、中断、crashのいずれの経路でも、QEMU processとpayload directoryに残滓を残さない。
+通常の成功・失敗・中断ではQEMU processとpayload directoryを回収する。hostや監視役のSIGKILL後は自動回収を保証せず、既存ps/stopによる回収を検証する。
 
 | 検証根拠 | 保証 |
 | --- | --- |
@@ -128,3 +128,7 @@ READMEとguideに記した`minictr` commandは、次の2経路で実行可能性
 
 - `cli.rs`の`documented_commands_match_the_public_help_surface`が、tracked Markdownの全command記述を`help()`のusage行と双方向に照合する。記述のないcommand、綴りの違うcommandを機械的に検出する。
 - 実QEMU E2Eのcli surface passが、QEMUを必要としない公開command (`version`、`help`、`image list`、`image export`、`image import`、`image remove`、`image prune`) を実storeへ1回ずつ実行する。`pull-oci`はregistry依存のため対象外である。
+
+## v1監視起動と保存結果（v1.2.0追加）
+
+`minictr start` はv1だけを受理し、READY後に記録IDを返す。起動0をguest成功とは扱わない。`minictr status [--wait]` はrunning/exited/failed/unknownを区別し、waitは回収後のguest codeを返す。監視役喪失と旧stateはunknown。owner専用logとstateを維持し、PID再利用では停止用リンクを表示しない。詳細と検証根拠は [監視起動の契約](supervised-v1.md)、`registered_state_is_private_and_observable_independent_of_umask` と通常実QEMU E2Eにある。旧run/detach/ps/stop、bundle/wire ABI、kernel固定は維持する。v2監視起動、task別I/O、監視役喪失時の自動回収は保証しない。

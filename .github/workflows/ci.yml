@@ -66,6 +66,14 @@ jobs:
           set -e
           test "$status" -eq 42
           grep -q "hello from guest" /tmp/release-smoke/guest.txt
+          RECORD_ID=$("$SMOKE_DIR/minictr" start --store /tmp/release-smoke/store --kernel "$SMOKE_DIR/kernel/minios.bin" --timeout-ms 5000 hello)
+          set +e
+          "$SMOKE_DIR/minictr" status --store /tmp/release-smoke/store --wait --timeout-ms 6000 "$RECORD_ID" > /tmp/release-smoke/status.txt
+          status=$?
+          set -e
+          test "$status" -eq 42
+          grep -q '^exited' /tmp/release-smoke/status.txt
+          test -z "$(find /tmp/release-smoke/store/run -name '*.state' -print)"
       - name: Install pinned ORAS
         run: |
           set -eu
