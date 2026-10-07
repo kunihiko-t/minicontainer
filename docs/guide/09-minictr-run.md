@@ -26,7 +26,7 @@ usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
-`--version`は`minictr 1.0.0`を標準出力へ出して0で終わる。
+`--version`は`minictr 1.1.0`を標準出力へ出して0で終わる。
 どちらも引数を取らず、後続のtokenは型付きerrorになる。
 
 `--store`と`--kernel`の値はOS pathとして不透明に扱う。

@@ -8,16 +8,17 @@
 
 Rust 1.98.0、`riscv64gc-unknown-none-elf`、QEMU 8.2.0以上、Gitを用意する。
 以下はMiniContainerのリポジトリ直下から同じシェルで順に実行する。
-`build-multi`を含む現在のsourceからCLIをビルドするため、配布済みarchiveのCLIでも同じcommandが使えるとは限らない。
+`build-multi`はv1.1.0から配布CLIでも使える。v1.0.0の配布CLIではこのcommandを使えない。
+以下はsourceからビルドする手順である。
 
 このサンプルはtask-local fault処理を含むMiniOS revision
 `086f2e3fa54f751cd28c5fcd2bed205830bd2934`を明示してビルドする。
-標準インストールやリリース用kernelの固定は変更しない。
+このSHAはv1.1.0の標準配布kernelと同じである。利用者の既存kernelファイルを自動更新するものではない。
 
 | kernel | 正常2task | fault＋survivor |
 | --- | --- | --- |
-| リリース固定`4865f9be97a6cdcd77c71e36b1ba426b49bd73d7` | PID 0/1とも42、CLI終了42 | guest trapでVM全体が失敗し、host error 125 |
-| 候補`086f2e3fa54f751cd28c5fcd2bed205830bd2934` | PID 0/1とも42、CLI終了42 | PID 0は70、PID 1は42、CLI終了70 |
+| v1.0.0のkernel `4865f9be97a6cdcd77c71e36b1ba426b49bd73d7`（現行CLIで実行） | PID 0/1とも42、CLI終了42 | guest trapでVM全体が失敗し、host error 125 |
+| v1.1.0のkernel `086f2e3fa54f751cd28c5fcd2bed205830bd2934` | PID 0/1とも42、CLI終了42 | PID 0は70、PID 1は42、CLI終了70 |
 
 この結果はUbuntuのQEMUで確認したものであり、物理FPGAやmacOS実機の動作を示すものではない。
 正常guestの42は意図した終了codeである。以下では`set -e`が有効でも結果を確認できるように終了codeを保存する。

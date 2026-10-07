@@ -22,7 +22,7 @@ Ubuntu 24.04のCIはsetupと同じcheck、Apple SiliconのmacOS CIはQEMUを除�
 開発上の節目「M1」は、このゲスト実行機能を指す。AppleのM1チップ限定という意味ではない。
 
 依存先のminiOSでは、Sv39、実行前ELF loader、U-mode実行、`write`、`exit`、終了後のresource回収の節目が完了した。
-実行kernelは固定revision (`4865f9be97a6cdcd77c71e36b1ba426b49bd73d7`) からbuildする。
+実行kernelは固定revision (`086f2e3fa54f751cd28c5fcd2bed205830bd2934`) からbuildする。
 この到達点はMiniContainerがpage tableやELF loaderを実装したことを意味しない。
 MiniContainerは検証済みbundleをboot payload予約領域へ渡し、QEMU子process、UART標準入出力、終了status、timeout、cleanupを一つのruntime lifecycleへ接続し、`minictr run`から呼び出す。
 一つのcontainerにつき一つのQEMU仮想machineでRISC-V 64 applicationを実行できる。

@@ -96,7 +96,7 @@ QEMUは固定引数のprocess groupで起動し、SIGINTとSIGTERMを転送す�
 
 | 検証根拠 | 保証 |
 | --- | --- |
-| 実QEMU E2Eのstress節 (5 scenario、21 iteration) | 反復、timeout、SIGINT、SIGTERM、detached stop、crash後の残滓なし |
+| 実QEMU E2Eのstress節 (短命guest detachedを含む26 iteration) | 反復、timeout、SIGINT、SIGTERM、detached stop、crash後の残滓なし |
 | 各caseのbaseline差分 | QEMU pidとpayload directoryの増減ゼロ |
 
 ## 対応hostとtool

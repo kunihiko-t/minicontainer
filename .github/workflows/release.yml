@@ -35,7 +35,7 @@ jobs:
         run: |
           set -eu
           git clone https://github.com/kunihiko-t/minios.git minios
-          git -C minios checkout --detach 4865f9be97a6cdcd77c71e36b1ba426b49bd73d7
+          git -C minios checkout --detach 086f2e3fa54f751cd28c5fcd2bed205830bd2934
           cargo build --manifest-path minios/Cargo.toml --target-dir minios/target -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --release --locked
       - name: Build distribution archive
         run: cargo xtask dist --target ${{ matrix.target }} --minictr target/release/minictr --kernel minios/target/riscv64gc-unknown-none-elf/release/minios-kernel --version ${{ github.ref_name }} --output dist
@@ -64,6 +64,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -75,11 +76,13 @@ jobs:
           set -eu
           VERSION="${{ github.ref_name }}"
           NOTES="$(mktemp)"
-          cat > "$NOTES" <<EOF
-          MiniContainer $VERSION distribution archives.
+          cat "docs/reference/$VERSION-release-notes.md" > "$NOTES"
+          cat >> "$NOTES" <<EOF
 
-          Built from commit ${{ github.sha }} by the release workflow.
-          Verify the checksum, then the build provenance:
+          ## 配布物の検証
+
+          release workflowがcommit ${{ github.sha }}から構築した配布archiveです。
+          checksumの後にbuild provenanceを確認してください。
 
               sha256sum -c 'minicontainer-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256'
               gh attestation verify 'minicontainer-$VERSION-x86_64-unknown-linux-gnu.tar.gz' --owner kunihiko-t
