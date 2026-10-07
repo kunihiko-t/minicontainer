@@ -651,11 +651,15 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> io::Result<()> {
             ".minicontainer-state-{}-{sequence}",
             std::process::id()
         ));
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // 通常umaskでも再接続のprivate検証を満たす。作成時から他ownerへ公開しない。
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&temporary) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -704,6 +708,48 @@ mod tests {
     fn instance_helper() {
         match env::var(HELPER_ENV).as_deref() {
             Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
+            #[cfg(unix)]
+            Ok("private-state") => {
+                use crate::OutputSink as _;
+                use std::os::unix::fs::PermissionsExt as _;
+                let root = TempRoot::create();
+                let mask = u32::from_str_radix(&env::var("MINICONTAINER_STATE_UMASK").unwrap(), 8)
+                    .unwrap();
+                // umaskはこのhelper processだけで変更し、親の並行testへ影響させない。
+                unsafe {
+                    libc::umask(mask as libc::mode_t);
+                }
+                let dir = open_dir(&root);
+                let handle = dir
+                    .register(
+                        "hello",
+                        std::process::id(),
+                        helper_program().as_os_str(),
+                        &payload_dir(),
+                    )
+                    .unwrap();
+                let records = crate::RunRecords::open(&root.0).unwrap();
+                let mut run = records.begin().unwrap();
+                run.registered(handle.id(), handle.state()).unwrap();
+                let state_path = dir.state_path(handle.id()).unwrap();
+                let mode = fs::metadata(&state_path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "state mode under umask {mask:o}");
+                assert_eq!(
+                    records.observe(run.id()).unwrap(),
+                    crate::RecordedObservation::Running
+                );
+                assert_eq!(
+                    records.active_instance(run.id()).unwrap().as_deref(),
+                    Some(handle.id())
+                );
+                // 公開permissionへ変更されたstateは従来どおり拒否する。
+                fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644)).unwrap();
+                assert_eq!(
+                    records.active_instance(run.id()).unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidData
+                );
+                dir.unregister(&handle).unwrap();
+            }
             mode => panic!("unknown instance helper mode: {mode:?}"),
         }
     }
@@ -759,6 +805,32 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("the sleeper helper must spawn")
+    }
+
+    /// 通常・寛容・厳格umaskでも、実registerからのstateを安全に再接続できる。
+    #[test]
+    #[cfg(unix)]
+    fn registered_state_is_private_and_observable_independent_of_umask() {
+        for mask in ["022", "000", "077"] {
+            let output = Command::new(helper_program())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "instance::tests::instance_helper",
+                    "--nocapture",
+                ])
+                .env(HELPER_ENV, "private-state")
+                .env("MINICONTAINER_STATE_UMASK", mask)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "umask {mask}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     // Catches a canonical state file failing to round-trip: fields must come
