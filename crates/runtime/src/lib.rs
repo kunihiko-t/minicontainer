@@ -5,6 +5,7 @@ mod detach;
 mod error;
 mod instance;
 mod process;
+mod recording;
 mod session;
 mod stdin;
 mod stop;
@@ -21,6 +22,9 @@ pub use instance::{
 };
 pub use process::{
     ProcessBackend, ProcessControl, ProcessError, ProcessEvent, ProcessStatus, SystemProcessBackend,
+};
+pub use recording::{
+    RecordStream, RecordedExit, RecordedObservation, RecordedRun, RecordingFailure, RunRecords,
 };
 pub use session::{RunOutcome, Session, SessionError, SessionEvent};
 pub use stop::{StopError, StopOutcome, StopReport};
@@ -2308,6 +2312,142 @@ mod tests {
             }
             Ok(successful_process())
         }
+    }
+
+    #[test]
+    fn recording_confirms_guest_only_after_runtime_cleanup() {
+        let root =
+            std::env::temp_dir().join(format!("minicontainer-record-test-{}", std::process::id()));
+        let records = crate::RunRecords::open(&root).unwrap();
+        let run = records.begin().unwrap();
+        let id = run.id().to_owned();
+        assert_eq!(
+            records.observe(&id).unwrap(),
+            crate::RecordedObservation::Running
+        );
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let backend = FakeBackend::events(
+            trace.clone(),
+            payload.clone(),
+            vec![
+                ProcessEvent::Uart(guest_stream(42)),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        );
+        let outcome = run
+            .supervise(
+                &Runtime::new(backend),
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: std::path::Path::new("kernel"),
+                    deadline: Duration::from_secs(1),
+                    resources: QemuResources::DEFAULT,
+                    input: None,
+                    interrupts: None,
+                    instances: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.exit_code, 42);
+        assert!(trace.borrow().contains(&"reap"));
+        assert!(
+            !payload
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(
+            records.observe(&id).unwrap(),
+            crate::RecordedObservation::Finished(crate::RecordedExit::Guest {
+                code: 42,
+                process_exits: vec![]
+            })
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recording_keeps_cleanup_failure_as_host_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "minicontainer-record-cleanup-{}",
+            std::process::id()
+        ));
+        let records = crate::RunRecords::open(&root).unwrap();
+        let run = records.begin().unwrap();
+        let id = run.id().to_owned();
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let mut backend = FakeBackend::events(
+            trace,
+            payload,
+            vec![
+                ProcessEvent::Uart(guest_stream(42)),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        );
+        backend.reap_fails = true;
+        let result = run
+            .supervise(
+                &Runtime::new(backend),
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: std::path::Path::new("kernel"),
+                    deadline: Duration::from_secs(1),
+                    resources: QemuResources::DEFAULT,
+                    input: None,
+                    interrupts: None,
+                    instances: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(result, Err(RuntimeError::CleanupOnly(_))));
+        assert!(
+            matches!(records.observe(&id).unwrap(), crate::RecordedObservation::Finished(
+            crate::RecordedExit::HostFailure { diagnostic }) if diagnostic.contains("reap failure"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recording_save_failure_keeps_the_primary_runtime_result() {
+        let root =
+            std::env::temp_dir().join(format!("minicontainer-record-save-{}", std::process::id()));
+        let records = crate::RunRecords::open(&root).unwrap();
+        let run = records.begin().unwrap();
+        let id = run.id().to_owned();
+        std::fs::remove_dir_all(root.join("results").join(&id)).unwrap();
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let payload = Rc::new(RefCell::new(None));
+        let backend = FakeBackend::events(
+            trace,
+            payload,
+            vec![
+                ProcessEvent::Uart(guest_stream(42)),
+                ProcessEvent::Exited(successful_process()),
+            ],
+        );
+        let failure = run
+            .supervise(
+                &Runtime::new(backend),
+                RunRequest {
+                    bundle: &valid_bundle(),
+                    kernel: std::path::Path::new("kernel"),
+                    deadline: Duration::from_secs(1),
+                    resources: QemuResources::DEFAULT,
+                    input: None,
+                    interrupts: None,
+                    instances: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(failure.run_result.unwrap().unwrap().exit_code, 42);
+        assert!(records.observe(&id).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn valid_bundle() -> Vec<u8> {

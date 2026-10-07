@@ -474,6 +474,7 @@ dependencies = [
  "libc",
  "minicontainer-bundle",
  "minicontainer-protocol",
+ "minicontainer-runtime",
  "minios-abi",
  "sha2 0.10.9",
 ]

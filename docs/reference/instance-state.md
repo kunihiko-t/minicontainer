@@ -1,5 +1,8 @@
 # Instance state
 
+新しいdetached監視に向けたopt-in runtime APIは[監視と永続結果の内部基盤](run-recording.md)に記す。
+現行CLIとこのstate v1の契約は変更しない。
+
 `minictr run`はQEMU起動直後にinstanceのstate fileを作り、終了時に消す。
 `run --detach`は戻った後もstate fileとpayload directoryを残し、`minictr stop`が回収する。
 `minictr ps`は残ったfileを読み、各instanceをlive、stale、corruptとして一覧する。
