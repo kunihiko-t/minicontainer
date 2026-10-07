@@ -78,3 +78,5 @@ guestの終了でQEMUも停止するため、終了後の`ps`は`stale`を出し
 payload directoryの削除はstate fileの`payload=`を鵜呑みにしない。
 basenameが`minicontainer-run-`で始まり、かつ親directoryがsystemの一時directory内にあるpathだけを消すため、捏造されたstate fileで任意のdirectoryを消されることはない。
 停止と回収の失敗は別々に報告され、processは消えたが回収に失敗した場合も終了code 125になる。
+
+従来のdetachとは別に、v1を監視して保存結果へ再接続する [start/status経路](supervised-v1.md) を提供する。監視役のruntimeが通常のUART読取・QEMU回収・state削除を担当する。
