@@ -16,6 +16,7 @@ logはdecode済みguest stdout/stderrであり、firmware診断やtask別stream�
 
 実行前に未確定snapshotを保存する。監視processのPID・開始token・commとboot identityを記録し、
 同じ監視役が生きていれば`Running`、監視役喪失・identity不一致・別boot・handle放棄なら`Unknown`となる。
+終了後に親のreapを待つzombieもUnknownとする。この追加判定は監視記録だけで使い、state v1の分類を変えない。
 Runningは監視identityの一致だけを示し、guestの進捗や成功は保証しない。
 壊れたsnapshot、未知version、欠落fileは読取errorとなり、成功には変換しない。
 古いinstance stateはこのAPIへ移行せず、従来の`ps`と`stop`が扱う。

@@ -494,6 +494,8 @@ fn parse_field<'a, T>(
 
 /// 同じpidのprocessを再利用と区別するための記録。
 pub(crate) struct ProcessIdentity {
+    /// 監視記録だけが使う終了済み判定。既存state v1のlive/stale規則は変えない。
+    pub(crate) running: bool,
     /// process開始時刻のopaque値。単位はplatformごとに異なり、同じplatform
     /// の記録どうしの一致だけを見る。
     pub(crate) token: u64,
@@ -576,6 +578,7 @@ fn platform_identity(pid: u32) -> Option<ProcessIdentity> {
         .map(|byte| (*byte as u8) as char)
         .collect();
     Some(ProcessIdentity {
+        running: info.pbi_status != libc::SZOMB,
         token: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
         comm,
     })
@@ -590,6 +593,7 @@ fn platform_identity(pid: u32) -> Option<ProcessIdentity> {
     let open = stat.find('(')?;
     let close = stat.rfind(')')?;
     let comm = stat.get(open + 1..close)?.to_owned();
+    let state = stat.get(close + 2..)?.split_whitespace().next()?;
     let starttime = stat
         .get(close + 2..)?
         .split_whitespace()
@@ -597,6 +601,7 @@ fn platform_identity(pid: u32) -> Option<ProcessIdentity> {
         .parse::<u64>()
         .ok()?;
     Some(ProcessIdentity {
+        running: !matches!(state, "Z" | "X" | "x"),
         token: starttime,
         comm,
     })

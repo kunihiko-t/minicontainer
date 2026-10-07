@@ -130,7 +130,7 @@ impl RunRecords {
         let Probe::Found(identity) = probe_identity(pid) else {
             return Err(invalid());
         };
-        if identity.token == 0 || identity.comm.len() > 64 {
+        if !identity.running || identity.token == 0 || identity.comm.len() > 64 {
             return Err(invalid());
         }
         let mut snapshot = Snapshot {
@@ -226,7 +226,7 @@ impl RunRecords {
             if !snapshot.abandoned
                 && boot_identity().ok().as_ref() == Some(&snapshot.boot)
                 && matches!(probe_identity(snapshot.pid), Probe::Found(current)
-            if snapshot.token != 0 && current.token == snapshot.token && current.comm == snapshot.comm)
+                    if current.running && snapshot.token != 0 && current.token == snapshot.token && current.comm == snapshot.comm)
             {
                 RecordedObservation::Running
             } else {
@@ -251,7 +251,7 @@ impl RecordedRun {
         self.snapshot.pid == std::process::id()
             && boot_identity().ok().as_ref() == Some(&self.snapshot.boot)
             && matches!(probe_identity(self.snapshot.pid), Probe::Found(current)
-                if current.token == self.snapshot.token && current.comm == self.snapshot.comm)
+                if current.running && current.token == self.snapshot.token && current.comm == self.snapshot.comm)
     }
 
     /// 既存runtimeがQEMUを所有しwait/reapとcleanupを終えるまで監視する。
@@ -751,6 +751,39 @@ mod tests {
             records.observe(run.id()).unwrap(),
             RecordedObservation::Unknown
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_supervisor_is_unknown_before_the_parent_reaps_it() {
+        use std::process::Stdio;
+        let temp = Temp::new();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "recording::tests::record_child", "--nocapture"])
+            .env("MINICTR_RECORD_TEST_STORE", &temp.0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        // EOFはdescriptor閉鎖だけを示す。reap前の終了状態を期限付きで待ち、
+        // descriptor閉鎖とprocess終了の間をassertする競合を避ける。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while matches!(probe_identity(child.id()), Probe::Found(identity) if identity.running)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let id = fs::read_to_string(temp.0.join("test-id")).unwrap();
+        let observed = RunRecords::open(&temp.0).unwrap().observe(&id);
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert_eq!(observed.unwrap(), RecordedObservation::Unknown);
     }
 
     #[test]
