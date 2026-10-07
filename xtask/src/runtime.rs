@@ -854,7 +854,7 @@ fn run_supervised_cli(minictr: &Path, kernel: &Path, workspace: &Path) -> Result
             "start",
             &[
                 "--timeout-ms",
-                if case == "timeout" { "1200" } else { "10000" },
+                if case == "timeout" { "5000" } else { "10000" },
             ],
         );
         start.extend([

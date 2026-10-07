@@ -7,7 +7,8 @@ MiniContainerは、miniOSをゲストカーネルとして使い、静的RISC-V 
 imageはcontent-addressed storeに置き、ファイルとOCI Image Layoutの両方で持ち出しと取り込みができる。
 v1.0.0で公開契約（MiniBundle format、Guest ABI、CLI構文と終了コード、instance state、OCI対応）を固定した。
 v1.1.0では標準kernelを更新し、複数imageの構築とforeground実行、task-local fault分離を提供する。
-変更は[v1.1.0 release notes](docs/reference/v1.1.0-release-notes.md)に、保証と検証根拠の対応は[公開契約の監査表](docs/reference/public-contract.md)に記載している。
+v1.2.0ではv1の監視起動と保存結果への再接続を追加する。
+変更は[v1.2.0 release notes](docs/reference/v1.2.0-release-notes.md)と[v1.1.0 release notes](docs/reference/v1.1.0-release-notes.md)に、保証と検証根拠の対応は[公開契約の監査表](docs/reference/public-contract.md)に記載している。
 
 DockerやOCI runtime、Linuxコンテナとの互換性はない。
 OCI対応はMiniBundle用artifactの配布形式に限る。
@@ -224,7 +225,7 @@ usage: minictr image pull-oci [--store PATH] IMAGE REFERENCE
 ```
 
 `help`と`--help`は上記のusageを標準出力へ出して0で終わる。
-`--version`は`minictr 1.1.0`を標準出力へ出して0で終わる。
+`--version`は`minictr 1.2.0`を標準出力へ出して0で終わる。
 `--store`と`--kernel`を省略した値は環境変数`MINICTR_STORE`、`MINICTR_KERNEL`、なければ`$HOME/.minicontainer`以下から解決する。
 `--timeout-ms`の既定値は5000である。
 
@@ -308,7 +309,7 @@ parserのfuzzは`cargo xtask fuzz --target <bundle|uart>`で実行し、finding�
 | 変更時の解釈基準 | [互換性と移行の方針](docs/reference/compatibility.md) |
 | 安全境界 | [脅威モデル](docs/reference/threat-model.md)、[Security Policy](SECURITY.md) |
 | 配布と導入 | [配布手順](docs/reference/releasing.md) |
-| 版ごとの変更 | [v1.1.0 release notes](docs/reference/v1.1.0-release-notes.md)、[v1.0.0 release notes](docs/reference/v1.0.0-release-notes.md)、[v0.1.0 release notes](docs/reference/v0.1.0-release-notes.md) |
+| 版ごとの変更 | [v1.2.0 release notes](docs/reference/v1.2.0-release-notes.md)、[v1.1.0 release notes](docs/reference/v1.1.0-release-notes.md)、[v1.0.0 release notes](docs/reference/v1.0.0-release-notes.md)、[v0.1.0 release notes](docs/reference/v0.1.0-release-notes.md) |
 | 到達した節目 | [ロードマップ](docs/reference/roadmap.md) |
 | 開発への参加 | [CONTRIBUTING](CONTRIBUTING.md) |
 
@@ -317,3 +318,5 @@ parserのfuzzは`cargo xtask fuzz --target <bundle|uart>`で実行し、finding�
 MiniContainerはMIT LicenseまたはApache License 2.0の条件で利用できる。
 詳細は[LICENSE-MIT](LICENSE-MIT)と[LICENSE-APACHE](LICENSE-APACHE)を参照する。
 SPDX表記は`MIT OR Apache-2.0`である。
+
+監視起動は `minictr start`、保存結果の再接続は `minictr status [--wait]` を使う。契約と停止・復旧手順は [v1監視起動](docs/reference/supervised-v1.md) を参照する。
