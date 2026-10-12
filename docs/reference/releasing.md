@@ -39,7 +39,7 @@ minicontainer-<version>-<target>/
 ```
 
 `minictr`はrelease buildであり、実行bitを付けて格納する。
-`kernel/minios.bin`は固定revision `eb427702664cb002c9a235bc319eb404aa93692e` のminiOSを`--release --locked --target riscv64gc-unknown-none-elf`でbuildしたものである。
+`kernel/minios.bin`は固定revision `4f9044da6b623f26172565ca7603b0f2a0f4ac78` のminiOSを`--release --locked --target riscv64gc-unknown-none-elf`でbuildしたものである。
 配布kernelは[脅威モデル](threat-model.md)の信頼する計算基盤と同じ前提で扱う。
 `MANIFEST.txt`はarchive version、target、各fileのmodeとSHA-256を記録する。
 `SHA256SUMS`は`sha256sum -c`形式でpayloadと`MANIFEST.txt`を検査できる。
