@@ -146,7 +146,7 @@ Linux containerのPID 1には孤児processを回収するinitを用意する。
 
 ## 明示リビジョンでの複数task検査
 
-`cargo xtask compat --minios-rev 39fc51652427fe5ec7fbf4aa76aeb26755257593 --multi`は、
+`cargo xtask compat --minios-rev eb427702664cb002c9a235bc319eb404aa93692e --multi`は、
 通常のhost検査とv1 E2Eに加え、公開CLIの`image build-multi`で作った正常2 taskの実行、
 `image export`とbuilderのbytes一致、illegal instructionとstore faultでPID 0がcode 70になった後も
 PID 1が出力を継続してcode 7で終了することを公開CLI経由で検査する。
