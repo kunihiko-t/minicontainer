@@ -28,7 +28,7 @@ OCI configから複数taskの構造を復元する契約は設けない。
 ## 選択したMiniOSでの検証
 
 ```sh
-cargo xtask compat --minios-rev f18b15065d63b1ddc28cd81152616b1263f6008c --multi
+cargo xtask compat --minios-rev dc16925833708d62e823f1a9f65716b1b65c05cb --multi
 ```
 
 SHAは小文字40桁で明示する。`--multi`はtask-local fault処理を含むMiniOS revision

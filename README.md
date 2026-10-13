@@ -86,7 +86,7 @@ Guest ABIは`minios-abi-v0.2.0`に固定している。
 
 ```sh
 git clone https://github.com/kunihiko-t/minios.git "$MINIOS"
-git -C "$MINIOS" checkout f18b15065d63b1ddc28cd81152616b1263f6008c
+git -C "$MINIOS" checkout dc16925833708d62e823f1a9f65716b1b65c05cb
 cargo build --manifest-path "$MINIOS/Cargo.toml" --target-dir "$MINIOS/target" -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --locked
 ```
 
