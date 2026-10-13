@@ -41,7 +41,7 @@ use crate::tools;
 /// E2Eがbuildして起動するminiOS sourceの公開URL。
 pub const MINIOS_REPO_URL: &str = "https://github.com/kunihiko-t/minios.git";
 /// E2EがbuildするminiOS kernelのpin留めrevision (copy_to_user一本化のmerge commit)。
-pub const MINIOS_KERNEL_REV: &str = "378b25cc33bef8d8043873e74e99c8a439f764c3";
+pub const MINIOS_KERNEL_REV: &str = "1c3a6538e6cb984190520a4bbf308e2b2d3a61d8";
 /// E2E kernelが実装するGuest ABI tag。変更時は別承認のABI更新が必要である。
 pub const MINIOS_ABI_TAG: &str = "minios-abi-v0.2.0";
 /// E2Eが解決するimage tag。
