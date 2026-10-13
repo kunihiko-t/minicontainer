@@ -20,7 +20,7 @@ SHA-256 digestは破損検出とcontent addressingに使い、署名や配布元
 ## Guest ABI
 
 MiniContainerはtagで固定したminios-abi (`minios-abi-v0.2.0`) を利用し、boot header、manifest、UART control frame、system call番号を共有する。
-実行kernelはminiOSの固定revision (`dc16925833708d62e823f1a9f65716b1b65c05cb`) からbuildする。
+実行kernelはminiOSの固定revision (`8793c281cb1f0ff5bf77c8ba3f5aabd1241a0aea`) からbuildする。
 ホスト側の検証は、miniOSが行うguest側の再検証を省略する根拠にならない。
 
 ## ゲスト実行の流れ
