@@ -35,7 +35,7 @@ jobs:
         run: |
           set -eu
           git clone https://github.com/kunihiko-t/minios.git minios
-          git -C minios checkout --detach 4f9044da6b623f26172565ca7603b0f2a0f4ac78
+          git -C minios checkout --detach 378b25cc33bef8d8043873e74e99c8a439f764c3
           cargo build --manifest-path minios/Cargo.toml --target-dir minios/target -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --release --locked
       - name: Build distribution archive
         run: cargo xtask dist --target ${{ matrix.target }} --minictr target/release/minictr --kernel minios/target/riscv64gc-unknown-none-elf/release/minios-kernel --version ${{ github.ref_name }} --output dist
