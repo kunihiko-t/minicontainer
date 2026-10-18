@@ -5,10 +5,12 @@ store形式の詳細は第4章、runのlifecycleは第8章を参照する。
 
 ## 構文と解決
 
-`minictr`が実装するcommandは`run`、`ps`、`stop`、`doctor`、`image build`、`image build-multi`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
+`minictr`が実装するcommandは`run`、`start`、`status`、`ps`、`stop`、`doctor`、`image build`、`image build-multi`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 
 ```text
 usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
+usage: minictr start [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
+usage: minictr status [--store PATH] [--wait] [--timeout-ms N] ID
 usage: minictr ps [--store PATH]
 usage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>
 usage: minictr doctor [--store PATH] [--kernel PATH]
@@ -55,6 +57,8 @@ FILEは`--store`と同じくOS pathとして非UTF-8 byteを透過的に扱う�
 `image list`はpositionalを取らず、`--store`だけを一度だけ指定できる。
 `ps`もpositionalを取らず、`--store`だけを一度だけ指定できる。
 `run`の`--detach`は値を取らないflagであり、`--detach=値`の付与と重複指定は型付きerrorになる。
+`start`は`run`と同じresource optionとIMAGEを取り、`--detach`は受け付けない。
+`status`は記録IDを一つ取り、`--store`、`--timeout-ms`、値なしflagの`--wait`を一度ずつ指定できる。
 `stop`は`i-<pid>`の形のinstance idを一つ取り、`--store`と`--timeout-ms`を一度ずつ指定できる。
 idの形が合わない引数は型付きerrorであり、state fileを引く前に拒否する。
 `image inspect`はIMAGEを一つ取り、`--store`を前後どこに置いてもよい。

@@ -204,15 +204,18 @@ cargo run -p minictr --locked -- image import --store "$STORE" hello-copy ./hell
 
 ## コマンドと終了コード
 
-`minictr`が実装するコマンドは`run`、`ps`、`stop`、`doctor`、`image build`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
+`minictr`が実装するコマンドは`run`、`start`、`status`、`ps`、`stop`、`doctor`、`image build`、`image build-multi`、`image import`、`image export`、`image list`、`image inspect`、`image remove`、`image prune`、`image export-oci`、`image import-oci`、`image pull-oci`、`help`、`--version`である。
 構文と解決の詳細は[第9章](docs/guide/09-minictr-run.md)を参照する。
 
 ```text
 usage: minictr run [--detach] [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
+usage: minictr start [--store PATH] [--kernel PATH] [--timeout-ms N] [--memory MIB] [--cpus N] IMAGE
+usage: minictr status [--store PATH] [--wait] [--timeout-ms N] ID
 usage: minictr ps [--store PATH]
 usage: minictr stop [--store PATH] [--timeout-ms N] i-<pid>
 usage: minictr doctor [--store PATH] [--kernel PATH]
 usage: minictr image build [--store PATH] [--arg VALUE]... IMAGE ELF
+usage: minictr image build-multi TAG --image NAME ELF [--arg VALUE]... [--image NAME ELF [--arg VALUE]...]... [--store PATH]
 usage: minictr image import [--store PATH] IMAGE FILE
 usage: minictr image export [--store PATH] IMAGE --output PATH
 usage: minictr image list [--store PATH]
@@ -273,7 +276,7 @@ stdout、stderr、診断の合計は表示済みも含めて1 MiBが上限であ
 ## 保証しない範囲
 
 - Docker API互換、Linuxアプリケーション互換、OCI runtime互換。OCI対応はMiniBundle用artifactの配布形式（export、import、匿名pull）に限る。
-- ゲストへのネットワーク、永続ボリューム、複数image実行。ネットワークはregistry pullのHTTPS clientだけである。
+- ゲストへのネットワークと永続ボリューム。ネットワークはregistry pullのHTTPS clientだけである。
 - 未信頼コードを扱うマルチテナント分離とguest escapeの防止。
 - `minicontainer-*` crateのRust API。利用者が依存してよい公開面は`minictr` binaryだけである。
 - Windowsでの動作。
