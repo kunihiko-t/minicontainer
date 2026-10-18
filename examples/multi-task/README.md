@@ -12,7 +12,7 @@ Rust 1.98.0、`riscv64gc-unknown-none-elf`、QEMU 8.2.0以上、Gitを用意す�
 以下はsourceからビルドする手順である。
 
 このサンプルはtask-local fault処理を含むMiniOS revision
-`8793c281cb1f0ff5bf77c8ba3f5aabd1241a0aea`を明示してビルドする。
+`06d91d19429a620b2c2ee97340905d8f059332cd`を明示してビルドする。
 このSHAはmain branchの標準kernel pinと同じである。利用者の既存kernelファイルを自動更新するものではない。
 
 | kernel | 正常2task | fault＋survivor |
@@ -33,7 +33,7 @@ cargo build --manifest-path examples/guest-hello/Cargo.toml --target riscv64gc-u
 WORK="$(mktemp -d)"
 MINIOS="$WORK/minios"
 STORE="$WORK/store"
-CANDIDATE_REV=8793c281cb1f0ff5bf77c8ba3f5aabd1241a0aea
+CANDIDATE_REV=06d91d19429a620b2c2ee97340905d8f059332cd
 git clone https://github.com/kunihiko-t/minios.git "$MINIOS"
 git -C "$MINIOS" checkout --detach "$CANDIDATE_REV"
 cargo build --manifest-path "$MINIOS/Cargo.toml" --target-dir "$WORK/target" -p minios-kernel --bin minios-kernel -p minios-guest --bin minios-guest-proc-fault --target riscv64gc-unknown-none-elf --locked
