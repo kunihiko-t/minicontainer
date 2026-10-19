@@ -28,7 +28,7 @@ jobs:
       - run: cargo xtask setup
       - run: cargo xtask check
       - name: Verify multi-task compatibility with explicit MiniOS revision
-        run: cargo xtask compat --minios-rev 06d91d19429a620b2c2ee97340905d8f059332cd --multi
+        run: cargo xtask compat --minios-rev 307613cc0a07368930ce85b871b73c071182f3ba --multi
       - name: Smoke-test minictr doctor
         run: |
           set -eu
@@ -47,7 +47,7 @@ jobs:
           set -eu
           cargo build -p minictr --release --locked
           git clone https://github.com/kunihiko-t/minios.git /tmp/release-smoke/minios
-          git -C /tmp/release-smoke/minios checkout --detach 06d91d19429a620b2c2ee97340905d8f059332cd
+          git -C /tmp/release-smoke/minios checkout --detach 307613cc0a07368930ce85b871b73c071182f3ba
           cargo build --manifest-path /tmp/release-smoke/minios/Cargo.toml --target-dir /tmp/release-smoke/minios/target -p minios-kernel --bin minios-kernel --target riscv64gc-unknown-none-elf --release --locked
           cargo xtask dist --target x86_64-unknown-linux-gnu --minictr target/release/minictr --kernel /tmp/release-smoke/minios/target/riscv64gc-unknown-none-elf/release/minios-kernel --output /tmp/release-smoke/dist
           (cd /tmp/release-smoke/dist && sha256sum -c ./*.sha256)
