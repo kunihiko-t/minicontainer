@@ -158,7 +158,7 @@ impl InstanceDir {
 
         let mut failures = Vec::new();
         failures.extend(remove_payload_dir(&state.payload));
-        if let Err(error) = self.remove_state(id) {
+        if let Err(error) = self.remove_state(id, &state) {
             failures.push(CleanupFailure::Instance(error));
         }
         if failures.is_empty() {

@@ -38,6 +38,8 @@ digestは破損検出とcontent addressingに使い、署名や配布元の認�
 `resolve`はtagからdigestを引き、bytesを再検証してdigestとpathの一致を確認してから返す。
 `resolve_digest`はdigestから直接同じ検証をして返す。`image export`のtag指定とdigest指定はこの二つに対応する。
 `list_tags`はtag名のbyte順で`TagRecord`を返し、imageの有無は確認しない。
+新しい書き込みの一時fileは、正規tag名に使えない`=`を含む`.minicontainer-tmp=`名前空間に分離し、一覧から除外する。読み取り中に削除されたtagも一覧から省く。
+旧形式の`.minicontainer-tmp-<pid>-<連番>`は正規tag名として利用できるため隠さない。旧版の強制終了で残った同名fileは利用者のtagと区別できず、不要なものは内容を確認して`image remove`で削除する。
 非UTF-8名、symlink、壊れたdigestなどの不正entryはskipせず型付きerrorで返す。
 tag名はmanifestのname文法に従い、単一path成分でない名前は別途拒否する。
 `remove_tag`はtag fileだけをunlinkし、blobには触れない。存在しないtagは型付きerrorで報告する。

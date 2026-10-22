@@ -9,7 +9,7 @@ use std::{
     error::Error,
     ffi::OsStr,
     fmt, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -269,17 +269,17 @@ impl InstanceDir {
         };
         let id = format!("{INSTANCE_PREFIX}{pid}");
         let path = self.root.join(format!("{id}{STATE_SUFFIX}"));
+        let _lock = self.lock_state_changes()?;
         atomic_write(&path, &state.encode())?;
         Ok(InstanceHandle { id, path, state })
     }
 
-    /// 登録済みfileを消す。既に無いfileの削除は成功として扱う。
+    /// 自分が登録した世代だけを消す。欠落・別世代への置換は成功として扱う。
     pub fn unregister(&self, handle: &InstanceHandle) -> Result<(), InstanceError> {
-        match fs::remove_file(&handle.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        if self.state_path(handle.id()).as_ref() != Some(&handle.path) {
+            return Err(InstanceError::UnsafePath);
         }
+        self.remove_state(handle.id(), handle.state())
     }
 
     /// state fileを一覧する。更新中のfileもrename済みの完全な内容だけを
@@ -331,33 +331,66 @@ impl InstanceDir {
         Some(self.root.join(format!("{id}{STATE_SUFFIX}")))
     }
 
-    /// idのstate fileを消す。handleを持たない停止経路 (例: `stop`) が
-    /// 使い、既に無いfileの削除は成功として扱う。
-    pub(crate) fn remove_state(&self, id: &str) -> Result<(), InstanceError> {
+    /// 停止前に読んだ世代だけを消し、後から登録された記録は保持する。
+    pub(crate) fn remove_state(
+        &self,
+        id: &str,
+        expected: &InstanceState,
+    ) -> Result<(), InstanceError> {
         let Some(path) = self.state_path(id) else {
             return Ok(());
         };
+        let _lock = self.lock_state_changes()?;
+        match read_state_bytes(&path) {
+            Ok(bytes) if bytes == expected.encode() => {}
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
+
+    /// renameと比較・削除を同じlockで直列化する。lock fileはrenameしない。
+    fn lock_state_changes(&self) -> Result<fs::File, InstanceError> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(self.root.join(".state.lock"))?;
+        if !file.metadata()?.is_file() {
+            return Err(InstanceError::UnsafePath);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            loop {
+                // SAFETY: file owns this descriptor; closing it releases the advisory lock.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(file)
+    }
 }
 
 /// 一つのstate fileを行へ読み上げる。fileが無い・読み取り中に消えた場合は
 /// `None`、symlinkや上限超過・parse不能は`Corrupt`行として返す。
 pub(crate) fn read_row(id: String, path: &Path) -> Result<Option<InstanceRow>, InstanceError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    // symlinkのfileは追従せずcorruptとして見せる。
-    if metadata.file_type().is_symlink() || metadata.len() > MAX_STATE_LEN {
-        return Ok(Some(InstanceRow::Corrupt { id }));
-    }
-    let bytes = match fs::read(path) {
+    let bytes = match read_state_bytes(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Ok(Some(InstanceRow::Corrupt { id })),
@@ -370,6 +403,38 @@ pub(crate) fn read_row(id: String, path: &Path) -> Result<Option<InstanceRow>, I
         },
         None => InstanceRow::Corrupt { id },
     }))
+}
+
+fn read_state_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let check = |metadata: fs::Metadata| {
+        if !metadata.is_file() || metadata.len() > MAX_STATE_LEN {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid instance state file",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check(fs::symlink_metadata(path)?)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    check(file.metadata()?)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_LEN + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STATE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "instance state exceeds 1 KiB",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn row_id(row: &InstanceRow) -> &str {
@@ -711,6 +776,31 @@ mod tests {
     fn instance_helper() {
         match env::var(HELPER_ENV).as_deref() {
             Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
+            #[cfg(unix)]
+            Ok("fifo-state") => {
+                use std::os::unix::ffi::OsStrExt as _;
+                let root = TempRoot(PathBuf::from(
+                    env::var_os("MINICONTAINER_FIFO_STORE").unwrap(),
+                ));
+                let dir = open_dir(&root);
+                let path = root.0.join("run/i-12345.state");
+                let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                // SAFETY: name is NUL terminated and belongs to this test's scratch directory.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                assert!(matches!(
+                    dir.list().unwrap().as_slice(),
+                    [InstanceRow::Corrupt { .. }]
+                ));
+                assert!(matches!(
+                    dir.lookup("i-12345").unwrap(),
+                    Some(InstanceRow::Corrupt { .. })
+                ));
+                assert!(matches!(
+                    dir.stop("i-12345", Duration::ZERO),
+                    Err(crate::StopError::Corrupt(_))
+                ));
+                assert!(path.exists(), "a corrupt state must not be deleted");
+            }
             #[cfg(unix)]
             Ok("private-state") => {
                 use crate::OutputSink as _;
@@ -1241,6 +1331,141 @@ mod tests {
 
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
+    }
+
+    #[test]
+    fn unregister_preserves_a_replacement_state() {
+        let root = TempRoot::create();
+        let dir = open_dir(&root);
+        let old = dir
+            .register(
+                "old",
+                std::process::id(),
+                helper_program().as_os_str(),
+                &payload_dir(),
+            )
+            .unwrap();
+        let new = dir
+            .register(
+                "new",
+                std::process::id(),
+                helper_program().as_os_str(),
+                &payload_dir(),
+            )
+            .unwrap();
+
+        dir.unregister(&old).unwrap();
+        assert!(
+            matches!(dir.lookup(new.id()).unwrap(), Some(InstanceRow::Known { state, .. }) if state == *new.state())
+        );
+        dir.unregister(&new).unwrap();
+        assert!(dir.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_cleanup_preserves_a_replacement_state() {
+        let root = TempRoot::create();
+        let dir = open_dir(&root);
+        let old = dir
+            .register(
+                "old",
+                std::process::id(),
+                helper_program().as_os_str(),
+                &payload_dir(),
+            )
+            .unwrap();
+        let new = dir
+            .register(
+                "new",
+                std::process::id(),
+                helper_program().as_os_str(),
+                &payload_dir(),
+            )
+            .unwrap();
+
+        dir.remove_state(old.id(), old.state()).unwrap();
+        assert!(
+            matches!(dir.lookup(new.id()).unwrap(), Some(InstanceRow::Known { state, .. }) if state == *new.state())
+        );
+        dir.unregister(&new).unwrap();
+    }
+
+    #[test]
+    fn concurrent_registration_survives_old_cleanup() {
+        let root = TempRoot::create();
+        let dir = open_dir(&root);
+        for _ in 0..32 {
+            let old = dir
+                .register(
+                    "old",
+                    std::process::id(),
+                    helper_program().as_os_str(),
+                    &payload_dir(),
+                )
+                .unwrap();
+            let start = std::sync::Barrier::new(2);
+            let (cleanup, replacement) = std::thread::scope(|scope| {
+                let cleanup = scope.spawn(|| {
+                    start.wait();
+                    dir.unregister(&old)
+                });
+                let replacement = scope.spawn(|| {
+                    start.wait();
+                    dir.register(
+                        "new",
+                        std::process::id(),
+                        helper_program().as_os_str(),
+                        &payload_dir(),
+                    )
+                });
+                (cleanup.join().unwrap(), replacement.join().unwrap())
+            });
+            cleanup.unwrap();
+            let replacement = replacement.unwrap();
+            assert!(
+                matches!(dir.lookup(replacement.id()).unwrap(), Some(InstanceRow::Known { state, .. }) if state == *replacement.state())
+            );
+            dir.unregister(&replacement).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fifo_state_is_corrupt_without_blocking() {
+        let root = TempRoot::create();
+        let mut child = Command::new(helper_program())
+            .args([
+                "--ignored",
+                "--exact",
+                "instance::tests::instance_helper",
+                "--nocapture",
+            ])
+            .env(HELPER_ENV, "fifo-state")
+            .env("MINICONTAINER_FIFO_STORE", &root.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if timed_out {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!timed_out, "reading FIFO state must not block");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Catches an unsafe image label producing a file that cannot be parsed

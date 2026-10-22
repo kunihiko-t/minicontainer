@@ -55,6 +55,8 @@ process開始時刻を取得できないplatformではpid再利用を識別で�
 記録できないinstanceを起動したままにはしないため、登録失敗時はchildを回収してpayloadを消してから型付きerrorを返す。
 通常終了・timeout・signal中断・失敗の全経路で、cleanupの最後に`unregister`がstate fileを消す。
 `unregister`は冪等であり、既に無いfileの削除は成功として扱う。
+登録と削除は`run/.state.lock`のadvisory lockで直列化し、削除前に記録全体が取得時の内容と一致することを確認する。PID再利用などで新しい記録へ置き換わった場合、古い`unregister`や`stop`の後始末はその記録を保持する。
+状態の読み取りは通常fileだけを最大1 KiBまで行い、FIFOなどの特殊fileは待機せずcorruptとして扱う。
 削除の失敗はcleanup errorへ合成され、主errorを隠さない。
 
 foregroundのrunでは通常fileは残らない。
