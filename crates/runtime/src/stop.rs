@@ -20,7 +20,7 @@ use crate::{
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// SIGKILL後にprocessが消えるのを待つ上限。カーネルがkillを処理すれば
-/// zombie化を含めてほぼ即座に消えるため、この期限に届くのは異常である。
+/// zombie化を含めてほぼ即座に終了するため、この期限に届くのは異常である。
 const KILL_BUDGET: Duration = Duration::from_secs(5);
 
 /// payload dirのbasenameが持つべき接頭辞。これ以外のpathはstate fileが
@@ -186,13 +186,17 @@ fn wait_for_exit(state: &InstanceState, budget: Duration) -> WaitOutcome {
     loop {
         match probe_identity(state.pid) {
             Probe::Gone => return WaitOutcome::Gone,
-            Probe::Found(current) if current.token == state.token && current.comm == state.comm => {
+            Probe::Found(current)
+                if current.running
+                    && current.token == state.token
+                    && current.comm == state.comm =>
+            {
                 if Instant::now() >= deadline {
                     return WaitOutcome::StillAlive;
                 }
             }
-            // identityが変わったpidは再利用済みであり、記録したprocessは
-            // 既に死んでいる。Transient (exec途中などでidentityが読めない)
+            // zombieは既に終了済みで、identityが変わったpidも再利用済み。
+            // Transient (exec途中などでidentityが読めない)
             // は生存の可能性を残すため期限まで待ち続ける。
             Probe::Found(_) => return WaitOutcome::Gone,
             Probe::Transient => {
@@ -520,16 +524,13 @@ mod tests {
             )
             .unwrap();
         let id = handle.id().to_owned();
-        // stopが消滅を待つ間にsleeperがzombieとして残らないよう、reapを
-        // 別threadへ委譲する。
-        let reaper = std::thread::spawn(move || {
-            let _ = sleeper.wait();
-        });
-
-        let report = dir.stop(&id, Duration::from_secs(2)).unwrap();
+        // Keep the child unreaped until stop returns: termination is complete
+        // even while its parent has not yet collected the exit status.
+        let report = dir.stop(&id, Duration::from_secs(2));
+        sleeper.wait().unwrap();
+        let report = report.unwrap();
 
         assert_eq!(report.outcome, StopOutcome::Stopped);
-        reaper.join().unwrap();
         assert!(!crate::instance::process_exists(
             report.id[2..].parse().unwrap()
         ));
