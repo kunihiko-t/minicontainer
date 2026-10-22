@@ -562,11 +562,13 @@ fn platform_identity(pid: u32) -> Option<ProcessIdentity> {
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
     // SAFETY: `proc_pidinfo`は成功時に`info`をsize_of分だけ初期化する。
     // 戻り値が構造体サイズと一致しなければ初期化を仮定しない。
+    // PROC_PIDTBSDINFOのarg=1でzombieも検索する。0では終了済みのPIDが
+    // ESRCHになり、signal 0には存在するためTransientと誤認してしまう。
     let written = unsafe {
         libc::proc_pidinfo(
             pid as libc::pid_t,
             libc::PROC_PIDTBSDINFO,
-            0,
+            1,
             info.as_mut_ptr().cast::<libc::c_void>(),
             std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
         )
@@ -1092,10 +1094,15 @@ mod tests {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
+        let identity = super::probe_identity(sleeper.id());
         let rows = dir.list();
         sleeper.wait().unwrap();
 
         assert_eq!(observed, 0, "the child must exit without being reaped");
+        assert!(matches!(
+            identity,
+            super::Probe::Found(identity) if !identity.running
+        ));
         let rows = rows.unwrap();
         assert_eq!(rows.len(), 1);
         assert!(matches!(
