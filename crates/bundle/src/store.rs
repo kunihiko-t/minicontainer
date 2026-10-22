@@ -10,6 +10,8 @@ use std::{
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 const TEMP_CREATE_ATTEMPTS: usize = 128;
 const TAG_DIGEST_LEN: usize = 64;
+// '=' is not a valid tag character, keeping internal writes separate from user tags.
+const TEMP_FILE_PREFIX: &str = ".minicontainer-tmp=";
 
 /// tag名と、そのtag fileが指すdigest。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,10 +187,18 @@ impl Store {
             let Some(name) = file_name.to_str() else {
                 return Err(StoreError::InvalidTag(ManifestError::InvalidUtf8));
             };
+            if name.starts_with(TEMP_FILE_PREFIX) {
+                continue;
+            }
             validate_tag_name(name)?;
             let encoded_digest =
-                read_store_file_up_to(&self.root, &tags.join(name), TAG_DIGEST_LEN)?
-                    .ok_or(StoreError::TagTooLarge)?;
+                match read_store_file_up_to(&self.root, &tags.join(name), TAG_DIGEST_LEN) {
+                    Ok(bytes) => bytes.ok_or(StoreError::TagTooLarge)?,
+                    Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
             let digest = decode_digest(&encoded_digest).ok_or(StoreError::InvalidTagDigest)?;
             records.push(TagRecord {
                 name: name.to_owned(),
@@ -303,7 +313,7 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> io::Result<()> {
     for _ in 0..TEMP_CREATE_ATTEMPTS {
         let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
         let temporary = directory.join(format!(
-            ".minicontainer-tmp-{}-{sequence}",
+            "{TEMP_FILE_PREFIX}{}={sequence}",
             std::process::id()
         ));
         let mut file = match OpenOptions::new()
@@ -931,7 +941,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(".minicontainer-tmp-")
+                    .starts_with(super::TEMP_FILE_PREFIX)
             })
             .count();
         assert_eq!(temporary_files, 0);
@@ -1303,6 +1313,80 @@ mod tests {
             store.list_tags(),
             Err(StoreError::UnsafeStorePath)
         ));
+    }
+
+    #[test]
+    fn list_ignores_unpublished_atomic_writes() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        store.tag("hello", [0x11; 32]).unwrap();
+        for bytes in [b"".as_slice(), &[b'a'; 64]] {
+            fs::write(home.path().join("tags/.minicontainer-tmp=123=0"), bytes).unwrap();
+            let tags = store.list_tags().unwrap();
+            assert_eq!(tags.len(), 1);
+            assert_eq!(tags[0].name, "hello");
+        }
+    }
+
+    #[test]
+    fn legacy_temporary_style_tag_remains_visible() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        store.tag(".minicontainer-tmp-123-0", [0x11; 32]).unwrap();
+        let tags = store.list_tags().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, ".minicontainer-tmp-123-0");
+    }
+
+    #[test]
+    fn list_succeeds_during_atomic_tag_updates() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        store.tag("hello", [0x11; 32]).unwrap();
+        let writer_root = home.path().to_owned();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_start = start.clone();
+        let writer = std::thread::spawn(move || {
+            let store = Store::new(writer_root).unwrap();
+            writer_start.wait();
+            for _ in 0..500 {
+                store.tag("hello", [0x11; 32]).unwrap();
+            }
+        });
+        start.wait();
+        let result = (0..500).try_for_each(|_| {
+            let tags = store.list_tags().map_err(|error| error.to_string())?;
+            if tags.len() != 1 || tags[0].name != "hello" {
+                return Err(format!("unpublished tag appeared: {tags:?}"));
+            }
+            Ok(())
+        });
+        writer.join().unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn list_succeeds_during_tag_removal() {
+        let home = TempHome::new();
+        let store = Store::new(home.path()).unwrap();
+        store.tag("hello", [0x11; 32]).unwrap();
+        let writer_root = home.path().to_owned();
+        let writer = std::thread::spawn(move || {
+            let store = Store::new(writer_root).unwrap();
+            for _ in 0..500 {
+                store.remove_tag("hello").unwrap();
+                store.tag("hello", [0x11; 32]).unwrap();
+            }
+        });
+        let result = (0..500).try_for_each(|_| {
+            let tags = store.list_tags().map_err(|error| error.to_string())?;
+            if tags.iter().any(|tag| tag.name != "hello") {
+                return Err(format!("unpublished tag appeared: {tags:?}"));
+            }
+            Ok(())
+        });
+        writer.join().unwrap();
+        result.unwrap();
     }
 
     // Production break caught: listing silently skips a corrupt tag digest instead of returning a typed error.
