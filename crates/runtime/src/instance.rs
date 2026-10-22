@@ -387,7 +387,8 @@ pub(crate) fn status_of(state: &InstanceState) -> InstanceStatus {
     loop {
         match probe_identity(state.pid) {
             Probe::Found(current) => {
-                break if state.token != 0
+                break if current.running
+                    && state.token != 0
                     && current.token == state.token
                     && current.comm == state.comm
                 {
@@ -1062,6 +1063,48 @@ mod tests {
             InstanceRow::Known { status, .. } => assert_eq!(*status, InstanceStatus::Stale),
             InstanceRow::Corrupt { id } => panic!("expected a stale row, got corrupt {id}"),
         }
+    }
+
+    // An exited child can retain its PID, token and comm until its parent
+    // reaps it. It must already be stale while that identity still exists.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn an_unreaped_process_lists_as_stale() {
+        let root = TempRoot::create();
+        let dir = open_dir(&root);
+        let mut sleeper = spawn_sleeper();
+        dir.register(
+            "hello",
+            sleeper.id(),
+            helper_program().as_os_str(),
+            &payload_dir(),
+        )
+        .unwrap();
+        sleeper.kill().unwrap();
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        // SAFETY: waitid receives a valid output buffer and our own child PID.
+        // WNOWAIT observes termination without reaping the child.
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                sleeper.id() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        let rows = dir.list();
+        sleeper.wait().unwrap();
+
+        assert_eq!(observed, 0, "the child must exit without being reaped");
+        let rows = rows.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0],
+            InstanceRow::Known {
+                status: InstanceStatus::Stale,
+                ..
+            }
+        ));
     }
 
     // Catches PID reuse being trusted: a live pid with a forged start token
